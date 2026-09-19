@@ -1045,6 +1045,12 @@ class DiffusionEngine:
         if model_class_name is None:
             raise RuntimeError("Dummy request requires a resolved model_class_name")
         supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
+        parallel_config = getattr(self.od_config, "parallel_config", None)
+        is_chunk_pipeline = getattr(parallel_config, "pipeline_parallel_mode", "layer") == "chunk"
+        if is_chunk_pipeline:
+            supports_image_input = supports_audio_input = False
+            guidance_scale = 1.0
+            num_inference_steps = 3
         if supports_image_input:
             color_format = image_color_format(model_class_name)
             images = [PIL.Image.new(color_format, (width, height)) for _ in range(num_image_inputs)]
@@ -1055,6 +1061,12 @@ class DiffusionEngine:
             prompt.setdefault("multi_modal_data", {})["audio"] = np.random.randn(audio_sr * 2).astype(np.float32)
 
         num_frames = get_dummy_run_num_frames(model_class_name, supports_audio_input)
+        extra_args = {"cfg_text_scale": 1.0, "cfg_img_scale": 1.0}
+        if is_chunk_pipeline:
+            # Three one-latent chunks exercise both ranks, condition prefixes,
+            # and a slot with bidirectional P2P, including the return direction.
+            num_frames = 9
+            extra_args.update(chunk_frames=1, chunk_cond_frames=1, chunk_gap=1)
         if num_frames <= 0:
             return None
         return OmniDiffusionRequest(
@@ -1067,7 +1079,7 @@ class DiffusionEngine:
                 num_frames=num_frames,
                 guidance_scale=guidance_scale,
                 num_outputs_per_prompt=1,
-                extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
+                extra_args=extra_args,
             ),
         )
 

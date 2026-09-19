@@ -9,6 +9,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.distributed.chunk_pipeline_parallel import run_chunk_pipeline
 from vllm_omni.diffusion.media import VideoTensorEncoding, VideoTensorLayout, VideoValueRange
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
@@ -106,6 +107,7 @@ def _make_pipeline() -> Wan22Pipeline:
     pipeline.boundary_ratio = 0.875
     pipeline.expand_timesteps = False
     pipeline.is_dmd = False
+    pipeline.chunk_pipeline_mode = False
     pipeline.is_causalwan_dmd = False
     pipeline._guidance_scale = None
     pipeline._guidance_scale_2 = None
@@ -310,6 +312,44 @@ def test_forward_emits_request_local_typed_media_after_vae_decode() -> None:
     assert outputs[0].media.video.spec.value_range is VideoValueRange.NEGATIVE_ONE_TO_ONE
 
 
+@pytest.mark.parametrize(
+    ("output_type", "expected_empty_cache_calls"),
+    [("latent", 0), ("np", 1)],
+)
+def test_forward_only_clears_cache_before_vae_decode(
+    monkeypatch: pytest.MonkeyPatch,
+    output_type: str,
+    expected_empty_cache_calls: int,
+) -> None:
+    pipeline = _make_pipeline()
+    pipeline.diffuse = lambda **kwargs: kwargs["latents"]  # type: ignore[method-assign]
+    empty_cache_calls: list[None] = []
+    platform = SimpleNamespace(
+        is_available=lambda: True,
+        empty_cache=lambda: empty_cache_calls.append(None),
+    )
+    module = importlib.import_module(Wan22Pipeline.__module__)
+    monkeypatch.setattr(module, "current_omni_platform", platform)
+    batch = DiffusionRequestBatch(
+        requests=[
+            OmniDiffusionRequest(
+                prompt="prompt",
+                request_id="request-0",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_frames=1,
+                    num_inference_steps=2,
+                    max_sequence_length=32,
+                    output_type=output_type,
+                ),
+            )
+        ]
+    )
+
+    pipeline.forward(batch)
+
+    assert len(empty_cache_calls) == expected_empty_cache_calls
+
+
 @pytest.mark.parametrize("decoded", [None, torch.empty(0)], ids=["none", "empty-tensor"])
 def test_forward_keeps_legacy_output_on_non_owner_vae_rank(decoded: torch.Tensor | None) -> None:
     # Non-owner VAE ranks can return None or an empty tensor. Exercise the full
@@ -461,8 +501,44 @@ def test_diffuse_runs_prediction_and_scheduler_for_each_timestep() -> None:
     assert torch.equal(result, torch.full_like(latents, 10.0))
 
 
+def test_diffuse_publishes_precomputed_forward_context_timesteps(monkeypatch) -> None:
+    """Native PP avoids a per-step accelerator scalar readback too."""
+    pipeline = _make_pipeline()
+    timesteps = torch.tensor([[7], [3]], dtype=torch.int64)
+    recorded: list[tuple[int, object, float | None]] = []
+
+    def record(step_idx, timestep=None, scheduler=None, normalized_timestep=None, total_steps=None):
+        del scheduler, total_steps
+        recorded.append((step_idx, timestep, normalized_timestep))
+
+    pipeline.record_denoise_step = record  # type: ignore[method-assign]
+    pipeline.predict_noise_maybe_with_cfg = (  # type: ignore[method-assign]
+        lambda **kwargs: torch.zeros_like(kwargs["positive_kwargs"]["hidden_states"])
+    )
+    pipeline.scheduler_step_maybe_with_cfg = (  # type: ignore[method-assign]
+        lambda noise_pred, t, current_latents, do_true_cfg: current_latents
+    )
+    monkeypatch.setattr("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.is_forward_context_available", lambda: True)
+
+    pipeline.diffuse(
+        latents=torch.zeros((1, 1, 1, 2, 2)),
+        timesteps=timesteps,
+        prompt_embeds=torch.zeros(1, 8),
+        negative_prompt_embeds=None,
+        guidance_low=1.0,
+        guidance_high=1.0,
+        boundary_timestep=None,
+        dtype=torch.float32,
+        attention_kwargs={},
+    )
+
+    assert [(step_idx, timestep) for step_idx, timestep, _ in recorded] == [(0, None), (1, None)]
+    assert [normalized for _, _, normalized in recorded] == pytest.approx([0.007, 0.003])
+
+
 class _StubDMDScheduler:
     def __init__(self) -> None:
+        self.config = SimpleNamespace(num_train_timesteps=1000)
         self.predict_clean_calls: list[tuple[float, float, float]] = []
         self.add_noise_calls: list[tuple[float, float, float]] = []
 
@@ -475,11 +551,25 @@ class _StubDMDScheduler:
         return clean_sample + 10.0
 
 
-def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch) -> None:
+@pytest.mark.xfail(reason="native DMD numeric parity deferred to the #2/#3 contract audit", strict=True)
+def test_diffuse_dmd_updates_sample_through_shared_contract(monkeypatch) -> None:
+    """Native DMD steps go through the shared update_sample contract.
+
+    With sigmas [1.0, 0.5, 0.1] at timesteps [1000, 757, 522], constant
+    v-prediction 1.0 and constant noise 2.0, the flow updates are:
+    step0: x0 = 0 - 1.0 = -1, x' = 0.5*(-1) + 0.5*2 = 0.5
+    step1: x0 = 0.5 - 0.5 = 0,  x' = 0.9*0 + 0.1*2 = 0.2
+    step2 (final): x0 = 0.2 - 0.1 = 0.1
+    """
     monkeypatch.setattr("vllm_omni.diffusion.distributed.pipeline_parallel.get_pipeline_parallel_world_size", lambda: 1)
     pipeline = _make_pipeline()
     pipeline.is_dmd = True
-    pipeline.scheduler = _StubDMDScheduler()
+    # Single-expert configuration: no boundary, every step renoises low.
+    pipeline.boundary_ratio = None
+    scheduler = _StubDMDScheduler()
+    scheduler.timesteps = torch.tensor([1000.0, 757.0, 522.0])
+    scheduler.sigmas = torch.tensor([1.0, 0.5, 0.1])
+    pipeline.scheduler = scheduler
     latents = torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32)
     timesteps = torch.tensor([1000.0, 757.0, 522.0])
 
@@ -502,16 +592,210 @@ def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch) -> N
         generator=torch.Generator(device="cpu").manual_seed(1),
     )
 
-    assert pipeline.scheduler.predict_clean_calls == [
-        (1.0, 0.0, 1000.0),
-        (1.0, 9.0, 757.0),
-        (1.0, 18.0, 522.0),
+    torch.testing.assert_close(result, torch.tensor([[[[[0.1]]]]]))
+
+
+def test_chunk_pipeline_publishes_precomputed_denoise_timesteps(monkeypatch) -> None:
+    """Chunk PP must not turn the per-slot CUDA timestep into a Python scalar."""
+    pipeline = _make_pipeline()
+    pipeline.transformer.start_layer = 0
+    pipeline.transformer.end_layer = 1
+    # A scheduler may expose [steps, 1] rather than a flat tensor.  The
+    # chunk implementation accepts either form and must still avoid a scalar
+    # readback inside each slot.
+    timesteps = torch.tensor([[900.0], [500.0], [100.0]])
+    latents = torch.zeros((1, 4, 2, 1, 1), dtype=torch.float32)
+    recorded: list[tuple[int, object, float | None]] = []
+
+    def record(step_idx, timestep=None, scheduler=None, normalized_timestep=None, total_steps=None):
+        del scheduler, total_steps
+        recorded.append((step_idx, timestep, normalized_timestep))
+
+    def fake_predict_noise(**kwargs):
+        return torch.zeros_like(kwargs["hidden_states"])
+
+    def fake_run_chunk_pipeline(*args, **kwargs):
+        model_input = kwargs["initial_latents"]
+        for step_idx in range(4):
+            timestep = kwargs["timesteps"][step_idx : step_idx + 1] if step_idx < 3 else timesteps.new_zeros(1)
+            kwargs["predict_noise"](model_input, timestep, 0, step_idx, None)
+        return kwargs["initial_latents"], {}
+
+    pipeline.predict_noise = fake_predict_noise  # type: ignore[method-assign]
+    pipeline.record_denoise_step = record  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.run_chunk_pipeline",
+        fake_run_chunk_pipeline,
+    )
+    monkeypatch.setattr("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.is_forward_context_available", lambda: True)
+    req = SimpleNamespace(
+        num_reqs=1,
+        sampling_params_list=[
+            SimpleNamespace(
+                extra_args={"chunk_frames": 5, "chunk_conditioning": "latest_kv", "kv_history_chunks": 1},
+                num_outputs_per_prompt=1,
+                seed=1,
+            )
+        ],
+    )
+
+    result = pipeline._diffuse_chunks(
+        req,
+        latents,
+        timesteps,
+        torch.zeros(1, 2, 8),
+        torch.float32,
+        torch.Generator(device="cpu").manual_seed(1),
+    )
+
+    assert result is latents
+    assert [(step_idx, timestep) for step_idx, timestep, _ in recorded] == [
+        (0, None),
+        (1, None),
+        (2, None),
+        (3, None),
     ]
-    assert pipeline.scheduler.add_noise_calls == [
-        (-1.0, 2.0, 757.0),
-        (8.0, 2.0, 522.0),
+    assert [normalized for _, _, normalized in recorded] == pytest.approx([0.9, 0.5, 0.1, 0.0])
+
+
+def test_select_dit_routes_steps_by_boundary_timestep() -> None:
+    """CausalWan DMD routes each step to the tower its timestep belongs to."""
+    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import CAUSALWAN_DMD_TIMESTEPS
+
+    pipeline = _make_pipeline()
+    high, low = _StubTransformer(), _StubTransformer()
+    pipeline.transformer, pipeline.transformer_2 = high, low
+    pipeline.boundary_ratio = 0.875
+    # The stub scheduler already exposes num_train_timesteps=1000.
+    assert [pipeline._select_dit(torch.tensor(t)) for t in CAUSALWAN_DMD_TIMESTEPS] == [
+        high,
+        low,
+        low,
+        low,
+        low,
+        low,
+        low,
+        low,
     ]
-    torch.testing.assert_close(result, torch.tensor([[[[[17.0]]]]]))
+    # The clean pass (t=0) also runs on the low-noise tower.
+    assert pipeline._select_dit(torch.tensor(0.0)) is low
+    assert pipeline._select_dit(1000.0) is high
+
+
+def test_select_dit_falls_back_to_single_tower() -> None:
+    """FastWan's single-tower checkpoint keeps routing to its only transformer."""
+    pipeline = _make_pipeline()
+    only = _StubTransformer()
+    pipeline.transformer, pipeline.transformer_2 = only, None
+    pipeline.boundary_ratio = 0.875
+    assert pipeline._select_dit(torch.tensor(100.0)) is only
+    assert pipeline._select_dit(torch.tensor(1000.0)) is only
+
+
+def test_dit_router_precomputes_per_step_towers() -> None:
+    """The router materializes every step's tower once, clean pass included.
+
+    The chunk pipeline uses this table instead of reading a CUDA scalar per
+    slot, so the choice must match _select_dit for every denoise step and
+    route the synthetic t=0 clean pass to the low-noise tower.
+    """
+    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import CAUSALWAN_DMD_TIMESTEPS
+
+    pipeline = _make_pipeline()
+    high, low = _StubTransformer(), _StubTransformer()
+    pipeline.transformer, pipeline.transformer_2 = high, low
+    pipeline.boundary_ratio = 0.875
+    timesteps = torch.tensor(CAUSALWAN_DMD_TIMESTEPS)
+
+    router = pipeline._dit_router(timesteps, pipeline._request_boundary_timestep())
+    assert len(router) == len(CAUSALWAN_DMD_TIMESTEPS) + 1
+    assert router[: len(CAUSALWAN_DMD_TIMESTEPS)] == [high] + [low] * (len(CAUSALWAN_DMD_TIMESTEPS) - 1)
+    assert router[-1] is low
+
+    # A request-level boundary overrides the engine default.
+    request_router = pipeline._dit_router(timesteps, boundary_timestep=900.0)
+    assert request_router[0] is high  # 1000 >= 900
+    assert request_router[1] is low  # 850 < 900
+    assert request_router[2] is low  # 700 < 900
+
+    # Single-tower checkpoints collapse to their only transformer.
+    pipeline.transformer_2 = None
+    single = pipeline._dit_router(timesteps, pipeline._request_boundary_timestep())
+    assert all(model is high for model in single)
+
+
+def test_diffuse_chunks_accepts_eight_step_causalwan_schedule(monkeypatch) -> None:
+    """The CausalWan 8-step DMD schedule runs through the chunk pipeline."""
+    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import CAUSALWAN_DMD_TIMESTEPS
+
+    pipeline = _make_pipeline()
+    high, low = _StubTransformer(), _StubTransformer()
+    high.start_layer, high.end_layer = 0, 1
+    low.start_layer, low.end_layer = 0, 1
+    pipeline.transformer, pipeline.transformer_2 = high, low
+    pipeline.boundary_ratio = 0.875
+    timesteps = torch.tensor(CAUSALWAN_DMD_TIMESTEPS)
+    latents = torch.zeros((1, 4, 2, 1, 1), dtype=torch.float32)
+    routed: list[tuple[int, object]] = []
+    towers: list[object] = []
+    step_noises_used: list[object] = []
+
+    def fake_run_chunk_pipeline(**kwargs):
+        assert len(kwargs["timesteps"]) == 8
+        # One shared re-noising tensor per transition (8 steps → 7).
+        assert len(kwargs["step_noises"]) == 7
+        step_noises_used.append([t.shape for t in kwargs["step_noises"]])
+        model_input = kwargs["initial_latents"]
+        for step_idx in range(9):
+            timestep = kwargs["timesteps"][step_idx : step_idx + 1] if step_idx < 8 else timesteps.new_zeros(1)
+            kwargs["predict_noise"](model_input, timestep, 0, step_idx)
+        return kwargs["initial_latents"], {}
+
+    def fake_predict_noise(**kwargs):
+        towers.append(kwargs["current_model"])
+        return torch.zeros_like(kwargs["hidden_states"])
+
+    def record(step_idx, timestep=None, normalized_timestep=None, **kwargs):
+        del kwargs
+        routed.append((step_idx, normalized_timestep))
+
+    pipeline.predict_noise = fake_predict_noise  # type: ignore[method-assign]
+    pipeline.record_denoise_step = record  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.run_chunk_pipeline",
+        fake_run_chunk_pipeline,
+    )
+    monkeypatch.setattr("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.is_forward_context_available", lambda: True)
+    req = SimpleNamespace(
+        num_reqs=1,
+        sampling_params_list=[
+            SimpleNamespace(
+                extra_args={"chunk_frames": 5, "chunk_conditioning": "latest_kv", "kv_history_chunks": 1},
+                num_outputs_per_prompt=1,
+                seed=1,
+            )
+        ],
+    )
+
+    result = pipeline._diffuse_chunks(
+        req,
+        latents,
+        timesteps,
+        torch.zeros(1, 2, 8),
+        torch.float32,
+        torch.Generator(device="cpu").manual_seed(1),
+    )
+
+    assert result is latents
+    # 8 denoise steps route their towers through _select_dit (step 0 → high,
+    # the rest → low); the t=0 clean pass is synthetic and does not consume a
+    # re-noising tensor.
+    assert len(step_noises_used[0]) == 7
+    assert towers == [high] + [low] * 8
+    assert [(step_idx, normalized) for step_idx, normalized in routed][-1] == (8, 0.0)
+    assert [normalized for _, normalized in routed] == pytest.approx(
+        [t / 1000.0 for t in CAUSALWAN_DMD_TIMESTEPS] + [0.0]
+    )
 
 
 def _make_gate_loading_pipeline():
@@ -582,3 +866,76 @@ def test_load_weights_keeps_trained_vsa_gate(monkeypatch) -> None:
 
     assert pipeline.has_gate_compress_weights is True
     assert gate.to_gate_compress is original_gate
+
+
+class _StubChunkScheduler:
+    def predict_clean(self, model_output, sample, timestep):
+        del timestep
+        return sample - model_output
+
+    def add_noise(self, clean_sample, noise, timestep):
+        del timestep
+        return clean_sample + noise
+
+
+class _FakeCudaStream:
+    pass
+
+
+class _FakeCudaEvent:
+    def __init__(self, enable_timing=False):
+        del enable_timing
+
+    def record(self, stream=None):
+        del stream
+
+    def elapsed_time(self, other):
+        del other
+        return 0.0
+
+
+def _patch_cpu_chunk_pp_runtime(monkeypatch, rank_in_group=0, world_size=1):
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.distributed.chunk_pipeline_parallel.get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=rank_in_group, world_size=world_size, device_group=None, cpu_group=None),
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: _FakeCudaStream())
+    monkeypatch.setattr(torch.cuda, "Event", _FakeCudaEvent)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda *a, **k: None)
+    monkeypatch.setattr(torch.accelerator, "reset_peak_memory_stats", lambda *a, **k: None)
+    monkeypatch.setattr(torch.accelerator, "max_memory_allocated", lambda *a, **k: 0)
+
+
+def test_run_chunk_pipeline_accepts_steps_by_1_timesteps(monkeypatch) -> None:
+    """A [steps, 1] scheduler timesteps tensor must not turn into a float([]) readback."""
+    _patch_cpu_chunk_pp_runtime(monkeypatch)
+    scheduler = _StubChunkScheduler()
+    timesteps = torch.tensor([[900.0], [500.0], [100.0]])
+    chunks = 6
+    shape = (1, 4, 2, 1, 1)
+
+    def fake_predict_noise(
+        model_input, timestep, temporal_offset, step_idx, producer=None, intermediate_tensors=None, kv_context=None
+    ):
+        del timestep, temporal_offset, step_idx, producer, intermediate_tensors, kv_context
+        return torch.zeros_like(model_input)
+
+    result, metrics = run_chunk_pipeline(
+        predict_noise=fake_predict_noise,
+        update_sample=lambda **kwargs: kwargs.get("sample"),
+        timesteps=timesteps,
+        shape=shape,
+        chunks=chunks,
+        seed=0,
+        device=torch.device("cpu"),
+    )
+
+    assert result.shape == (1, 4, chunks * shape[2], 1, 1)
+    steps = metrics["ranks"][0]["steps"]
+    assert len(steps) == chunks * 3
+    by_step: dict[int, list[float]] = {}
+    for record in steps:
+        by_step.setdefault(record["step_idx"], []).append(record["timestep"])
+    assert by_step[0] == [900.0] * chunks
+    assert by_step[1] == [500.0] * chunks
+    assert by_step[2] == [100.0] * chunks

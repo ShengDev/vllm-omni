@@ -266,12 +266,15 @@ def test_paged_kv_admission_accepts_shape_at_profile_envelope() -> None:
     assert engine._prepare_request_for_admission(request) is request
 
 
-def test_dummy_request_preserves_multimodal_contract(
+@pytest.mark.parametrize("pipeline_mode", ["chunk", "layer", None])
+def test_chunk_pipeline_dummy_request_uses_t2v_dmd_contract(
     monkeypatch: pytest.MonkeyPatch,
+    pipeline_mode: str | None,
 ) -> None:
     engine = DiffusionEngine.__new__(DiffusionEngine)
     engine.od_config = SimpleNamespace(model_class_name="mock_model")
-    engine.od_config.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
+    if pipeline_mode is not None:
+        engine.od_config.parallel_config = SimpleNamespace(pipeline_parallel_mode=pipeline_mode)
 
     monkeypatch.setattr(
         "vllm_omni.diffusion.diffusion_engine.supports_multimodal_input",
@@ -296,13 +299,27 @@ def test_dummy_request_preserves_multimodal_contract(
     assert request.is_dummy_run()
     params = request.sampling_params
     assert (params.height, params.width, params.num_outputs_per_prompt) == (32, 64, 1)
-    multimodal = request.prompt["multi_modal_data"]
-    assert len(multimodal["image"]) == 2
-    assert all(image.size == (64, 32) and image.mode == "RGB" for image in multimodal["image"])
-    assert multimodal["audio"].shape == (32000,)
-    assert multimodal["audio"].dtype.name == "float32"
-    assert params.guidance_scale == 5.5
-    assert params.num_inference_steps == 7
-    assert params.num_frames == 1
-    assert params.extra_args == {"cfg_text_scale": 1.0, "cfg_img_scale": 1.0}
-    get_num_frames.assert_called_once_with("mock_model", True)
+    if pipeline_mode == "chunk":
+        assert "multi_modal_data" not in request.prompt
+        assert params.guidance_scale == 1.0
+        assert params.num_inference_steps == 3
+        assert params.num_frames == 9
+        assert params.extra_args == {
+            "cfg_text_scale": 1.0,
+            "cfg_img_scale": 1.0,
+            "chunk_frames": 1,
+            "chunk_cond_frames": 1,
+            "chunk_gap": 1,
+        }
+        get_num_frames.assert_called_once_with("mock_model", False)
+    else:
+        multimodal = request.prompt["multi_modal_data"]
+        assert len(multimodal["image"]) == 2
+        assert all(image.size == (64, 32) and image.mode == "RGB" for image in multimodal["image"])
+        assert multimodal["audio"].shape == (32000,)
+        assert multimodal["audio"].dtype.name == "float32"
+        assert params.guidance_scale == 5.5
+        assert params.num_inference_steps == 7
+        assert params.num_frames == 1
+        assert params.extra_args == {"cfg_text_scale": 1.0, "cfg_img_scale": 1.0}
+        get_num_frames.assert_called_once_with("mock_model", True)
