@@ -112,10 +112,10 @@ class VersionPool:
         start = slot * self.chunk_blocks
         return list(range(start, start + self.chunk_blocks))
 
-    def tensor_dict(self, slot: int) -> dict[str, torch.Tensor]:
+    def tensor_dict(self, slot: int, num_blocks: int) -> dict[str, torch.Tensor]:
         payload: dict[str, torch.Tensor] = {}
         start = slot * self.chunk_blocks
-        end = start + self.chunk_blocks
+        end = start + num_blocks
         for layer in range(self.num_layers):
             payload[f"k.{layer}"] = self.kv_pools[layer][0][start:end].contiguous()
             payload[f"v.{layer}"] = self.kv_pools[layer][1][start:end].contiguous()
@@ -123,7 +123,7 @@ class VersionPool:
 
     def copy_into(self, slot: int, payload: dict[str, torch.Tensor]) -> None:
         start = slot * self.chunk_blocks
-        end = start + self.chunk_blocks
+        end = start + payload["k.0"].shape[0]
         for layer in range(self.num_layers):
             self.kv_pools[layer][0][start:end].copy_(payload[f"k.{layer}"])
             self.kv_pools[layer][1][start:end].copy_(payload[f"v.{layer}"])
@@ -185,6 +185,7 @@ class VersionedKVTransport:
         *,
         rank: int,
         pp_group: Any | None,
+        chunk_tokens_by_request: dict[str, int],
     ) -> list[Any]:
         """Post this slot's transfers. Returns only the local *send* handles.
 
@@ -200,7 +201,8 @@ class VersionedKVTransport:
             key = _version_key(xfer.req, xfer.version)
             if xfer.src == rank:
                 slot = self.pool.slot_of(key)
-                payload = self.pool.tensor_dict(slot)
+                num_blocks = chunk_tokens_by_request[xfer.req] // self.pool.block_size
+                payload = self.pool.tensor_dict(slot, num_blocks)
                 self.bytes_sent += _payload_bytes(payload)
                 self._send_handles.extend(pp_group.isend_tensor_dict(payload, dst=xfer.dst))
             elif xfer.dst == rank:
@@ -377,7 +379,9 @@ class VersionedKVState:
     def exchange(self, slot: int) -> list[Any]:
         transfers = union_transfers(self._inflight, slot)
         self.transfers_deduped = len(transfers)
-        handles = self.cache.transport.exchange(transfers, rank=self._rank, pp_group=self._pp_group)
+        handles = self.cache.transport.exchange(
+            transfers, rank=self._rank, pp_group=self._pp_group, chunk_tokens_by_request=self._chunk_tokens
+        )
         self.bytes_sent = self.cache.transport.bytes_sent
         self.bytes_received = self.cache.transport.bytes_received
         return handles
