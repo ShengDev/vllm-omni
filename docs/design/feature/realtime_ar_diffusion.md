@@ -224,28 +224,6 @@ This contract does not currently provide:
 Those features can be layered on top without adding LingBot-specific identity
 or lifecycle fields to the generic runtime.
 
-## Related: Noisy PP (experimental)
-
-Noisy PP (`Ordering.SERIAL` / Latest-KV interleaved chunk scheduling within one
-request) is documented in
-[noisy_pp](noisy_pp.md). Those orderings are
-**in-generation strategies** for one ChunkPlan / one work set of chunks; they are
-not properties of a session. A session (optional) only decides whether clean KV
-survives across successive generations.
-
-**Pipeline ownership** (detail in
-[ar_diffusion_pipeline_capability](../ar_diffusion_pipeline_capability.md#pipeline-ownership-shared-orchestration-vs-model-custom-loops)):
-shared `chunk_schedule` / `chunk_executor` are the default orchestration for
-opt-in chunk pipelines; DreamZero / LingBot may keep a fully model-owned loop,
-or later mix shared plan helpers with model hooks. Runner only binds KV/session.
-
-**Compatibility:** DreamZero and LingBot keep their current paged-session
-`forward` / stepwise paths as the default (implicitly serial inside the model).
-Wiring an optional session around an explicit Chunk Serial/Latest backend is
-opt-in and must not silently replace those backends. Effective Latest-KV still
-needs vertical PP (`S=T+1`) and a separate deploy; default DreamZero / LingBot
-YAMLs stay on the existing topologies.
-
 ## Required regression coverage
 
 CPU contract tests cover:

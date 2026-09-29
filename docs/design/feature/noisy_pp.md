@@ -257,11 +257,10 @@ PP size for `S > 1`.
 
 - No TP × Noisy PP composition yet; WaveServe experimental DiT is PP-oriented.
 - Runner still branches paged session KV vs NoisyKV at preallocate time.
-- Optional Session⊕Chunk resident-clean eviction is specified but not required
-  for #102 feature acceptance.
-- Open implementation questions: dedicated CUDA stream for KV P2P vs compute;
-  varlen vs padded micro-batches; metadata envelope when a tick submits `N>1`
-  chunks.
+- Noisy PP is not wired to session yet.
+- Dedicated CUDA stream for KV P2P vs compute.
+- Micro-batch packing — varlen vs pad to max length in a slot (`R`).
+- Metadata envelope when a tick submits `N>1` chunks.
 
 ## Related
 

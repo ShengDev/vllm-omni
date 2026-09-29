@@ -175,7 +175,7 @@ public API.
 
 `SupportsARDiffusionChunkPipeline` (NoisyKV + chunk context) is the capability
 surface for **Noisy PP**, documented in [noisy_pp](feature/noisy_pp.md).
-**Serial and Latest are in-generation scheduling strategies** (`Ordering`); they
+**SERIAL and Latest are in-generation scheduling strategies** (`Ordering`); they
 do not require a session. A session, when present, only retains clean KV across
 generations.
 
@@ -195,7 +195,7 @@ in the model file.” The stable split is:
 | Layer | Owns | Does not own |
 | --- | --- | --- |
 | Runner | KV / session pools, bind/unbind, LRU, fail-closed cleanup | Denoise math, chunk loop body, condition schemas |
-| Shared chunk libs (`chunk_schedule`, `chunk_executor`, `NoisyKV`) | Default Serial / Latest plan and slot loop | Model-specific noise, commit timing, CFG / camera / action |
+| Shared chunk libs (`chunk_schedule`, `chunk_executor`, `NoisyKV`) | Default SERIAL / Latest plan and slot loop | Model-specific noise, commit timing, CFG / camera / action |
 | Pipeline (model file) | Whether to use shared libs or keep a private loop; adapter hooks | Session routing and pool capacity policy |
 
 Three legitimate pipeline shapes (opt-in by capability, never silent switch):
@@ -203,7 +203,7 @@ Three legitimate pipeline shapes (opt-in by capability, never silent switch):
 ```text
 共享默认路径（抽出共用）
   chunk_schedule / chunk_executor / NoisyKV
-  Serial | Latest 的通用语义
+  SERIAL | Latest 的通用语义
 
 模型 Pipeline（定制面）
   ├─ 选用共用：声明 SupportsARDiffusionChunkPipeline，少写循环（WaveServe）
@@ -221,5 +221,5 @@ override?” Runner continues to bind KV/session only—it must not swallow a
 model-owned rollout loop.
 
 Compatibility gate: unadapted DreamZero / LingBot deploys stay on the paged
-session + in-model loop path. Chunk Serial/Latest and any hybrid hooks are
+session + in-model loop path. Chunk SERIAL/Latest and any hybrid hooks are
 opt-in surfaces and separate deploys when they need vertical PP.
