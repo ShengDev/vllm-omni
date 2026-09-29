@@ -255,12 +255,12 @@ PP size for `S > 1`.
 
 ## Limitations and open issues
 
-- No TP × Noisy PP composition yet; WaveServe experimental DiT is PP-oriented.
-- Runner still branches paged session KV vs NoisyKV at preallocate time.
+- Original paged-session path (DreamZero / LingBot) and Noisy PP (WaveServe /
+  NoisyKV) stay separate: runner preallocates one or the other; no TP × Noisy PP
+  composition yet (WaveServe DiT is PP-oriented).
 - Noisy PP is not wired to session yet.
-- Dedicated CUDA stream for KV P2P vs compute.
-- Micro-batch packing — varlen vs pad to max length in a slot (`R`).
-- Metadata envelope when a tick submits `N>1` chunks.
+- Micro-batch packing in a slot (`R`): varlen vs pad; metadata envelope when a
+  tick carries `N>1` chunks / multiple identities.
 
 ## Related
 

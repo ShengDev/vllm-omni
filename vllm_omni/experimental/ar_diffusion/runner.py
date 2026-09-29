@@ -414,7 +414,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         scheduler_output: DiffusionSchedulerOutput,
         od_config: OmniDiffusionConfig,
     ) -> BatchRunnerOutput:
-        """Latest-KV stage pipelines batch same-step requests; timeline KV stays single-seq."""
+        """Noisy PP chunk path may micro-batch requests; paged timeline KV stays single-seq."""
         if self.noisy_kv_cache is not None and self._ar_diffusion_chunk_capability is not None:
             with self._ar_diffusion_chunk_capability.bind_ar_diffusion_chunk_context(self._make_chunk_context()):
                 return super().execute_model_batch(scheduler_output, od_config)
