@@ -38,7 +38,6 @@ from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
 
-
 logger = init_logger(__name__)
 
 HF_MODEL_ID = "Physis-AI/waveserve-wan2.1-1.3b-diffusers-rf-dev"
@@ -163,9 +162,9 @@ class _LatentChunkAdapter(ChunkAdapter):
         # Per-request current latents keyed by chunk while in flight on this rank
         self._live: dict[str, dict[int, torch.Tensor]] = {}
 
-    def _init_noise(self, req: str, chunk: int) -> torch.Tensor:
+    def _init_noise(self, chunk: int) -> torch.Tensor:
         gen = torch.Generator(device=self.device)
-        gen.manual_seed(self.seed * 1_000_003 + hash(req) % 1_000_000 + chunk * 4096)
+        gen.manual_seed(self.seed * 1_000_003 + chunk * 4096)
         return torch.randn(self.latent_shape, generator=gen, device=self.device, dtype=self.dtype)
 
     @staticmethod
@@ -185,7 +184,7 @@ class _LatentChunkAdapter(ChunkAdapter):
             if hidden is None:
                 latent = live.get(chunk)
                 if latent is None:
-                    latent = self._init_noise(req, chunk)
+                    latent = self._init_noise(chunk)
             elif isinstance(hidden, torch.Tensor):
                 latent = self._slice_batch(hidden, i, len(tasks))
             elif isinstance(hidden, dict):

@@ -15,9 +15,11 @@ import torch
 
 from vllm_omni.diffusion.models.waveserve_wan.pipeline_waveserve_wan import (
     HF_MODEL_ID,
+    FlowEuler,
     WaveServeWanPipeline,
+    _LatentChunkAdapter,
 )
-from vllm_omni.diffusion.models.waveserve_wan.transformer import stage_layer_range
+from vllm_omni.diffusion.models.waveserve_wan.transformer import StageWanTransformer, stage_layer_range
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.experimental.ar_diffusion.chunk_executor import (
     ARDiffusionChunkContext,
@@ -38,6 +40,23 @@ def test_stage_layer_range_covers_all_layers():
     assert covered == list(range(30))
     assert stage_layer_range(30, 0, 2) == (0, 15)
     assert stage_layer_range(30, 1, 2) == (15, 30)
+
+
+def test_waveserve_chunk_noise_matches_reference_seed():
+    shape = (1, 16, 1, 2, 2)
+    seed, chunk = 7, 2
+    adapter = _LatentChunkAdapter(
+        StageWanTransformer(num_layers=1, dim=32, num_heads=2, ffn_dim=64, tiny=True),
+        sampler=FlowEuler(3, shift=5.0),
+        prompt_embeds=torch.empty(1, 1, 32),
+        latent_shape=shape,
+        seed=seed,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    reference = torch.randn(shape, generator=torch.Generator().manual_seed(seed * 1_000_003 + chunk * 4096))
+    torch.testing.assert_close(adapter._init_noise(chunk), reference)
+    torch.testing.assert_close(adapter._init_noise(chunk), reference)
 
 
 def test_waveserve_tiny_forward_cpu():
