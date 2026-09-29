@@ -8,7 +8,7 @@ from datetime import timedelta
 import pytest
 import torch
 
-from tests.helpers.runtime import get_distributed_init_method
+from tests.helpers.runtime import get_open_port
 from vllm_omni.diffusion.distributed.group_coordinator import GroupCoordinator
 from vllm_omni.experimental.ar_diffusion.chunk_schedule import ChunkSchedule, Inflight, Ordering, build_chunk_plan
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
@@ -124,7 +124,7 @@ def _transfer_worker(rank: int, chunk_tokens: int, init_method: str, device_kind
 def test_noisy_kv_transfer_uses_valid_blocks(chunk_tokens: int, mode: str) -> None:
     torch.multiprocessing.spawn(
         _transfer_worker,
-        args=(chunk_tokens, get_distributed_init_method(), "cpu", mode),
+        args=(chunk_tokens, f"tcp://127.0.0.1:{get_open_port()}", "cpu", mode),
         nprocs=2,
     )
 
@@ -132,6 +132,6 @@ def test_noisy_kv_transfer_uses_valid_blocks(chunk_tokens: int, mode: str) -> No
 def test_unused_inbound_kv_finishes_before_page_reuse() -> None:
     torch.multiprocessing.spawn(
         _transfer_worker,
-        args=(4, get_distributed_init_method(), "cpu", "discard"),
+        args=(4, f"tcp://127.0.0.1:{get_open_port()}", "cpu", "discard"),
         nprocs=2,
     )
