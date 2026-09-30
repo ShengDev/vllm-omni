@@ -21,6 +21,7 @@ from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.waveserve_wan.transformer import StageWanTransformer
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -265,6 +266,17 @@ class WaveServeWanPipeline(nn.Module):
             pp_rank=pp_rank,
             transformer_config=transformer_config,
         )
+        # Without this the Diffusers loader's get_all_weights() is empty, so the
+        # DiT stays at init (zeros / garbage NaN biases) and every video is NaN.
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=model_path,
+                subfolder="transformer",
+                revision=None,
+                prefix="transformer.",
+                fall_back_to_pt=True,
+            )
+        ]
         self.tokenizer = None
         self.text_encoder = None
         self.vae = None
