@@ -71,7 +71,9 @@ def _resolve_deploy(args: argparse.Namespace, world: int) -> Path:
     cfg = OmegaConf.load(base)
     stage0 = cfg.stages[0]
     current_pp = int(OmegaConf.select(stage0, "parallel_config.pipeline_parallel_size") or 1)
-    current_s = int(OmegaConf.select(stage0, "model_config.ar_diffusion_stage_config.stage_parallel_size") or current_pp)
+    current_s = int(
+        OmegaConf.select(stage0, "model_config.ar_diffusion_stage_config.stage_parallel_size") or current_pp
+    )
     stages = args.denoise_steps + 1
     layer_groups = args.gpus_per_stage
     if stages * layer_groups != world:

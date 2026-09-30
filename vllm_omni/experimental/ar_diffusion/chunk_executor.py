@@ -42,8 +42,8 @@ def _cuda_sync() -> None:
     try:
         import torch
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        if torch.accelerator.is_available():
+            torch.accelerator.synchronize()
     except Exception:
         return
 
