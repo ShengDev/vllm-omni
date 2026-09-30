@@ -13,14 +13,14 @@ from typing import Any
 
 from vllm.logger import init_logger
 
-from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVState
 from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
+    ChunkPlan,
     ChunkStep,
     Inflight,
-    ChunkPlan,
     can_admit,
     rank_work,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVState
 
 #: Wall time of each *active* slot (rank has work) on rank 0.
 #: Experimental telemetry only; a harness clears it per request.
@@ -217,65 +217,71 @@ def run_chunk_pipeline(
     limit = max_slots if max_slots is not None else 10**9
     pending_hidden: Any | None = None
     pipeline_started = time.perf_counter()
-    while (ctx.inflight or ctx.pending) and slot < limit:
-        slot_started = time.perf_counter()
-        ctx.admit_pending(slot)
-        kv.set_inflight(tuple(ctx.inflight))
-        tasks = rank_work(tuple(ctx.inflight), slot, spec.rank)
-        _assert_i8(tasks)
-        contexts = kv.prepare(tasks) if tasks else []
-        output = None
-        if tasks:
-            output = adapter.forward(tasks, contexts, hidden=pending_hidden)
-            kv.publish(tasks)
-        comm_handles: list[Any] = []
-        world = spec.topology.world
-        if pp is not None and world > 1:
-            last_rank = world - 1
-            # S=1: last→0 is latent feedback for the next denoise step.
-            # S=T+1: the next step lives on the next ranks; rank 0 starts new chunks.
-            if spec.topology.stages == 1 and rank_work(tuple(ctx.inflight), slot, last_rank):
-                if output is not None and spec.rank == last_rank:
-                    comm_handles.extend(pp.isend_tensor_dict(adapter.pack_activation(output), dst=0))
-                elif spec.rank == 0:
-                    recv, recv_handles, _ = pp.irecv_tensor_dict(src=last_rank)
-                    comm_handles.extend(recv_handles)
-                    pending_hidden = adapter.unpack_activation(recv)
-            for src in range(last_rank):
-                dst = src + 1
-                if not rank_work(tuple(ctx.inflight), slot, src):
-                    continue
-                if spec.rank == src and output is not None:
-                    comm_handles.extend(pp.isend_tensor_dict(adapter.pack_activation(output), dst=dst))
-                elif spec.rank == dst:
-                    recv, recv_handles, _ = pp.irecv_tensor_dict(src=src)
-                    comm_handles.extend(recv_handles)
-                    pending_hidden = adapter.unpack_activation(recv)
-        comm_handles.extend(kv.exchange(slot))
-        # ① Outbound not left dangling: only this rank's own posted handles.
-        _wait(comm_handles)
-        still = []
-        for item in ctx.inflight:
-            local = slot - item.t0
-            if local + 1 < item.plan.num_slots:
-                still.append(item)
-            else:
-                kv.end_request(item.req)
-        ctx.inflight = still
-        kv.set_inflight(tuple(ctx.inflight))
-        # ② Next slot's sources: wait only the inbound versions slot+1 reads.
-        kv.evict(slot)
-        kv.await_ready(slot)
-        if spec.rank == 0 and tasks:
-            # Active slots only — idle bubbles would dominate SERIAL medians.
+    try:
+        while (ctx.inflight or ctx.pending) and slot < limit:
+            slot_started = time.perf_counter()
+            ctx.admit_pending(slot)
+            kv.set_inflight(tuple(ctx.inflight))
+            tasks = rank_work(tuple(ctx.inflight), slot, spec.rank)
+            _assert_i8(tasks)
+            contexts = kv.prepare(tasks) if tasks else []
+            output = None
+            if tasks:
+                output = adapter.forward(tasks, contexts, hidden=pending_hidden)
+                kv.publish(tasks)
+            comm_handles: list[Any] = []
+            world = spec.topology.world
+            if pp is not None and world > 1:
+                last_rank = world - 1
+                # S=1: last→0 is latent feedback for the next denoise step.
+                # S=T+1: the next step lives on the next ranks; rank 0 starts new chunks.
+                if spec.topology.stages == 1 and rank_work(tuple(ctx.inflight), slot, last_rank):
+                    if output is not None and spec.rank == last_rank:
+                        comm_handles.extend(pp.isend_tensor_dict(adapter.pack_activation(output), dst=0))
+                    elif spec.rank == 0:
+                        recv, recv_handles, _ = pp.irecv_tensor_dict(src=last_rank)
+                        comm_handles.extend(recv_handles)
+                        pending_hidden = adapter.unpack_activation(recv)
+                for src in range(last_rank):
+                    dst = src + 1
+                    if not rank_work(tuple(ctx.inflight), slot, src):
+                        continue
+                    if spec.rank == src and output is not None:
+                        comm_handles.extend(pp.isend_tensor_dict(adapter.pack_activation(output), dst=dst))
+                    elif spec.rank == dst:
+                        recv, recv_handles, _ = pp.irecv_tensor_dict(src=src)
+                        comm_handles.extend(recv_handles)
+                        pending_hidden = adapter.unpack_activation(recv)
+            comm_handles.extend(kv.exchange(slot))
+            # ① Outbound not left dangling: only this rank's own posted handles.
+            _wait(comm_handles)
+            still = []
+            for item in ctx.inflight:
+                local = slot - item.t0
+                if local + 1 < item.plan.num_slots:
+                    still.append(item)
+                else:
+                    kv.end_request(item.req)
+            ctx.inflight = still
+            kv.set_inflight(tuple(ctx.inflight))
+            # ② Next slot's sources: wait only the inbound versions slot+1 reads.
+            kv.evict(slot)
+            kv.await_ready(slot)
+            if spec.rank == 0 and tasks:
+                # Active slots only — idle bubbles would dominate SERIAL medians.
+                _cuda_sync()
+                _record_slot(time.perf_counter() - slot_started)
+            slot += 1
+        # Teardown: land anything the narrowed waits skipped.
+        kv.drain()
+        if spec.rank == 0:
             _cuda_sync()
-            _record_slot(time.perf_counter() - slot_started)
-        slot += 1
-    # Teardown: land anything the narrowed waits skipped.
-    kv.drain()
-    if spec.rank == 0:
-        _cuda_sync()
-        _record_pipeline(time.perf_counter() - pipeline_started)
+            _record_pipeline(time.perf_counter() - pipeline_started)
+    except Exception:
+        # Fail-closed: release VersionPool slots so later requests are not stranded.
+        for req in {item.req for item in ctx.inflight} | {item.req for item in ctx.pending}:
+            ctx.drop(req)
+        raise
 
 
 @contextmanager

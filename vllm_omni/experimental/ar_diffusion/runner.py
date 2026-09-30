@@ -19,15 +19,15 @@ from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunn
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVCacheSpec,
-    SupportsARDiffusionPipeline,
     SupportsARDiffusionChunkPipeline,
+    SupportsARDiffusionPipeline,
     SupportsARDiffusionWarmup,
     supports_chunk_step_grouping,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
-from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVCache, NoisyKVState
+from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.platforms import current_omni_platform
 
@@ -395,9 +395,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                     output = super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
             except Exception:
                 ctx.kv.reset_all()
-                logger.warning(
-                    "AR-Diffusion chunk forward failed; NoisyKV versions were released fail-closed"
-                )
+                logger.warning("AR-Diffusion chunk forward failed; NoisyKV versions were released fail-closed")
                 raise
             self._perf_e2e_times.append(time.perf_counter() - started)
             return output
@@ -432,9 +430,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                     return super().execute_model_batch(scheduler_output, od_config)
             except Exception:
                 ctx.kv.reset_all()
-                logger.warning(
-                    "AR-Diffusion chunk batch failed; NoisyKV versions were released fail-closed"
-                )
+                logger.warning("AR-Diffusion chunk batch failed; NoisyKV versions were released fail-closed")
                 raise
         raise RuntimeError(
             "ARDiffusionModelRunner does not support request-batch execution; use request mode with max_num_seqs=1."

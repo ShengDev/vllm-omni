@@ -7,11 +7,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
-    ARDiffusionNoisyKVSpec,
-    NoisyKVCache,
-    NoisyKVState,
-)
 from vllm_omni.experimental.ar_diffusion.chunk_executor import (
     ARDiffusionChunkContext,
     ChunkAdapter,
@@ -19,7 +14,12 @@ from vllm_omni.experimental.ar_diffusion.chunk_executor import (
     ChunkTopology,
     run_chunk_pipeline,
 )
-from vllm_omni.experimental.ar_diffusion.chunk_schedule import Ordering, ChunkSchedule, build_chunk_plan
+from vllm_omni.experimental.ar_diffusion.chunk_schedule import ChunkSchedule, Ordering, build_chunk_plan
+from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
+    ARDiffusionNoisyKVSpec,
+    NoisyKVCache,
+    NoisyKVState,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -147,3 +147,46 @@ def test_continuous_batch_two_requests_same_tokens():
     assert reqs_seen == {"A", "B"}
     assert not ctx.inflight
     assert not ctx.pending
+
+
+def test_executor_releases_versions_when_forward_raises():
+    plan = build_chunk_plan(
+        ChunkSchedule(
+            chunks=1,
+            num_denoise_steps=1,
+            stages=1,
+            layer_groups=1,
+            ordering=Ordering.SERIAL,
+            kv_history_chunks=1,
+        )
+    )
+    cache = NoisyKVCache(
+        ARDiffusionNoisyKVSpec(
+            num_layers=1,
+            num_kv_heads=2,
+            head_size=4,
+            block_size=4,
+            max_chunk_tokens=4,
+            max_history_chunks=1,
+        ),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        layer_groups=1,
+        max_batch_size=1,
+    )
+    kv = NoisyKVState(cache)
+    ctx = ARDiffusionChunkContext(
+        spec=ChunkRunSpec(topology=ChunkTopology(stages=1, layer_groups=1), rank=0),
+        kv=kv,
+    )
+    assert ctx.admit("A", plan, chunk_tokens=4, slot=0)
+
+    class BoomAdapter(CountingAdapter):
+        def forward(self, tasks, kv_contexts, *, hidden):
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        run_chunk_pipeline(ctx=ctx, adapter=BoomAdapter())
+    assert not ctx.inflight
+    assert not ctx.pending
+    assert len(cache.pool.keys) == 0

@@ -1,11 +1,17 @@
 # WaveServe Wan / Noisy PP (experimental)
 
+> Experimental offline Noisy PP on WaveServe Wan 2.1 1.3B (rectified-flow).
+> Deviations from [`TEMPLATE.md`](../TEMPLATE.md): this is an opt-in AR-Diffusion
+> feature recipe (not a supported-models claim); hardware is stated as a
+> qualification profile for #102 acceptance, not a GA hardware matrix.
+
 ## Summary
 
 - Vendor: Physis-AI
 - Model: `Physis-AI/waveserve-wan2.1-1.3b-diffusers-rf-dev` (Wan 2.1 T2V 1.3B, rectified-flow)
 - Task: **Noisy PP** — chunk-autoregressive text-to-video with Serial / Latest-KV within one request
 - Mode: Offline Omni with `deploy/waveserve_wan.yaml` + `ARDiffusionEngine`
+- Hardware: multi-GPU CUDA (qualify with `S = num_denoise_steps + 1`, `G ≥ 1`)
 - Tracking: [project #102](https://github.com/JiusiServe/vllm-omni-project-manage/issues/102) (feature, v0.31); [#103](https://github.com/JiusiServe/vllm-omni-project-manage/issues/103) (model quality, v0.32)
 - Maintainer: Community (experimental)
 
@@ -19,6 +25,17 @@ This recipe intentionally avoids a model-specific Python example under
 `examples/` (see contributing examples policy). Commands use the shared Omni
 Python API and the noisy_pp bench script.
 
+## Supported model contract
+
+| Item | Contract |
+| --- | --- |
+| Task | Offline text-to-video via Omni `generate` |
+| Checkpoint | `Physis-AI/waveserve-wan2.1-1.3b-diffusers-rf-dev` (experimental distilled RF) |
+| Entrypoint | Omni + `vllm_omni/deploy/waveserve_wan.yaml` (not `vllm serve --omni` GA path) |
+| `chunk_schedule` | Request `extra_args`: `serial` \| `latest` (unknown values raise) |
+| Topology | `pipeline_parallel_size = S · G`, `S ∈ {1, T+1}`, `G ≥ 1` |
+| Acceptance (#102) | Reproducible basic function + config logging; no FPS / realtime SLA |
+
 ## References
 
 - Design: [`docs/design/feature/noisy_pp.md`](../../docs/design/feature/noisy_pp.md)
@@ -27,23 +44,22 @@ Python API and the noisy_pp bench script.
 - Project issue: [#102 Noisy PP feature support](https://github.com/JiusiServe/vllm-omni-project-manage/issues/102)
 - Related RFC: [Unified KV Cache Management for the AR-Diffusion Engine](https://github.com/vllm-project/vllm-omni/issues/4366)
 
-## Notes
+## Hardware
 
-- **Noisy PP** topology: `pipeline_parallel_size = S · G` with `S = num_denoise_steps + 1`
-  (denoise stages + clean). `G = 1` keeps a full DiT per stage rank; `G > 1`
-  splits layers within each stage (`forward_latent_step` + activation pack
-  `{latent[, hidden_states]}`).
-- Do **not** wrap Omni in `torchrun`; use the mp executor from deploy YAML.
-- The test checkpoint was distilled with timestep **shift 5.0**.
-- `chunk_schedule` is a request `extra_args` choice (`serial` | `latest`), not a
-  separate deploy fork. Acceptance for #102 is reproducible basic function + config
-  logging; FPS / speedup / realtime SLA are out of scope for this phase.
+- Accelerator: NVIDIA CUDA GPUs (NVLink or PCIe); qualify with enough cards for `S · G`
+- Profile used for #102 smoke: 5× GPU with `S=5`, `G=1` (`T=4` denoise + clean)
+- Qualification scope: experimental; not a GA hardware claim
 
-## GPU
+## Software environment
 
-### 5× GPU (S=5, T=4 denoise + clean)
+- OS: Linux
+- Python: 3.10+
+- Driver / runtime: NVIDIA driver with a CUDA runtime supported by your PyTorch build
+- vLLM / vLLM-Omni: match the repository checkout you are validating
 
-#### Offline generate (Latest-KV)
+## Command
+
+### Offline generate (Latest-KV, S=5)
 
 ```bash
 python - <<'PY'
@@ -85,7 +101,7 @@ finally:
 PY
 ```
 
-#### Serial vs Latest bench
+### Serial vs Latest bench
 
 ```bash
 python benchmarks/noisy_pp/waveserve_serial_vs_latest.py \
@@ -113,8 +129,36 @@ python benchmarks/noisy_pp/waveserve_serial_vs_latest.py \
   --chunks 1 --history 2 --repeat 1 --regimes serial
 ```
 
+## Verification
+
+```bash
+# Expect JSON with serial/latest timings and no traceback
+test -f outputs/omni_s5_c7.json && python -c 'import json; print(sorted(json.load(open("outputs/omni_s5_c7.json"))))'
+```
+
 Note: `denoise-steps` must satisfy `world-size == (denoise-steps + 1) * gpus-per-stage`.
 For a pure S=1 smoke the bench currently requires `denoise-steps + 1 == world-size`;
 use a one-off deploy YAML with `pipeline_parallel_size: 1` / `stage_parallel_size: 1`
 and `num_denoise_steps: 1` if you need S=1 with T≥1 on a single card (Omni allows
 `S ∈ {1, T+1}`).
+
+## Notes
+
+- **Noisy PP** topology: `pipeline_parallel_size = S · G` with `S = num_denoise_steps + 1`
+  (denoise stages + clean). `G = 1` keeps a full DiT per stage rank; `G > 1`
+  splits layers within each stage (`forward_latent_step` + activation pack
+  `{latent[, hidden_states]}`).
+- Do **not** wrap Omni in `torchrun`; use the mp executor from deploy YAML.
+- The test checkpoint was distilled with timestep **shift 5.0**.
+- FPS / speedup / realtime SLA are out of scope for this phase (#102).
+
+## Supported features
+
+| Feature | Status |
+| --- | --- |
+| Offline Omni generate | Yes (experimental) |
+| Serial / Latest-KV `chunk_schedule` | Yes |
+| Vertical PP `S=T+1` | Yes |
+| Layer groups `G>1` | Code path present; device evidence tracked under #102 |
+| Online `vllm serve --omni` | Not claimed |
+| DreamZero / LingBot session path | Unchanged (separate deploy) |

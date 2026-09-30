@@ -2,17 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage-local Wan DiT for WaveServe chunk serving.
 
-Non-tiny path reuses ``wan2_2.WanTransformer3DModel`` (same diffusers Wan 2.1
-weight layout / ``load_weights``) and runs real 5D latent steps via
-``forward_latent_step``. Layer split follows WaveServe ``G`` (not Omni ``S·G``
-PP ranks) via explicit ``layer_pp_rank`` / ``layer_pp_world`` on the Wan builder.
+Reuses ``wan2_2.WanTransformer3DModel`` (same diffusers Wan 2.1 weight layout /
+``load_weights``) and runs real 5D latent steps via ``forward_latent_step``.
+Layer split follows WaveServe ``G`` (not Omni ``S·G`` PP ranks) via explicit
+``layer_pp_rank`` / ``layer_pp_world`` on the Wan builder.
 
 ``forward_latent_step`` is G-aware: stage-first patches, middle groups resume
 from ``IntermediateTensors``, stage-last unpatches. Activation packs carry
 ``latent`` (and ``hidden_states`` between groups) along the PP chain.
-
-Tiny path keeps a small CPU-only stack for unit tests that must not require
-distributed Wan linear layers.
 """
 
 from __future__ import annotations
@@ -24,11 +21,9 @@ from typing import Any
 import torch
 import torch.nn as nn
 from vllm.logger import init_logger
-from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import paged_write_attn
-
 
 logger = init_logger(__name__)
 
@@ -58,46 +53,6 @@ def stage_layer_range(num_layers: int, group: int, groups: int) -> tuple[int, in
     return (num_layers * group) // groups, (num_layers * (group + 1)) // groups
 
 
-class StageWanSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, head_dim: int) -> None:
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.qkv = nn.Linear(dim, dim * 3, bias=True)
-        self.o_proj = nn.Linear(dim, dim, bias=True)
-        self.scale = head_dim**-0.5
-
-    def forward(self, hidden: torch.Tensor, kv_ctx: Any | None) -> torch.Tensor:
-        b, s, _ = hidden.shape
-        qkv = self.qkv(hidden).view(b, s, 3, self.num_heads, self.head_dim)
-        query, key, value = qkv.unbind(dim=2)
-        if kv_ctx is not None:
-            inputs = kv_ctx.to_layer_inputs() if hasattr(kv_ctx, "to_layer_inputs") else kv_ctx
-            outs = [
-                paged_write_attn(inputs, query[i], key[i], value[i], None, None, self.scale)
-                for i in range(b)
-            ]
-            attn = torch.stack(outs, dim=0)
-        else:
-            scores = torch.einsum("bqhd,bkhd->bhqk", query.float(), key.float()) * self.scale
-            probs = torch.softmax(scores, dim=-1).to(value.dtype)
-            attn = torch.einsum("bhqk,bkhd->bqhd", probs, value)
-        return self.o_proj(attn.flatten(-2))
-
-
-class StageWanBlock(nn.Module):
-    def __init__(self, dim: int, num_heads: int, head_dim: int, ffn_dim: int) -> None:
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = StageWanSelfAttention(dim, num_heads, head_dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(), nn.Linear(ffn_dim, dim))
-
-    def forward(self, hidden: torch.Tensor, kv_ctx: Any | None) -> torch.Tensor:
-        hidden = hidden + self.attn(self.norm1(hidden), kv_ctx)
-        return hidden + self.ffn(self.norm2(hidden))
-
-
 def _wan_self_attn_with_kv(
     attn: nn.Module,
     hidden_states: torch.Tensor,
@@ -121,9 +76,7 @@ def _wan_self_attn_with_kv(
     scale = 1.0 / (attn.head_dim**0.5)
     if kv_ctx is not None:
         inputs = kv_ctx.to_layer_inputs() if hasattr(kv_ctx, "to_layer_inputs") else kv_ctx
-        outs = [
-            paged_write_attn(inputs, query[i], key[i], value[i], None, None, scale) for i in range(query.shape[0])
-        ]
+        outs = [paged_write_attn(inputs, query[i], key[i], value[i], None, None, scale) for i in range(query.shape[0])]
         hidden_states = torch.stack(outs, dim=0).flatten(2, 3).type_as(query)
     else:
         hidden_states = attn.attn(query, key, value, None)
@@ -147,11 +100,9 @@ class StageWanTransformer(nn.Module):
         patch_size: tuple[int, int, int] = (1, 2, 2),
         layer_groups: int = 1,
         pp_rank: int = 0,
-        tiny: bool = False,
         transformer_config: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
-        self.tiny = bool(tiny)
         self.layer_groups = max(1, int(layer_groups))
         self.pp_rank = int(pp_rank)
         self.group = 0 if self.layer_groups == 1 else self.pp_rank % self.layer_groups
@@ -160,56 +111,17 @@ class StageWanTransformer(nn.Module):
         self.patch_size = tuple(patch_size)
         self.in_features = in_channels * math.prod(self.patch_size)
         self._wan: nn.Module | None = None
-
-        if self.tiny:
-            self._init_tiny(
-                num_layers=num_layers,
-                dim=dim,
-                num_heads=num_heads,
-                ffn_dim=ffn_dim,
-                in_channels=in_channels,
-            )
-            return
-
-        self._init_wan(transformer_config=transformer_config, fallback_geo={
-            "num_layers": num_layers,
-            "dim": dim,
-            "num_heads": num_heads,
-            "ffn_dim": ffn_dim,
-            "in_channels": in_channels,
-            "patch_size": self.patch_size,
-        })
-
-    def _init_tiny(
-        self,
-        *,
-        num_layers: int,
-        dim: int,
-        num_heads: int,
-        ffn_dim: int,
-        in_channels: int,
-    ) -> None:
-        self.dim = dim
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.in_features = in_channels * math.prod(self.patch_size)
-        self.start_layer, self.end_layer = stage_layer_range(num_layers, self.group, self.layer_groups)
-        if self.is_stage_first:
-            self.patch_embed = nn.Linear(self.in_features, dim)
-        else:
-            self.patch_embed = PPMissingLayer()
-        blocks: list[nn.Module] = []
-        for idx in range(num_layers):
-            if self.start_layer <= idx < self.end_layer:
-                blocks.append(StageWanBlock(dim, num_heads, self.head_dim, ffn_dim))
-            else:
-                blocks.append(PPMissingLayer())
-        self.blocks = nn.ModuleList(blocks)
-        if self.is_stage_last:
-            self.proj_out = nn.Linear(dim, self.in_features)
-        else:
-            self.proj_out = PPMissingLayer()
+        self._init_wan(
+            transformer_config=transformer_config,
+            fallback_geo={
+                "num_layers": num_layers,
+                "dim": dim,
+                "num_heads": num_heads,
+                "ffn_dim": ffn_dim,
+                "in_channels": in_channels,
+                "patch_size": self.patch_size,
+            },
+        )
 
     def _init_wan(self, *, transformer_config: dict[str, Any] | None, fallback_geo: dict[str, Any]) -> None:
         from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import create_transformer_from_config
@@ -250,9 +162,6 @@ class StageWanTransformer(nn.Module):
         patch = tuple(cfg["patch_size"])
         self.patch_size = patch
         self.in_features = int(cfg["in_channels"]) * math.prod(patch)
-        # Chunk-schedule path used to feed flattened tokens via schedule_patch_embed.
-        # Real path uses Wan Conv3d patch_embedding on 5D latents; keep the Linear
-        # only for tiny CPU tests (created in _init_tiny as patch_embed).
         self.schedule_patch_embed = None
         logger.info(
             "StageWanTransformer: wan2_2 WanTransformer3DModel local_layers=[%d, %d) G=%d group=%d",
@@ -271,17 +180,12 @@ class StageWanTransformer(nn.Module):
         return self._wan
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str] | None:
-        """Load Diffusers / Omni Wan weights into the real DiT when present.
+        """Load Diffusers / Omni Wan weights into the DiT.
 
         Returns ``None`` so the Omni loader skips strict name coverage (inner
         Wan ``load_weights`` names are relative to ``_wan``).
         """
-        if self.tiny or self._wan is None:
-            mapping = dict(self.state_dict())
-            for name, tensor in weights:
-                key = name[len("transformer.") :] if name.startswith("transformer.") else name
-                if key in mapping and mapping[key].shape == tensor.shape:
-                    mapping[key].copy_(tensor)
+        if self._wan is None:
             return None
 
         def _strip() -> Iterable[tuple[str, torch.Tensor]]:
@@ -308,39 +212,6 @@ class StageWanTransformer(nn.Module):
             raise ValueError(f"latent {latent_shape} not aligned to patch {self.patch_size}")
         return (t // pt) * (h // ph) * (w // pw)
 
-    def _resolve_hidden(
-        self,
-        hidden_states: torch.Tensor | IntermediateTensors | None,
-        intermediate_tensors: IntermediateTensors | None,
-    ) -> torch.Tensor:
-        if isinstance(hidden_states, IntermediateTensors):
-            intermediate_tensors = hidden_states
-            hidden_states = None
-        if intermediate_tensors is not None:
-            return intermediate_tensors["hidden_states"]
-        if hidden_states is None:
-            raise RuntimeError("stage transformer received no hidden states")
-        if self.is_stage_first and self.tiny and hidden_states.size(-1) == self.in_features:
-            return self.patch_embed(hidden_states)
-        return hidden_states
-
-    def _forward_tiny(
-        self,
-        hidden_states: torch.Tensor | IntermediateTensors | None,
-        kv_contexts: list[Any] | None,
-        intermediate_tensors: IntermediateTensors | None,
-    ) -> torch.Tensor | IntermediateTensors:
-        hidden = self._resolve_hidden(hidden_states, intermediate_tensors)
-        local_count = self.local_num_layers
-        for idx in range(self.start_layer, self.end_layer):
-            ctx = None
-            if kv_contexts is not None:
-                ctx = kv_contexts[idx - self.start_layer] if len(kv_contexts) == local_count else kv_contexts[idx]
-            hidden = self.blocks[idx](hidden, ctx)
-        if self.is_stage_last:
-            return self.proj_out(hidden)
-        return IntermediateTensors({"hidden_states": hidden})
-
     def forward_latent_step(
         self,
         latent: torch.Tensor,
@@ -360,8 +231,8 @@ class StageWanTransformer(nn.Module):
         Self-attn is hooked to NoisyKV when ``kv_contexts`` is provided.
         ``G=1`` (first and last) is the full DiT path unchanged.
         """
-        if self.tiny or self._wan is None:
-            raise RuntimeError("forward_latent_step requires the real Wan DiT (non-tiny)")
+        if self._wan is None:
+            raise RuntimeError("forward_latent_step requires the Wan DiT")
         if latent.ndim != 5:
             raise ValueError(f"latent must be B,C,T,H,W; got shape {tuple(latent.shape)}")
         wan = self._wan
@@ -383,7 +254,7 @@ class StageWanTransformer(nn.Module):
             hidden = hidden.flatten(2).transpose(1, 2)
         else:
             if intermediate_tensors is None:
-                raise RuntimeError("non-first layer group requires intermediate_tensors[\"hidden_states\"]")
+                raise RuntimeError('non-first layer group requires intermediate_tensors["hidden_states"]')
             hidden = intermediate_tensors["hidden_states"]
 
         if timestep.ndim == 0:
@@ -447,9 +318,7 @@ class StageWanTransformer(nn.Module):
         kv_contexts: list[Any] | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        if self.tiny:
-            return self._forward_tiny(hidden_states, kv_contexts, intermediate_tensors)
+        del hidden_states, kv_contexts, intermediate_tensors
         raise RuntimeError(
-            "Non-tiny StageWanTransformer must use forward_latent_step(5D latent); "
-            "abstract token forward was removed"
+            "StageWanTransformer must use forward_latent_step(5D latent); abstract token forward was removed"
         )

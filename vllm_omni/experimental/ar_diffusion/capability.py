@@ -11,9 +11,9 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
-    from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
-    from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
     from vllm_omni.experimental.ar_diffusion.chunk_executor import ARDiffusionChunkContext
+    from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
+    from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 
 
 @dataclass(frozen=True)
@@ -200,14 +200,12 @@ class SupportsARDiffusionWarmup(Protocol):
 class SupportsARDiffusionChunkPipeline(Protocol):
     """Chunk Serial/Latest pipeline (vertical slice). Mutually exclusive with tick KV."""
 
-    def ar_diffusion_noisy_kv_spec(self) -> ARDiffusionNoisyKVSpec:
-        ...
+    def ar_diffusion_noisy_kv_spec(self) -> ARDiffusionNoisyKVSpec: ...
 
     def bind_ar_diffusion_chunk_context(
         self,
         ctx: ARDiffusionChunkContext,
-    ) -> AbstractContextManager[None]:
-        ...
+    ) -> AbstractContextManager[None]: ...
 
 
 def supports_chunk_step_grouping(pipeline: object) -> bool:
