@@ -44,18 +44,20 @@ def test_stage_layer_range_covers_all_layers():
     assert stage_layer_range(30, 1, 2) == (15, 30)
 
 
-def test_flow_euler_matches_diffusers_endpoint_warp():
-    """Endpoint is warp(1/1000), not warp(warp(1/1000))."""
+def test_flow_euler_matches_diffusers_shifted_endpoint():
+    """Match FlowMatchEulerDiscreteScheduler: linspace ends at warp(1/1000), then warp again."""
     shift = 5.0
     steps = 4
+
+    def warp(sigma: torch.Tensor) -> torch.Tensor:
+        return shift * sigma / (1 + (shift - 1) * sigma)
+
     sampler = FlowEuler(steps, shift=shift)
-    raw = torch.linspace(1.0, 1.0 / 1000, steps, dtype=torch.float64)
-    warped = (shift * raw / (1 + (shift - 1) * raw)).float().tolist()
-    assert sampler.sigmas == [*warped, 0.0]
-    # Last advance delta should match diffusers (~0.005), not the double-warped ~0.024.
-    last_delta = sampler.sigmas[-1] - sampler.sigmas[-2]
-    assert abs(last_delta - (-warped[-1])) < 1e-6
-    assert abs(last_delta) < 0.01
+    expected = warp(torch.linspace(1.0, float(warp(torch.tensor(1.0 / 1000))), steps, dtype=torch.float64))
+    assert sampler.sigmas == [*expected.float().tolist(), 0.0]
+    # Diffusers' own endpoint double-warp yields a larger last step than warp(1/1000).
+    last_delta = abs(sampler.sigmas[-1] - sampler.sigmas[-2])
+    assert last_delta > 0.01
 
 
 def test_waveserve_chunk_noise_matches_reference_seed():

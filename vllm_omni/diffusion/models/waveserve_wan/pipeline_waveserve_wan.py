@@ -60,7 +60,12 @@ def _as_request_list(req: OmniDiffusionRequest | DiffusionRequestBatch) -> list[
 
 
 class FlowEuler:
-    """Rectified-flow Euler matching Diffusers FlowMatchEulerDiscreteScheduler(shift=...)."""
+    """Rectified-flow Euler matching Diffusers FlowMatchEulerDiscreteScheduler(shift=...).
+
+    Diffusers 0.40 builds the shifted grid from an already-shifted ``sigma_min``
+    endpoint (``__init__`` reads ``sigma_min`` from the warped schedule), so the
+    linspace endpoint is effectively warped twice. Replicate that faithfully.
+    """
 
     def __init__(self, steps: int, shift: float = 1.0) -> None:
         if steps < 1:
@@ -71,9 +76,9 @@ class FlowEuler:
         def warp(sigma: torch.Tensor) -> torch.Tensor:
             return shift * sigma / (1 + (shift - 1) * sigma)
 
-        # Match diffusers: warp(linspace(1.0, 1/1000, N)) then append 0.0.
-        # Do not pre-warp the 1/1000 endpoint inside linspace (that double-warps it).
-        shifted = warp(torch.linspace(1.0, 1.0 / 1000, steps, dtype=torch.float64))
+        # Faithful to FlowMatchEulerDiscreteScheduler: endpoint is warp(1/1000)
+        # before linspace, then the whole grid is warped again.
+        shifted = warp(torch.linspace(1.0, float(warp(torch.tensor(1.0 / 1000))), steps, dtype=torch.float64))
         self.sigmas = [*shifted.float().tolist(), 0.0]
         self.timesteps = [1000.0 * sigma for sigma in self.sigmas[:-1]]
 
