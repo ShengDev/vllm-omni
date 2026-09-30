@@ -50,6 +50,33 @@ def test_capacity_uses_k1():
     assert cache.capacity == 20
 
 
+def test_capacity_respects_memory_budget():
+    cache = _cache(layer_groups=2, max_batch_size=2)
+    # Force a tiny budget: only one version slot fits.
+    tiny = NoisyKVCache(
+        cache.spec,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        layer_groups=2,
+        max_batch_size=2,
+        gpu_memory_fraction=1.0,
+        available_bytes=cache.bytes_per_version + 8,
+    )
+    assert tiny.capacity == 1
+    assert tiny.reserved_bytes == tiny.bytes_per_version
+
+
+def test_reset_all_releases_versions():
+    cache = _cache()
+    state = NoisyKVState(cache)
+    key = ("A", 0, 0)
+    cache.pool.alloc(key)
+    assert cache.pool.has(key)
+    state.reset_all()
+    assert not cache.pool.has(key)
+    assert cache.pool.free
+
+
 def test_prepare_evict_releases_last_use():
     plan = build_chunk_plan(
         ChunkSchedule(

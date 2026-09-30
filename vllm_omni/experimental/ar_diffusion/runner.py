@@ -121,6 +121,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         layer_groups = pp_world // stages
         max_batch_size = int(stage_cfg.get("max_batch_size", 1) or 1)
         self._ar_diffusion_chunk_capability = capability
+        avail = self._available_memory_bytes() if available_bytes is None else available_bytes
         self.noisy_kv_cache = NoisyKVCache(
             spec,
             dtype=self.od_config.dtype,
@@ -128,11 +129,12 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             layer_groups=layer_groups,
             max_batch_size=max_batch_size,
             gpu_memory_fraction=float(stage_cfg.get("gpu_memory_fraction", 1.0)),
-            available_bytes=available_bytes,
+            available_bytes=avail,
         )
         logger.info(
-            "AR-Diffusion noisy KV: capacity=%d layers=%d H=%d G=%d R=%d S=%d",
+            "AR-Diffusion noisy KV: capacity=%d reserved_bytes=%d layers=%d H=%d G=%d R=%d S=%d",
             self.noisy_kv_cache.capacity,
+            self.noisy_kv_cache.reserved_bytes,
             spec.num_layers,
             spec.max_history_chunks,
             layer_groups,
@@ -387,8 +389,16 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     ) -> DiffusionOutput:
         if self.noisy_kv_cache is not None and self._ar_diffusion_chunk_capability is not None:
             started = time.perf_counter()
-            with self._ar_diffusion_chunk_capability.bind_ar_diffusion_chunk_context(self._make_chunk_context()):
-                output = super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
+            ctx = self._make_chunk_context()
+            try:
+                with self._ar_diffusion_chunk_capability.bind_ar_diffusion_chunk_context(ctx):
+                    output = super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
+            except Exception:
+                ctx.kv.reset_all()
+                logger.warning(
+                    "AR-Diffusion chunk forward failed; NoisyKV versions were released fail-closed"
+                )
+                raise
             self._perf_e2e_times.append(time.perf_counter() - started)
             return output
         if self.kv_cache is None:
@@ -416,8 +426,16 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     ) -> BatchRunnerOutput:
         """Noisy PP chunk path may micro-batch requests; paged timeline KV stays single-seq."""
         if self.noisy_kv_cache is not None and self._ar_diffusion_chunk_capability is not None:
-            with self._ar_diffusion_chunk_capability.bind_ar_diffusion_chunk_context(self._make_chunk_context()):
-                return super().execute_model_batch(scheduler_output, od_config)
+            ctx = self._make_chunk_context()
+            try:
+                with self._ar_diffusion_chunk_capability.bind_ar_diffusion_chunk_context(ctx):
+                    return super().execute_model_batch(scheduler_output, od_config)
+            except Exception:
+                ctx.kv.reset_all()
+                logger.warning(
+                    "AR-Diffusion chunk batch failed; NoisyKV versions were released fail-closed"
+                )
+                raise
         raise RuntimeError(
             "ARDiffusionModelRunner does not support request-batch execution; use request mode with max_num_seqs=1."
         )

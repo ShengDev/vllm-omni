@@ -5,7 +5,7 @@
 Non-tiny path reuses ``wan2_2.WanTransformer3DModel`` (same diffusers Wan 2.1
 weight layout / ``load_weights``) and runs real 5D latent steps via
 ``forward_latent_step``. Layer split follows WaveServe ``G`` (not Omni ``S·G``
-PP ranks): during construction we temporarily present PP world size = ``layer_groups``.
+PP ranks) via explicit ``layer_pp_rank`` / ``layer_pp_world`` on the Wan builder.
 
 ``forward_latent_step`` is G-aware: stage-first patches, middle groups resume
 from ``IntermediateTensors``, stage-last unpatches. Activation packs carry
@@ -18,10 +18,8 @@ distributed Wan linear layers.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from collections.abc import Iterable
 from typing import Any
-from unittest import mock
 
 import torch
 import torch.nn as nn
@@ -58,36 +56,6 @@ def stage_layer_range(num_layers: int, group: int, groups: int) -> tuple[int, in
     if not 0 <= group < groups:
         raise ValueError(f"group {group} out of range for {groups}")
     return (num_layers * group) // groups, (num_layers * (group + 1)) // groups
-
-
-@contextmanager
-def _force_waveserve_layer_pp(group: int, groups: int) -> Iterator[None]:
-    """Make WanTransformer3DModel / make_layers partition by WaveServe G."""
-
-    class _FakePPGroup:
-        rank_in_group = group
-        world_size = groups
-
-    fake = _FakePPGroup()
-    is_first = group == 0
-    is_last = group == groups - 1
-    patches = [
-        mock.patch("vllm.distributed.parallel_state.get_pp_group", return_value=fake),
-        mock.patch(
-            "vllm_omni.diffusion.models.wan2_2.wan2_2_transformer.get_pipeline_parallel_world_size",
-            return_value=groups,
-        ),
-        mock.patch(
-            "vllm_omni.diffusion.models.wan2_2.wan2_2_transformer.is_pipeline_first_stage",
-            return_value=is_first,
-        ),
-        mock.patch(
-            "vllm_omni.diffusion.models.wan2_2.wan2_2_transformer.is_pipeline_last_stage",
-            return_value=is_last,
-        ),
-    ]
-    with patches[0], patches[1], patches[2], patches[3]:
-        yield
 
 
 class StageWanSelfAttention(nn.Module):
@@ -266,8 +234,11 @@ class StageWanTransformer(nn.Module):
                 }
             )
 
-        with _force_waveserve_layer_pp(self.group, self.layer_groups):
-            wan = create_transformer_from_config(cfg)
+        wan = create_transformer_from_config(
+            cfg,
+            layer_pp_rank=self.group,
+            layer_pp_world=self.layer_groups,
+        )
 
         self._wan = wan
         self.num_layers = int(cfg["num_layers"])

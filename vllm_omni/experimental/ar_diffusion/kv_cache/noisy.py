@@ -257,13 +257,40 @@ class NoisyKVCache:
         gpu_memory_fraction: float = 1.0,
         available_bytes: int | None = None,
     ) -> None:
-        del gpu_memory_fraction, available_bytes
+        if not 0.0 < float(gpu_memory_fraction) <= 1.0:
+            raise ValueError(f"gpu_memory_fraction must be in (0, 1], got {gpu_memory_fraction}")
         self.spec = spec
         self.layer_groups = layer_groups
         self.max_batch_size = max(1, max_batch_size)
         chunk_blocks = spec.max_chunk_tokens // spec.block_size
         per_req = spec.max_history_chunks + 2 + layer_groups
-        self.capacity = self.max_batch_size * per_req
+        desired = self.max_batch_size * per_req
+        bytes_per_version = (
+            2
+            * spec.num_layers
+            * chunk_blocks
+            * spec.block_size
+            * spec.num_kv_heads
+            * spec.head_size
+            * torch.empty((), dtype=dtype).element_size()
+        )
+        if available_bytes is not None:
+            budget = int(available_bytes * float(gpu_memory_fraction))
+            if bytes_per_version <= 0:
+                raise RuntimeError("invalid NoisyKV geometry: bytes_per_version <= 0")
+            max_by_budget = budget // bytes_per_version
+            if max_by_budget < 1:
+                raise RuntimeError(
+                    f"NoisyKV budget too small for one version slot: "
+                    f"budget={budget} bytes_per_version={bytes_per_version}"
+                )
+            if max_by_budget < desired:
+                # Shrink capacity to fit free HBM rather than OOM after DiT load.
+                self.capacity = max_by_budget
+            else:
+                self.capacity = desired
+        else:
+            self.capacity = desired
         self.pool = VersionPool(
             capacity=self.capacity,
             chunk_blocks=chunk_blocks,
@@ -276,6 +303,8 @@ class NoisyKVCache:
         )
         self.transport = NoisyKVTransport(self.pool)
         self.resident_peak = 0
+        self.bytes_per_version = bytes_per_version
+        self.reserved_bytes = self.capacity * bytes_per_version
 
 
 class NoisyKVState:
@@ -323,6 +352,20 @@ class NoisyKVState:
         self._plans.pop(req, None)
         self._chunk_tokens.pop(req, None)
         self._last_use_global.pop(req, None)
+
+    def reset_all(self) -> None:
+        """Fail-closed: drop every version and local request bookkeeping."""
+        for req in list(self._plans):
+            self.end_request(req)
+        # Catch versions that were allocated without a planned begin_request.
+        leftover = list(self.cache.pool.keys)
+        for key in leftover:
+            self.cache.transport.discard(key)
+            self.cache.pool.release(key)
+        self._plans.clear()
+        self._chunk_tokens.clear()
+        self._last_use_global.clear()
+        self._inflight = ()
 
     def prepare(self, tasks: tuple[tuple[str, ChunkStep], ...]) -> list[list[NoisyLayerContext]]:
         spec = self.cache.spec

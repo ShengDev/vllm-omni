@@ -354,7 +354,8 @@ class WaveServeWanPipeline(nn.Module):
             device = torch.device("cpu")
 
         # Text encoder on every DiT rank (needed each denoise step).
-        prefetch = ("tokenizer", "text_encoder", "vae")
+        # VAE decode ownership is rank 0 only — skip allocating it elsewhere.
+        prefetch = ("tokenizer", "text_encoder", "vae") if self.pp_rank == 0 else ("tokenizer", "text_encoder")
         self.tokenizer = from_pretrained_with_prefetch(
             AutoTokenizer.from_pretrained,
             model_path,
@@ -376,6 +377,9 @@ class WaveServeWanPipeline(nn.Module):
         )
         for p in self.text_encoder.parameters():
             p.requires_grad_(False)
+        if self.pp_rank != 0:
+            self.vae = None
+            return
         self.vae = (
             from_pretrained_with_prefetch(
                 DistributedAutoencoderKLWan.from_pretrained,

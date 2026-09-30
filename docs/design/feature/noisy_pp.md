@@ -110,7 +110,8 @@ stage S−1   rank (S−1)G ─────▶ … ─────────�
 ```
 
 Layer split for Noisy PP uses `(g, G)` (`get_pp_indices(B, pp_rank % G, G)`),
-not a naive split over `world = S·G`. Production Wan2.2 PP stays on its existing
+not a naive split over `world = S·G`. WaveServe builds Wan with explicit
+`layer_pp_rank` / `layer_pp_world`; production Wan2.2 PP stays on its existing
 `make_layers` path. Real Wan activations: non-last groups pack
 `{latent, hidden_states}`; stage-last unpatches, advances with FlowEuler, and
 packs `{latent}` to the next stage (or back to rank 0 when `S=1`).
