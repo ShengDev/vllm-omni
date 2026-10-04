@@ -58,9 +58,9 @@ def test_waveserve_path_resolves_default_deploy(monkeypatch):
         stage_overrides=None,
         strategy_config_path=None,
     )
-    engine_args = resolved.stage_configs[0].engine_args
+    diffusion_config = resolved.stage_configs[0].diffusion_config
 
     assert resolved.config_path is not None
     assert resolved.config_path.endswith("vllm_omni/deploy/waveserve_wan.yaml")
-    assert engine_args.model_class_name == "WaveServeWanPipeline"
-    assert "ARDiffusionEngine" in str(engine_args.engine_backend)
+    assert diffusion_config.model_class_name == "WaveServeWanPipeline"
+    assert "ARDiffusionEngine" in str(diffusion_config.engine_backend)

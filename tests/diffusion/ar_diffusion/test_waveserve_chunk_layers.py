@@ -35,7 +35,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_stage_layer_range_covers_all_layers():
-    covered = []
+    covered: list[int] = []
     for g in range(2):
         start, end = stage_layer_range(30, g, 2)
         covered.extend(range(start, end))
@@ -85,7 +85,7 @@ def test_chunk_schedule_rejects_unknown_values():
     req = OmniDiffusionRequest(
         prompt="x",
         request_id="sched-0",
-        sampling_params=OmniDiffusionSamplingParams(extra_args={"chunk_schedule": "latset"}),
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"chunk_schedule": "unsupported"}),
     )
     with pytest.raises(ValueError, match="chunk_schedule"):
         pipeline._plan_for(req)

@@ -7,8 +7,8 @@ from __future__ import annotations
 import pytest
 
 from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
-    Ordering,
     ChunkSchedule,
+    Ordering,
     build_chunk_plan,
 )
 
