@@ -10,7 +10,7 @@ with real Wan forward + FlowEuler → VAE decode on rank 0.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any, ClassVar
 
@@ -21,6 +21,14 @@ from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.media import (
+    DiffusionMediaOutput,
+    VideoMediaOutput,
+    VideoTensorEncoding,
+    VideoTensorLayout,
+    VideoTensorSpec,
+    VideoValueRange,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.waveserve_wan.transformer import StageWanTransformer
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -107,6 +115,7 @@ class _LatentChunkAdapter(ChunkAdapter):
         seed: int,
         device: torch.device,
         dtype: torch.dtype,
+        on_finished: Callable[[int, torch.Tensor], None] | None = None,
     ) -> None:
         self.transformer = transformer
         self.sampler = sampler
@@ -115,6 +124,7 @@ class _LatentChunkAdapter(ChunkAdapter):
         self.seed = seed
         self.device = device
         self.dtype = dtype
+        self.on_finished = on_finished
         self.num_denoise_steps = len(sampler.timesteps)
         # req -> chunk -> latent (after last denoise advance)
         self.finished: dict[str, dict[int, torch.Tensor]] = {}
@@ -174,6 +184,8 @@ class _LatentChunkAdapter(ChunkAdapter):
                 latent = self.sampler.advance(out, latent, step)
                 if step == self.num_denoise_steps - 1:
                     self.finished.setdefault(req, {})[chunk] = latent.detach()
+                    if self.on_finished is not None:
+                        self.on_finished(chunk, latent)
             else:
                 # Clean KV refresh at t=0; latent already final.
                 t = torch.zeros((), device=self.device, dtype=torch.float32)
@@ -286,6 +298,7 @@ class WaveServeWanPipeline(nn.Module):
         self.block_size = default_tokens
         self.max_chunk_tokens = default_tokens
         self._chunk_ctx: ARDiffusionChunkContext | None = None
+        self._stream_decode_group = None
         logger.info(
             "WaveServe Wan pipeline: S=%d G=%d layers=%d local=[%d, %d) codec=%s model=%s",
             self.stage_parallel_size,
@@ -449,6 +462,22 @@ class WaveServeWanPipeline(nn.Module):
         video = self.vae.decode(latents, return_dict=False)[0]
         return video.clamp(-1, 1)
 
+    def _video_output(self, video: torch.Tensor) -> DiffusionOutput:
+        if not self.od_config.video_output_transport.enable_device_postprocess:
+            return DiffusionOutput(output=video)
+        return DiffusionOutput(
+            media=DiffusionMediaOutput(
+                video=VideoMediaOutput(
+                    tensor=video,
+                    spec=VideoTensorSpec(
+                        layout=VideoTensorLayout.BCTHW,
+                        encoding=VideoTensorEncoding.NORMALIZED_FLOAT,
+                        value_range=VideoValueRange.NEGATIVE_ONE_TO_ONE,
+                    ),
+                )
+            )
+        )
+
     def _gather_finished(
         self, finished: dict[str, dict[int, torch.Tensor]], pp_group: Any | None
     ) -> dict[str, dict[int, torch.Tensor]]:
@@ -474,6 +503,45 @@ class WaveServeWanPipeline(nn.Module):
                     else:
                         bucket[chunk] = latent
         return merged
+
+    def _decode_latent_chunks(self, chunks: Iterator[torch.Tensor], latent_frames: int) -> torch.Tensor:
+        from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
+
+        assert self.vae is not None
+        vae = self.vae
+        param = next(vae.parameters())
+        mean = torch.tensor(vae.config.latents_mean, device=param.device, dtype=param.dtype).view(1, -1, 1, 1, 1)
+        inv_std = 1.0 / torch.tensor(vae.config.latents_std, device=param.device, dtype=param.dtype).view(
+            1, -1, 1, 1, 1
+        )
+        frames_per_latent = 2 ** sum(bool(flag) for flag in vae.decoder.temperal_upsample)
+        output = None
+        offset = 0
+        vae.clear_cache()
+        try:
+            with vae._execution_context():
+                for latent in chunks:
+                    hidden = vae.post_quant_conv(latent / inv_std + mean)
+                    for index in range(hidden.shape[2]):
+                        vae._conv_idx = [0]
+                        pixels = vae.decoder(
+                            hidden[:, :, index : index + 1],
+                            feat_cache=vae._feat_map,
+                            feat_idx=vae._conv_idx,
+                            first_chunk=offset == 0,
+                        )
+                        if vae.config.patch_size is not None:
+                            pixels = unpatchify(pixels, patch_size=vae.config.patch_size)
+                        if output is None:
+                            frames = pixels.shape[2] + (latent_frames - 1) * frames_per_latent
+                            output = pixels.new_empty((pixels.shape[0], pixels.shape[1], frames, *pixels.shape[-2:]))
+                        end = offset + pixels.shape[2]
+                        torch.clamp(pixels, min=-1.0, max=1.0, out=output[:, :, offset:end])
+                        offset = end
+            assert output is not None and offset == output.shape[2]
+            return output
+        finally:
+            vae.clear_cache()
 
     def forward(self, req: OmniDiffusionRequest | DiffusionRequestBatch) -> list[DiffusionOutput]:
         ctx = self._chunk_ctx
@@ -504,6 +572,37 @@ class WaveServeWanPipeline(nn.Module):
             prompt = item.prompt if isinstance(item.prompt, str) else str(item.prompt or "")
             prompt_embeds = self._encode_prompt(prompt, device, dtype)
             sampler = FlowEuler(denoise, shift=shift)
+            stream_decode = bool(extra.get("stream_decode", False))
+            decode_buffers = []
+            recv_works = []
+            send_works = []
+            on_finished = None
+            if stream_decode:
+                source_rank = denoise * self.layer_groups - 1
+                if self.stage_parallel_size != denoise + 1 or source_rank == 0 or pp_group is None:
+                    raise ValueError("stream_decode requires a remote final denoise rank in S=T+1 topology")
+                if self.vae is not None and (self.vae.use_tiling or self.vae.is_distributed_enabled()):
+                    raise ValueError("stream_decode requires non-tiled single-owner VAE")
+                source = pp_group.ranks[source_rank]
+                owner = pp_group.ranks[0]
+                if self._stream_decode_group is None:
+                    # CPU 潜变量通信不被 PP0 的设备同步阻塞；不混用激活/KV 顺序。
+                    self._stream_decode_group = dist.new_group(ranks=[owner, source], backend="gloo")
+                if pp_rank == 0:
+                    decode_buffers = [
+                        torch.empty(shape, device="cpu", dtype=dtype, pin_memory=True)
+                        for _ in range(plan.schedule.chunks)
+                    ]
+                    recv_works = [
+                        dist.irecv(buffer, src=source, group=self._stream_decode_group) for buffer in decode_buffers
+                    ]
+                elif pp_rank == source_rank:
+
+                    def on_finished(chunk: int, latent: torch.Tensor) -> None:
+                        assert chunk == len(send_works)
+                        host = latent.to(device="cpu").contiguous()
+                        send_works.append((host, dist.isend(host, dst=owner, group=self._stream_decode_group)))
+
             adapter = _LatentChunkAdapter(
                 self.transformer,
                 sampler=sampler,
@@ -512,8 +611,24 @@ class WaveServeWanPipeline(nn.Module):
                 seed=seed,
                 device=device,
                 dtype=dtype,
+                on_finished=on_finished,
             )
             run_chunk_pipeline(ctx=ctx, adapter=adapter)
+            if stream_decode:
+                for _latent, work in send_works:
+                    work.wait()
+                if pp_rank == 0:
+
+                    def ready_chunks() -> Iterator[torch.Tensor]:
+                        for buffer, work in zip(decode_buffers, recv_works):
+                            work.wait()
+                            yield buffer.to(device=device, non_blocking=True)
+
+                    video = self._decode_latent_chunks(ready_chunks(), plan.schedule.chunks * shape[2])
+                    outputs.append(self._video_output(video))
+                else:
+                    outputs.append(DiffusionOutput(output=torch.zeros(1, 3, 8, 8, 8, device=device, dtype=dtype)))
+                continue
             finished = self._gather_finished(adapter.finished, pp_group)
             chunk_map = finished.get(req_id, {})
             if pp_rank == 0 and chunk_map:
@@ -521,7 +636,7 @@ class WaveServeWanPipeline(nn.Module):
                 # Concatenate along time for multi-chunk video.
                 latents = torch.cat(ordered, dim=2)
                 video = self._decode_latents(latents)
-                outputs.append(DiffusionOutput(output=video))
+                outputs.append(self._video_output(video))
             else:
                 # Non-owner ranks still return a typed placeholder for the engine.
                 outputs.append(DiffusionOutput(output=torch.zeros(1, 3, 8, 8, 8, device=device, dtype=dtype)))

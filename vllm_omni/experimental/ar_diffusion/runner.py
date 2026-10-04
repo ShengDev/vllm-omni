@@ -5,13 +5,15 @@ from __future__ import annotations
 import dataclasses
 import time
 from collections import OrderedDict
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, KVPrefetchJob
@@ -89,8 +91,17 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             )
         return pipeline
 
-    def load_model(self, *args: object, **kwargs: object) -> None:
-        super().load_model(*args, **kwargs)
+    def load_model(
+        self,
+        memory_pool_context_fn: Callable[[str], AbstractContextManager[Any]] | None = None,
+        load_format: str = "default",
+        custom_pipeline_name: str | None = None,
+    ) -> None:
+        super().load_model(
+            memory_pool_context_fn=memory_pool_context_fn,
+            load_format=load_format,
+            custom_pipeline_name=custom_pipeline_name,
+        )
         if self.pipeline is None:
             return
         self._preallocate_kv_cache()
@@ -110,8 +121,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 raw = model_config.get("ar_diffusion_stage_config")
         return dict(raw) if isinstance(raw, dict) else {}
 
-    def _preallocate_noisy_kv(self, *, available_bytes: int | None = None) -> None:
-        capability = self.pipeline
+    def _preallocate_noisy_kv(
+        self, capability: SupportsARDiffusionChunkPipeline, *, available_bytes: int | None = None
+    ) -> None:
         spec = capability.ar_diffusion_noisy_kv_spec()
         stage_cfg = self._stage_config()
         stages = int(stage_cfg.get("stage_parallel_size", 1) or 1)
@@ -128,6 +140,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             device=self.device,
             layer_groups=layer_groups,
             max_batch_size=max_batch_size,
+            stages=stages,
             gpu_memory_fraction=float(stage_cfg.get("gpu_memory_fraction", 1.0)),
             available_bytes=avail,
         )
@@ -150,7 +163,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 "step_execution=True would bypass per-request AR session binding."
             )
         if isinstance(self.pipeline, SupportsARDiffusionChunkPipeline):
-            self._preallocate_noisy_kv(available_bytes=available_bytes)
+            self._preallocate_noisy_kv(self.pipeline, available_bytes=available_bytes)
             return
         max_num_seqs = int(getattr(self.od_config, "max_num_seqs", 1) or 1)
         if max_num_seqs > 1:
@@ -386,13 +399,16 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self,
         req: OmniDiffusionRequest,
         kv_prefetch_job: KVPrefetchJob | None = None,
+        diffusion_kv_metadata: DiffusionKVMetadata | None = None,
     ) -> DiffusionOutput:
         if self.noisy_kv_cache is not None and self._ar_diffusion_chunk_capability is not None:
             started = time.perf_counter()
             ctx = self._make_chunk_context()
             try:
                 with self._ar_diffusion_chunk_capability.bind_ar_diffusion_chunk_context(ctx):
-                    output = super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
+                    output = super().execute_model(
+                        req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
+                    )
             except Exception:
                 ctx.kv.reset_all()
                 logger.warning("AR-Diffusion chunk forward failed; NoisyKV versions were released fail-closed")
@@ -400,7 +416,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             self._perf_e2e_times.append(time.perf_counter() - started)
             return output
         if self.kv_cache is None:
-            return super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
+            return super().execute_model(
+                req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
+            )
         if self._ar_diffusion_capability is None:
             raise RuntimeError("AR-Diffusion capability missing after KV cache initialization")
 
@@ -411,7 +429,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             self.reset_session(session_id)
         started = time.perf_counter()
         with self._bound_ar_session(session_id, description="forward"):
-            output = super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
+            output = super().execute_model(
+                req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
+            )
         self._perf_e2e_times.append(time.perf_counter() - started)
         if close_session:
             self.close_session(session_id)

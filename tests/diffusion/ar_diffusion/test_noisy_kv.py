@@ -7,21 +7,21 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import paged_write_attn
+from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
+    ChunkPlan,
+    ChunkSchedule,
+    Inflight,
+    Ordering,
+    build_chunk_plan,
+    incoming_transfers,
+    union_wait_ready,
+)
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     ARDiffusionNoisyKVSpec,
     NoisyKVCache,
     NoisyKVState,
 )
-from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
-    Inflight,
-    Ordering,
-    ChunkPlan,
-    ChunkSchedule,
-    build_chunk_plan,
-    incoming_transfers,
-    union_wait_ready,
-)
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import paged_write_attn
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -41,6 +41,7 @@ def _cache(**kwargs) -> NoisyKVCache:
         device=torch.device("cpu"),
         layer_groups=kwargs.get("layer_groups", 2),
         max_batch_size=kwargs.get("max_batch_size", 1),
+        stages=kwargs.get("stages", 1),
     )
 
 
@@ -48,6 +49,12 @@ def test_capacity_uses_k1():
     cache = _cache(layer_groups=2, max_batch_size=2)
     # R * (H + 2 + G) = 2 * (6 + 2 + 2) = 20
     assert cache.capacity == 20
+
+
+def test_capacity_covers_latest_stage_frontier():
+    cache = _cache(layer_groups=1, stages=5)
+    # H=6, S=5 的 Latest 计划在单 rank 上峰值需要 10 个 live versions。
+    assert cache.capacity == 11
 
 
 def test_capacity_respects_memory_budget():
