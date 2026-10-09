@@ -1,55 +1,126 @@
 {
   "base_commit": "86490babe358740cf98f019d1972f3b364a329d4",
   "full_requests_checked": 16,
-  "measured_source_files_checked": 52,
+  "measured_source_files_checked": 28,
   "rows": [
     {
       "groups": 1,
       "variant": "baseline",
       "fps_samples": [
-        116.1977746312932,
-        116.2974894132776,
-        116.06524714885013
+        116.2104807717457,
+        116.16466587178448,
+        116.27083852642467
       ],
-      "median_fps": 116.1977746312932,
+      "median_fps": 116.2104807717457,
       "peak_allocated_gib": 14.866153717041016,
+      "kv_pool": "native_version_pool",
+      "kv_capacity": 11,
+      "kv_reserved_bytes": 9488793600,
       "sha256": "d37a9c999e612e6578aad0ff8fd715ba3d5abfa4a46994f698adb3a8df9396fe"
     },
     {
       "groups": 1,
       "variant": "hybrid_fused",
       "fps_samples": [
-        129.71408806904915,
-        129.52499661542424,
-        129.74462597980923
+        129.70585150141937,
+        129.85733612081523,
+        129.9400274508618
       ],
-      "median_fps": 129.71408806904915,
-      "peak_allocated_gib": 40.145193576812744,
+      "median_fps": 129.85733612081523,
+      "peak_allocated_gib": 31.30966806411743,
+      "kv_pool": "hybrid_ring",
+      "kv_capacity": 35,
+      "kv_reserved_bytes": 30191624400,
       "sha256": "d37a9c999e612e6578aad0ff8fd715ba3d5abfa4a46994f698adb3a8df9396fe"
     },
     {
       "groups": 2,
       "variant": "baseline",
       "fps_samples": [
-        178.48628725499987,
-        178.51999687648117,
-        178.34393171138578
+        178.51902430520244,
+        178.6728221159963,
+        178.3050733710032
       ],
-      "median_fps": 178.48628725499987,
+      "median_fps": 178.51902430520244,
       "peak_allocated_gib": 6.703157901763916,
+      "kv_pool": "native_version_pool",
+      "kv_capacity": 11,
+      "kv_reserved_bytes": 4744396800,
       "sha256": "a9a53546cb02479643554cce66ee217c7c00d84af6cbb16a0ecde54b60c2f45d"
     },
     {
       "groups": 2,
       "variant": "hybrid_fused",
       "fps_samples": [
-        251.41077134954523,
-        251.5136096139276,
-        252.22568726217494
+        252.81434990956242,
+        252.2332106483371,
+        251.7727663959782
       ],
-      "median_fps": 251.5136096139276,
-      "peak_allocated_gib": 20.302467346191406,
+      "median_fps": 252.2332106483371,
+      "peak_allocated_gib": 15.885505676269531,
+      "kv_pool": "hybrid_ring",
+      "kv_capacity": 35,
+      "kv_reserved_bytes": 15095812200,
       "sha256": "a9a53546cb02479643554cce66ee217c7c00d84af6cbb16a0ecde54b60c2f45d"
     }
-  ]
+  ],
+  "previous_revision": {
+    "commit": "69440924bed4234496415240c87ac02a50612944",
+    "rows": [
+      {
+        "groups": 1,
+        "variant": "baseline",
+        "fps_samples": [
+          116.1977746312932,
+          116.2974894132776,
+          116.06524714885013
+        ],
+        "median_fps": 116.1977746312932,
+        "peak_allocated_gib": 14.866153717041016,
+        "sha256": "d37a9c999e612e6578aad0ff8fd715ba3d5abfa4a46994f698adb3a8df9396fe"
+      },
+      {
+        "groups": 1,
+        "variant": "hybrid_fused",
+        "fps_samples": [
+          129.71408806904915,
+          129.52499661542424,
+          129.74462597980923
+        ],
+        "median_fps": 129.71408806904915,
+        "peak_allocated_gib": 40.145193576812744,
+        "sha256": "d37a9c999e612e6578aad0ff8fd715ba3d5abfa4a46994f698adb3a8df9396fe"
+      },
+      {
+        "groups": 2,
+        "variant": "baseline",
+        "fps_samples": [
+          178.48628725499987,
+          178.51999687648117,
+          178.34393171138578
+        ],
+        "median_fps": 178.48628725499987,
+        "peak_allocated_gib": 6.703157901763916,
+        "sha256": "a9a53546cb02479643554cce66ee217c7c00d84af6cbb16a0ecde54b60c2f45d"
+      },
+      {
+        "groups": 2,
+        "variant": "hybrid_fused",
+        "fps_samples": [
+          251.41077134954523,
+          251.5136096139276,
+          252.22568726217494
+        ],
+        "median_fps": 251.5136096139276,
+        "peak_allocated_gib": 20.302467346191406,
+        "sha256": "a9a53546cb02479643554cce66ee217c7c00d84af6cbb16a0ecde54b60c2f45d"
+      }
+    ]
+  },
+  "python_lines": {
+    "before": 2905,
+    "after": 1341,
+    "reduction_percent": 53.83820998278829
+  },
+  "evidence_sha256": "270e7f803a5b8cfa69b3f705501c9ffbf4e0b023dedf80f6227470719e43a940"
 }

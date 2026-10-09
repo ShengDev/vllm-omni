@@ -13,15 +13,11 @@ class CachedProjection(nn.Module):
         super().__init__()
         self.base = base
         self.values = {}
-        self.hits = self.misses = 0
 
     def forward(self, value):
         key = id(value)
         if key not in self.values:
             self.values[key] = (value, self.base(value))
-            self.misses += 1
-        else:
-            self.hits += 1
         return self.values[key][1]
 
     def clear(self):

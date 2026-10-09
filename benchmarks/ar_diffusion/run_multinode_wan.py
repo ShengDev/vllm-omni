@@ -52,7 +52,7 @@ def main():
     if rank == 0:
         root = Path(__file__).resolve().parents[2]
         files = list((root / "benchmarks/ar_diffusion").glob("*.py"))
-        files += list((root / "benchmarks/ar_diffusion/legacy_tick").glob("*"))
+        files.append(root / "benchmarks/ar_diffusion/provenance.json")
         files += [
             root / name
             for name in (
@@ -148,14 +148,7 @@ def main():
         model.eval().requires_grad_(False)
         shape = (1, 16, 3, 60, 104)
         tokens = model.seq_len_for_latent(shape)
-        kv = NoisyKVCache(
-            ARDiffusionNoisyKVSpec(model.local_num_layers, 12, 128, tokens, tokens, 6),
-            dtype=torch.bfloat16,
-            device=device,
-            layer_groups=args.groups,
-            max_batch_size=1,
-            stages=args.steps + 1,
-        )
+        kv_spec = ARDiffusionNoisyKVSpec(model.local_num_layers, 12, 128, tokens, tokens, 6)
         prompt = torch.load(args.condition, map_location="cpu", weights_only=True)["text"].to(device)
         pp = get_pp_group()
         sampler = FlowEuler(args.steps, shift=5.0)
@@ -175,16 +168,33 @@ def main():
         producer = args.steps * args.groups - 1
         for group, variant in enumerate(args.variants):
             rows = []
+            hybrid = variant in ("hybrid", "hybrid_fused")
             torch.accelerator.reset_peak_memory_stats()
+            kv = (
+                None
+                if hybrid
+                else NoisyKVCache(
+                    kv_spec,
+                    dtype=torch.bfloat16,
+                    device=device,
+                    layer_groups=args.groups,
+                    max_batch_size=1,
+                    stages=args.steps + 1,
+                )
+            )
             with ExitStack() as scopes:
                 math_variant = "fused" if variant == "hybrid_fused" else "cached" if variant == "hybrid" else variant
                 caches = scopes.enter_context(optimized(model, math_variant))
                 for index in range(args.warmup + args.repeat):
                     for module in caches:
                         module.clear()
-                    kv.transport.bytes_sent = kv.transport.bytes_received = 0
-                    hybrid = variant in ("hybrid", "hybrid_fused")
-                    state = HybridNoisyKVState(kv, model, kv_group) if hybrid else NoisyKVState(kv)
+                    if kv is not None:
+                        kv.transport.bytes_sent = kv.transport.bytes_received = 0
+                    state = (
+                        HybridNoisyKVState(kv_spec, model, kv_group, device, torch.bfloat16)
+                        if hybrid
+                        else NoisyKVState(kv)
+                    )
                     ctx = ARDiffusionChunkContext(
                         ChunkRunSpec(ChunkTopology(args.steps + 1, args.groups), 1, rank, pp), state
                     )
@@ -220,7 +230,9 @@ def main():
                     current_omni_platform.synchronize()
                     dist.barrier()
                     seconds = time.perf_counter() - start
-                    assert not kv.pool.keys, "native cache retained versions after request"
+                    assert not state._chunk_tokens, "KV state retained a completed request"
+                    if kv is not None:
+                        assert not kv.pool.keys, "native cache retained versions after request"
                     if rank == producer:
                         assert len(events) == len(latents) == args.chunks
                         milliseconds = [events[0].elapsed_time(e) for e in events]
@@ -262,7 +274,9 @@ def main():
                     rank=rank,
                     host=socket.gethostname(),
                     peak_allocated=torch.accelerator.max_memory_allocated(),
-                    kv_capacity=kv.capacity,
+                    kv_capacity=state.capacity if hybrid else kv.capacity,
+                    kv_reserved_bytes=state.reserved_bytes if hybrid else kv.reserved_bytes,
+                    kv_pool="hybrid_ring" if hybrid else "native_version_pool",
                     kv_sent_bytes=ctx.kv.bytes_sent,
                     kv_received_bytes=ctx.kv.bytes_received,
                 ),
@@ -293,6 +307,8 @@ def main():
                 )
                 groups.append(result)
                 (args.out / "summary.json").write_text(json.dumps(dict(groups=groups), indent=2) + "\n")
+            # Drop native pool references before measuring the next variant.
+            del ctx, state, kv
         if rank == producer:
             (args.out / "completed.txt").write_text("all full latent parity and repeat hashes passed\n")
         destroy_model_parallel()

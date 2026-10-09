@@ -95,21 +95,26 @@ output after timing. All variants and repeats must match the supplied hash
 or the first request's hash. Latest KV semantics depend on `K`, so hashes are
 compared within a topology rather than across `K=15` and `K=30`.
 
-The hybrid pool has `(history+1) * stages = 35` version positions per layer,
-in addition to the original native pool. This increases GPU memory usage.
-`kv_capacity` in summaries refers to the original pool, not the hybrid ring.
+The hybrid ring has `(history+1) * stages = 35` version positions per layer;
+it owns the only KV pool in hybrid runs. The baseline allocates its native
+version pool separately. `kv_capacity` reports version positions per layer
+for the selected pool, identified by `kv_pool`; `kv_reserved_bytes` includes
+the hybrid ticket storage when applicable.
 Buffers use producer-ready and consumer-release tickets to prevent a reused
 ring position from overwriting KV that attention still reads. Failed IPC
 requests keep mappings alive until the worker job exits.
 
 Source snapshots, per-request events and hashes, GPU memory statistics and
-median summaries are written under the output directory. Archived WaveServe
-transport provenance and formatting/adaptation hashes are listed in
-[provenance.json](legacy_tick/provenance.json).
+median summaries are written under the output directory. Per-block transport
+rounds and read labels derive directly from the native `ChunkPlan`; no second
+scheduler or general KV manager is included. Retained WaveServe transport
+source attribution and adaptation hashes are listed in
+[provenance.json](provenance.json).
 
 ## Tests
 
-CPU tests cover native KV labels, stage scheduling, physical pool addresses,
+CPU tests cover native KV labels, last-reader release identities, physical
+pool addresses, allocation boundaries, exported-buffer lifetime on failure,
 cache expiration and restoration of modules after normal and failed requests.
 CUDA tests compare fused kernels against separate eager BF16 operations,
 including strided residual tensors. They do not require model weights:

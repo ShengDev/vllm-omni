@@ -1,29 +1,52 @@
 # H800: native Wan chunk IPC/NCCL optimization
 
 An incremental benchmark on PR #8282 head
-`86490babe358740cf98f019d1972f3b364a329d4` measures **129.714 FPS** on one node
-and **251.514 FPS** on two nodes with the optimized adapter, a **1.939x**
+`86490babe358740cf98f019d1972f3b364a329d4` measures **129.857 FPS** on one node
+and **252.233 FPS** on two nodes with the optimized adapter, a **1.942x**
 scaling ratio. Within each topology, baseline and optimized full latents are
 bitwise identical. These are steady pure-DiT pixel-frame equivalents; VAE and
 the serving frontend are excluded.
 
 | Native vLLM-Omni variant | One node, 5 DiT GPUs | Two nodes, 10 DiT GPUs | Scaling |
 | --- | ---: | ---: | ---: |
-| Unoptimized | 116.198 FPS | 178.486 FPS | 1.536x |
-| Per-block IPC/NCCL + exact BF16 fusions | 129.714 FPS | 251.514 FPS | 1.939x |
-| Improvement at the same topology | +11.63% | +40.91% | |
+| Unoptimized | 116.210 FPS | 178.519 FPS | 1.536x |
+| Per-block IPC/NCCL + exact BF16 fusions | 129.857 FPS | 252.233 FPS | 1.942x |
+| Improvement at the same topology | +11.74% | +41.29% | |
 
 | Topology / variant | Three formal FPS samples | Maximum per-rank peak allocated memory |
 | --- | --- | ---: |
-| One node / baseline | 116.197775, 116.297489, 116.065247 | 14.866 GiB |
-| One node / optimized | 129.714088, 129.524997, 129.744626 | 40.145 GiB |
-| Two nodes / baseline | 178.486287, 178.519997, 178.343932 | 6.703 GiB |
-| Two nodes / optimized | 251.410771, 251.513610, 252.225687 | 20.302 GiB |
+| One node / baseline | 116.210481, 116.164666, 116.270839 | 14.866 GiB |
+| One node / optimized | 129.705852, 129.857336, 129.940027 | 31.310 GiB |
+| Two nodes / baseline | 178.519024, 178.672822, 178.305073 | 6.703 GiB |
+| Two nodes / optimized | 252.814350, 252.233211, 251.772766 | 15.886 GiB |
 
-The hybrid adapter uses 35 version positions per layer in addition to the
-original native pool. It trades more GPU memory for overlap. Peak allocated
-memory is reset before each variant; the table takes the maximum across
-all ranks, including the full warmup. It is not `nvidia-smi` reserved memory.
+The hybrid ring has 35 version positions per layer and is the only KV pool
+allocated in optimized runs. The baseline owns a separate native pool with
+11 positions per layer. Peak allocated memory is reset before each variant;
+the table takes the maximum across all ranks, including the full warmup.
+It is not `nvidia-smi` reserved memory. Summaries identify the selected pool
+and report its capacity and reserved bytes, including hybrid ticket storage.
+
+## Simplification
+
+Compared with [the original PR revision](https://github.com/zizdlp/vllm-omni/commit/69440924bed4234496415240c87ac02a50612944),
+Python code decreases from 2,905 to 1,341 lines (53.8%). The 15-module legacy
+framework is replaced by a native block-plan adapter and one hybrid transport
+module. PreviousTick/PreviousPush, generic LRU/replica/clean-placement managers,
+alternative layouts and unused projection counters are removed. Read labels,
+execution rounds and recipients derive directly from the native `ChunkPlan`.
+Only the selected variant's KV pool is allocated.
+
+| Optimized topology | Before simplification FPS / peak GiB | Current FPS / peak GiB |
+| --- | ---: | ---: |
+| One node, K30 | 129.714 / 40.145 | 129.857 / 31.310 |
+| Two nodes, K15 | 251.514 / 20.302 | 252.233 / 15.886 |
+
+These are separate repeated measurements on the same GPU allocation, not a
+claim of a statistically significant FPS gain from simplification. The
+unused pool removal lowers the optimized peak by about 8.84 GiB per rank on
+one node and 4.42 GiB per rank on two nodes. Raw before/after samples are in
+[audit.json](audit.json); the previous evidence remains in Git history.
 
 ## Hardware, software and configuration
 
@@ -67,8 +90,9 @@ All 16 full requests pass their topology's complete latent hash:
 
 K-dependent Latest KV labels differ, so cross-topology equality is not
 required. No cross-framework quality, concurrent-request, VAE or end-to-end
-speedup is claimed. The harness validates its archived block schedule against
-the native plan's KV labels, completion slots and active receivers.
+speedup is claimed. The per-block transport
+reads and rounds derive directly from native KV sources and execution slots;
+producer-round recipients are checked for activity.
 
 The original native version-pool transport remains the baseline. The optimized
 path publishes each block's KV as soon as Q/K/V are ready, using IPC push on
@@ -78,8 +102,10 @@ contiguous native paged attention pools. Pointwise kernels preserve every
 intermediate eager BF16 rounding, with FP32 fusion disabled. Request caches
 are cleared between requests, and context managers restore original modules.
 
-Targeted checks on the PR head: **117 passed, 15 warnings in 20.84s**
-(114 CPU checks and three CUDA BF16 checks):
+Targeted checks on the simplified sources: **119 passed, 15 warnings in 17.00s**
+(116 CPU checks and three CUDA BF16 checks). New regression checks cover native
+source owners, last-reader identities, absence of pre-admission pool allocation
+and retention of exported buffers after abort:
 
 ```bash
 python -m pytest --noconftest -o addopts='' \
@@ -101,8 +127,8 @@ tests have not been run.
 
 [evidence.zip](evidence.zip) contains per-request completion events, hashes,
 rank summaries, the targeted test log and measured source snapshots.
-SHA256: `6e021eac5aa5d2196e99f424a7cf0d296d595b94434f11377eeab20f76047e2a`.
-The audit recomputes all 16 requests and medians and checks 52 source snapshot
+SHA256: `270e7f803a5b8cfa69b3f705501c9ffbf4e0b023dedf80f6227470719e43a940`.
+The audit recomputes all 16 requests and medians and checks 28 source snapshot
 hashes. [audit.json](audit.json) also records memory and sample values.
 
 ```bash
@@ -114,7 +140,7 @@ The fixture [conditioning.pt.gz](conditioning.pt.gz) contains pre-encoded
 text only. Its uncompressed SHA256 is
 `198358abb9eb6e80296d18bb78f82924a4fef1fa1a44ff26af34e75cfda9c5af`.
 Model weights are not included. Transport source and adaptation hashes are
-recorded in [provenance.json](../../legacy_tick/provenance.json).
+recorded in [provenance.json](../../provenance.json).
 
 For comparison, the earlier frozen commit
 `2e4f22a3e3d67319fafbf84e1d0f199e397e08e9` measured 116.303/130.038 FPS on
