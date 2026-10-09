@@ -1,0 +1,55 @@
+{
+  "base_commit": "86490babe358740cf98f019d1972f3b364a329d4",
+  "full_requests_checked": 16,
+  "measured_source_files_checked": 52,
+  "rows": [
+    {
+      "groups": 1,
+      "variant": "baseline",
+      "fps_samples": [
+        116.1977746312932,
+        116.2974894132776,
+        116.06524714885013
+      ],
+      "median_fps": 116.1977746312932,
+      "peak_allocated_gib": 14.866153717041016,
+      "sha256": "d37a9c999e612e6578aad0ff8fd715ba3d5abfa4a46994f698adb3a8df9396fe"
+    },
+    {
+      "groups": 1,
+      "variant": "hybrid_fused",
+      "fps_samples": [
+        129.71408806904915,
+        129.52499661542424,
+        129.74462597980923
+      ],
+      "median_fps": 129.71408806904915,
+      "peak_allocated_gib": 40.145193576812744,
+      "sha256": "d37a9c999e612e6578aad0ff8fd715ba3d5abfa4a46994f698adb3a8df9396fe"
+    },
+    {
+      "groups": 2,
+      "variant": "baseline",
+      "fps_samples": [
+        178.48628725499987,
+        178.51999687648117,
+        178.34393171138578
+      ],
+      "median_fps": 178.48628725499987,
+      "peak_allocated_gib": 6.703157901763916,
+      "sha256": "a9a53546cb02479643554cce66ee217c7c00d84af6cbb16a0ecde54b60c2f45d"
+    },
+    {
+      "groups": 2,
+      "variant": "hybrid_fused",
+      "fps_samples": [
+        251.41077134954523,
+        251.5136096139276,
+        252.22568726217494
+      ],
+      "median_fps": 251.5136096139276,
+      "peak_allocated_gib": 20.302467346191406,
+      "sha256": "a9a53546cb02479643554cce66ee217c7c00d84af6cbb16a0ecde54b60c2f45d"
+    }
+  ]
+}
