@@ -162,4 +162,4 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
         # Mirrors upstream XPUPlatform defaults: `gelu_and_mul_sparse` has no XPU
         # provider, so it must not fall back to `default` (which contains
         # `vllm_c`) via IrOpPriorityConfig.with_default.
-        return IrOpPriorityConfig.with_default(default, gelu_and_mul_sparse=["native"])
+        return cls._build_ir_op_priority(default, gelu_and_mul_sparse=["native"])
