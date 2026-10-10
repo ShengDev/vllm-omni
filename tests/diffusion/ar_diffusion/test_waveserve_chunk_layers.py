@@ -82,6 +82,7 @@ def test_chunk_schedule_rejects_unknown_values():
     pipeline.stage_parallel_size = 1
     pipeline.layer_groups = 1
     pipeline.max_history_chunks = 1
+    pipeline.transformer = SimpleNamespace(num_layers=1, local_num_layers=1)
     req = OmniDiffusionRequest(
         prompt="x",
         request_id="sched-0",
@@ -107,6 +108,8 @@ def test_waveserve_tiny_helper_forward_cpu():
         device=torch.device("cpu"),
         layer_groups=1,
         max_batch_size=1,
+        blocks_per_rank=transformer.local_num_layers,
+        layer_offset=transformer.start_layer,
     )
     ctx = ARDiffusionChunkContext(
         spec=ChunkRunSpec(topology=ChunkTopology(stages=1, layer_groups=1), rank=0),
@@ -120,6 +123,8 @@ def test_waveserve_tiny_helper_forward_cpu():
             layer_groups=1,
             ordering=Ordering.SERIAL,
             kv_history_chunks=1,
+            blocks=transformer.num_layers,
+            blocks_per_rank=transformer.local_num_layers,
         )
     )
     ctx.enqueue("ws-0", plan, chunk_tokens=block_size)
@@ -144,9 +149,18 @@ def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
             self.is_stage_last = is_stage_last
 
         def forward_latent_step(
-            self, latent, *, timestep, encoder_hidden_states, kv_contexts=None, intermediate_tensors=None
+            self,
+            latent,
+            *,
+            timestep,
+            encoder_hidden_states,
+            kv_contexts=None,
+            intermediate_tensors=None,
+            only_block=None,
+            chunk: int = 0,
+            step: int = 0,
         ):
-            del timestep, encoder_hidden_states, kv_contexts
+            del timestep, encoder_hidden_states, kv_contexts, only_block, chunk, step
             if not self.is_stage_last:
                 assert intermediate_tensors is None or "hidden_states" in intermediate_tensors.tensors
                 tokens = torch.ones(latent.shape[0], 3, 8, device=latent.device, dtype=latent.dtype)
@@ -176,17 +190,17 @@ def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
         dtype=dtype,
     )
 
-    tasks = [("r0", (0, 0))]
+    tasks = [("r0", (0, 0, 0))]
     mid_out = mid.forward(tasks, [None], hidden=None)
-    assert set(mid_out) == {"latent", "hidden_states"}
+    assert {"latent", "hidden_states"} <= set(mid_out)
     packed = mid.pack_activation(mid_out)
     assert "latent" in packed and "hidden_states" in packed
 
     last_in = last.unpack_activation(packed)
     last_out = last.forward(tasks, [None], hidden=last_in)
-    assert set(last_out) == {"latent"}
+    assert "latent" in last_out
     assert 0 not in last.finished.get("r0", {})
     # Second denoise step finishes the chunk on stage-last.
-    last_out2 = last.forward([("r0", (0, 1))], [None], hidden=last_out)
+    last_out2 = last.forward([("r0", (0, 1, 0))], [None], hidden=last_out)
     assert 0 in last.finished["r0"]
     assert last_out2["latent"].shape == shape

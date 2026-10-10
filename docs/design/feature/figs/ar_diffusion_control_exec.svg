@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="720" viewBox="0 0 1000 720">
+  <defs>
+    <style>
+      .title { font: 700 22px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #0f172a; }
+      .sub { font: 500 13px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #475569; }
+      .h { font: 700 14px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #0f172a; }
+      .t { font: 12px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #1e293b; }
+      .s { font: 11px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #64748b; }
+      .w { font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #334155; }
+    </style>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#64748b"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#ea580c"/>
+    </marker>
+  </defs>
+  <rect width="100%" height="100%" fill="#f8fafc"/>
+  
+  <text x="40" y="40" class="title">控制面 / 执行面：谁调用谁</text>
+  <text x="40" y="64" class="sub">Chunk 路径一次请求的真实调用链</text>
+
+  <rect x="200" y="90" width="600" height="48" rx="10" fill="#e2e8f0" stroke="#64748b"/>
+  <text x="500" y="120" text-anchor="middle" class="h">Serving / Session（可选）· session_id / reset / close</text>
+
+  <line x1="500" y1="138" x2="500" y2="165" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="250" y="165" width="500" height="44" rx="10" fill="#cbd5e1" stroke="#475569"/>
+  <text x="500" y="193" text-anchor="middle" class="h">ARDiffusionEngine · 选型壳（几乎空）</text>
+
+  <line x1="500" y1="209" x2="500" y2="235" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="200" y="235" width="600" height="58" rx="10" fill="#94a3b8" stroke="#334155"/>
+  <text x="500" y="260" text-anchor="middle" class="h" fill="#fff">ARDiffusionModelRunner</text>
+  <text x="500" y="280" text-anchor="middle" class="s" fill="#f1f5f9">预分配 NoisyKVCache · execute 时 bind ChunkContext · 不跑 tick</text>
+
+  <line x1="500" y1="293" x2="500" y2="320" stroke="#ea580c" stroke-width="2" marker-end="url(#arrowOrange)"/>
+
+  <rect x="200" y="320" width="600" height="58" rx="10" fill="#fdba74" stroke="#ea580c"/>
+  <text x="500" y="345" text-anchor="middle" class="h">WaveServeWanPipeline.forward</text>
+  <text x="500" y="365" text-anchor="middle" class="s">组 ChunkSchedule → build_chunk_plan → run_chunk_pipeline</text>
+
+  <line x1="350" y1="378" x2="220" y2="420" stroke="#2563eb" stroke-width="2" marker-end="url(#arrowBlue)"/>
+  <line x1="500" y1="378" x2="500" y2="420" stroke="#ea580c" stroke-width="2" marker-end="url(#arrowOrange)"/>
+  <line x1="650" y1="378" x2="780" y2="420" stroke="#16a34a" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="40" y="420" width="280" height="150" rx="12" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+  <text x="180" y="450" text-anchor="middle" class="h" fill="#1d4ed8">chunk_schedule.py</text>
+  <text x="180" y="478" text-anchor="middle" class="t">纯函数时刻表</text>
+  <text x="180" y="500" text-anchor="middle" class="w">ChunkPlan</text>
+  <text x="180" y="522" text-anchor="middle" class="s">cells · sources</text>
+  <text x="180" y="542" text-anchor="middle" class="s">transfers · last_use</text>
+  <text x="180" y="550" text-anchor="middle" class="s"></text>
+
+  <rect x="360" y="420" width="280" height="150" rx="12" fill="#ffedd5" stroke="#ea580c" stroke-width="2"/>
+  <text x="500" y="450" text-anchor="middle" class="h" fill="#c2410c">chunk_executor.py</text>
+  <text x="500" y="478" text-anchor="middle" class="t">tick / cell 循环</text>
+  <text x="500" y="500" text-anchor="middle" class="w">await → prepare</text>
+  <text x="500" y="522" text-anchor="middle" class="w">forward → publish</text>
+  <text x="500" y="544" text-anchor="middle" class="w">exchange → evict</text>
+
+  <rect x="680" y="420" width="280" height="150" rx="12" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="820" y="450" text-anchor="middle" class="h" fill="#15803d">kv_cache/noisy.py</text>
+  <text x="820" y="478" text-anchor="middle" class="t">版本 KV + P2P</text>
+  <text x="820" y="500" text-anchor="middle" class="w">NoisyKVState</text>
+  <text x="820" y="522" text-anchor="middle" class="w">VersionPool</text>
+  <text x="820" y="544" text-anchor="middle" class="w">Transport</text>
+
+  <line x1="500" y1="570" x2="500" y2="600" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="250" y="600" width="500" height="50" rx="10" fill="#f1f5f9" stroke="#64748b"/>
+  <text x="500" y="630" text-anchor="middle" class="t">adapter.forward(cell) · 模型数学（条件 / CFG / DiT block）</text>
+
+  <text x="40" y="690" class="sub">对比 Legacy：Runner.execute_* / 模型循环 ≈ 这里的 executor；Engine 两边都不管时刻表</text>
+
+</svg>

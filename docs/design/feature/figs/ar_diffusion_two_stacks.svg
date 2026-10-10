@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="760" viewBox="0 0 1000 760">
+  <defs>
+    <style>
+      .title { font: 700 22px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #0f172a; }
+      .sub { font: 500 13px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #475569; }
+      .h { font: 700 14px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #0f172a; }
+      .t { font: 12px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #1e293b; }
+      .s { font: 11px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #64748b; }
+      .w { font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #334155; }
+    </style>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#64748b"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#ea580c"/>
+    </marker>
+  </defs>
+  <rect width="100%" height="100%" fill="#f8fafc"/>
+  
+  <text x="40" y="40" class="title">AR-Diffusion：两条栈叠在同一 Engine 壳上</text>
+  <text x="40" y="64" class="sub">Legacy Session（DreamZero / LingBot） vs Chunk / Noisy（WaveServe）</text>
+
+  <!-- top -->
+  <rect x="280" y="90" width="440" height="56" rx="10" fill="#e2e8f0" stroke="#64748b" stroke-width="1.5"/>
+  <text x="500" y="115" text-anchor="middle" class="h">Omni / DiffusionEngine</text>
+  <text x="500" y="134" text-anchor="middle" class="s">engine_backend → ARDiffusionEngine（只选 runner）</text>
+
+  <line x1="500" y1="146" x2="500" y2="175" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="220" y="175" width="560" height="56" rx="10" fill="#cbd5e1" stroke="#475569" stroke-width="1.5"/>
+  <text x="500" y="200" text-anchor="middle" class="h">ARDiffusionModelRunner · runner.py</text>
+  <text x="500" y="219" text-anchor="middle" class="s">分叉点：有 Chunk capability → Noisy；否则 → Session KV</text>
+
+  <line x1="360" y1="231" x2="250" y2="270" stroke="#2563eb" stroke-width="2" marker-end="url(#arrowBlue)"/>
+  <line x1="640" y1="231" x2="750" y2="270" stroke="#ea580c" stroke-width="2" marker-end="url(#arrowOrange)"/>
+
+  <!-- left legacy -->
+  <rect x="40" y="270" width="420" height="430" rx="14" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+  <text x="250" y="298" text-anchor="middle" class="h" fill="#1d4ed8">Legacy Session 栈</text>
+  <text x="250" y="318" text-anchor="middle" class="s">SupportsARDiffusionPipeline</text>
+
+  <rect x="70" y="340" width="360" height="52" rx="8" fill="#dbeafe" stroke="#3b82f6"/>
+  <text x="250" y="362" text-anchor="middle" class="t">bind ARDiffusionKVState</text>
+  <text x="250" y="380" text-anchor="middle" class="w">state.py</text>
+
+  <line x1="250" y1="392" x2="250" y2="415" stroke="#2563eb" stroke-width="2" marker-end="url(#arrowBlue)"/>
+
+  <rect x="70" y="415" width="360" height="52" rx="8" fill="#dbeafe" stroke="#3b82f6"/>
+  <text x="250" y="437" text-anchor="middle" class="t">Pipeline 自管循环（forward / stepwise）</text>
+  <text x="250" y="455" text-anchor="middle" class="w">DreamZero / LingBot</text>
+
+  <line x1="250" y1="467" x2="250" y2="490" stroke="#2563eb" stroke-width="2" marker-end="url(#arrowBlue)"/>
+
+  <rect x="70" y="490" width="360" height="90" rx="8" fill="#bfdbfe" stroke="#2563eb"/>
+  <text x="250" y="518" text-anchor="middle" class="t">kv_cache 三分</text>
+  <text x="250" y="540" text-anchor="middle" class="w">state · manager · paged(+attention)</text>
+  <text x="250" y="562" text-anchor="middle" class="s">BlockPool · sink+window · 单版本</text>
+
+  <text x="250" y="665" text-anchor="middle" class="s">Runner = 中枢（session + KV 生命周期）</text>
+
+  <!-- right chunk -->
+  <rect x="540" y="270" width="420" height="430" rx="14" fill="#fff7ed" stroke="#ea580c" stroke-width="2"/>
+  <text x="750" y="298" text-anchor="middle" class="h" fill="#c2410c">Chunk / Noisy 栈</text>
+  <text x="750" y="318" text-anchor="middle" class="s">SupportsARDiffusionChunkPipeline</text>
+
+  <rect x="570" y="340" width="360" height="52" rx="8" fill="#ffedd5" stroke="#f97316"/>
+  <text x="750" y="362" text-anchor="middle" class="t">bind ARDiffusionChunkContext</text>
+  <text x="750" y="380" text-anchor="middle" class="w">NoisyKVState in context</text>
+
+  <line x1="750" y1="392" x2="750" y2="415" stroke="#ea580c" stroke-width="2" marker-end="url(#arrowOrange)"/>
+
+  <rect x="570" y="415" width="360" height="52" rx="8" fill="#ffedd5" stroke="#f97316"/>
+  <text x="750" y="437" text-anchor="middle" class="t">Pipeline 调 build_plan + run_chunk_pipeline</text>
+  <text x="750" y="455" text-anchor="middle" class="w">WaveServeWan</text>
+
+  <line x1="750" y1="467" x2="750" y2="490" stroke="#ea580c" stroke-width="2" marker-end="url(#arrowOrange)"/>
+
+  <rect x="570" y="490" width="360" height="110" rx="8" fill="#fed7aa" stroke="#ea580c"/>
+  <text x="750" y="518" text-anchor="middle" class="t">一次生成编排 + NoisyKV</text>
+  <text x="750" y="540" text-anchor="middle" class="w">chunk_schedule · chunk_executor</text>
+  <text x="750" y="560" text-anchor="middle" class="w">kv_cache/noisy.py（揉在一起）</text>
+  <text x="750" y="582" text-anchor="middle" class="s">VersionPool · last_use · PP P2P</text>
+
+  <text x="750" y="665" text-anchor="middle" class="s">Runner 降级：预分配 + 注入 context</text>
+
+  <text x="500" y="730" text-anchor="middle" class="sub">错位：schedule/executor 挂在 Pipeline，不是 Runner/Engine 子模块</text>
+
+</svg>

@@ -3,13 +3,19 @@
 
 from __future__ import annotations
 
+import socket
 from datetime import timedelta
 
 import pytest
 import torch
 
-from tests.helpers.runtime import get_open_port
 from vllm_omni.diffusion.distributed.group_coordinator import GroupCoordinator
+
+
+def get_open_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 from vllm_omni.experimental.ar_diffusion.chunk_schedule import ChunkSchedule, Inflight, Ordering, build_chunk_plan
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     ARDiffusionNoisyKVSpec,
@@ -51,29 +57,30 @@ def _transfer_worker(rank: int, chunk_tokens: int, init_method: str, device_kind
     transfers = [(slot, xfer) for slot in range(plan.num_slots) for xfer in plan.transfers(slot)]
     assert len(transfers) == 1
     slot, xfer = transfers[0]
-    key = ("A", *xfer.version)
+    key = ("A", *xfer.version)  # (req,c,s,b)
     pool = cache.pool
     shape = (chunk_tokens, spec.num_kv_heads, spec.head_size)
+    layer = key[3] % spec.num_layers
     if rank == xfer.src:
         source_slot = pool.alloc(key)
-        for layer in range(spec.num_layers):
-            pool.k_pools[layer].fill_(77)
-            pool.v_pools[layer].fill_(77)
-            start = source_slot * spec.max_chunk_tokens
-            expected_key = torch.arange(
-                chunk_tokens * spec.num_kv_heads * spec.head_size, dtype=torch.float32, device=device
-            ).reshape(shape)
-            pool.k_pools[layer][start : start + chunk_tokens] = expected_key + layer
-            pool.v_pools[layer][start : start + chunk_tokens] = expected_key + layer + 0.5
+        for li in range(spec.num_layers):
+            pool.k_pools[li].fill_(77)
+            pool.v_pools[li].fill_(77)
+        start = source_slot * spec.max_chunk_tokens
+        expected_key = torch.arange(
+            chunk_tokens * spec.num_kv_heads * spec.head_size, dtype=torch.float32, device=device
+        ).reshape(shape)
+        pool.k_pools[layer][start : start + chunk_tokens] = expected_key + layer
+        pool.v_pools[layer][start : start + chunk_tokens] = expected_key + layer + 0.5
     else:
-        for layer in range(spec.num_layers):
-            pool.k_pools[layer].fill_(-1)
-            pool.v_pools[layer].fill_(-1)
+        for li in range(spec.num_layers):
+            pool.k_pools[li].fill_(-1)
+            pool.v_pools[li].fill_(-1)
 
     handles = state.exchange(slot)
     for handle in handles:
         handle.wait()
-    expected_bytes = 2 * spec.num_layers * chunk_tokens * spec.num_kv_heads * spec.head_size * 4
+    expected_bytes = 2 * chunk_tokens * spec.num_kv_heads * spec.head_size * 4
     if mode != "immediate":
         assert cache.transport.await_ready(frozenset()) == (1 if rank == xfer.dst else 0)
         torch.distributed.barrier()
@@ -100,14 +107,13 @@ def _transfer_worker(rank: int, chunk_tokens: int, init_method: str, device_kind
         assert cache.transport.bytes_received == expected_bytes
         received_slot = pool.slot_of(key)
         start = received_slot * spec.max_chunk_tokens
-        for layer in range(spec.num_layers):
-            expected_key = torch.arange(
-                chunk_tokens * spec.num_kv_heads * spec.head_size, dtype=torch.float32, device=device
-            ).reshape(shape)
-            torch.testing.assert_close(pool.k_pools[layer][start : start + chunk_tokens], expected_key + layer)
-            torch.testing.assert_close(pool.v_pools[layer][start : start + chunk_tokens], expected_key + layer + 0.5)
-            assert torch.all(pool.k_pools[layer][start + chunk_tokens : start + spec.max_chunk_tokens] == -1)
-            assert torch.all(pool.v_pools[layer][start + chunk_tokens : start + spec.max_chunk_tokens] == -1)
+        expected_key = torch.arange(
+            chunk_tokens * spec.num_kv_heads * spec.head_size, dtype=torch.float32, device=device
+        ).reshape(shape)
+        torch.testing.assert_close(pool.k_pools[layer][start : start + chunk_tokens], expected_key + layer)
+        torch.testing.assert_close(pool.v_pools[layer][start : start + chunk_tokens], expected_key + layer + 0.5)
+        assert torch.all(pool.k_pools[layer][start + chunk_tokens : start + spec.max_chunk_tokens] == -1)
+        assert torch.all(pool.v_pools[layer][start + chunk_tokens : start + spec.max_chunk_tokens] == -1)
     print(
         f"rank={rank} device={device_kind} chunk_tokens={chunk_tokens} "
         f"sent={state.bytes_sent} received={state.bytes_received}",

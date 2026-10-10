@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="660" viewBox="0 0 1000 660">
+  <defs>
+    <style>
+      .title { font: 700 22px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #0f172a; }
+      .sub { font: 500 13px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #475569; }
+      .h { font: 700 14px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #0f172a; }
+      .t { font: 12px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #1e293b; }
+      .s { font: 11px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #64748b; }
+      .w { font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #334155; }
+    </style>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#64748b"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#ea580c"/>
+    </marker>
+  </defs>
+  <rect width="100%" height="100%" fill="#f8fafc"/>
+  
+  <text x="40" y="40" class="title">目标对齐结构（建议）</text>
+  <text x="40" y="64" class="sub">控制面统一到 Runner · KV 按 state/manager 分层 · schedule 保持纯函数</text>
+
+  <rect x="300" y="90" width="400" height="44" rx="10" fill="#e2e8f0" stroke="#64748b"/>
+  <text x="500" y="118" text-anchor="middle" class="h">engine.py · 仍只选 runner</text>
+
+  <line x1="500" y1="134" x2="500" y2="160" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="200" y="160" width="600" height="54" rx="10" fill="#334155"/>
+  <text x="500" y="183" text-anchor="middle" class="h" fill="#fff">runner.py · 选 backend + bind + session 外壳</text>
+  <text x="500" y="203" text-anchor="middle" class="s" fill="#cbd5e1">backend=session | chunk</text>
+
+  <line x1="320" y1="214" x2="220" y2="250" stroke="#2563eb" stroke-width="2" marker-end="url(#arrowBlue)"/>
+  <line x1="680" y1="214" x2="780" y2="250" stroke="#ea580c" stroke-width="2" marker-end="url(#arrowOrange)"/>
+
+  <rect x="40" y="250" width="360" height="200" rx="12" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+  <text x="220" y="280" text-anchor="middle" class="h" fill="#1d4ed8">backend = session</text>
+  <text x="220" y="310" text-anchor="middle" class="t">state_session.py</text>
+  <text x="220" y="335" text-anchor="middle" class="t">manager_session.py</text>
+  <text x="220" y="360" text-anchor="middle" class="s">BlockPool · sink/window</text>
+  <text x="220" y="395" text-anchor="middle" class="t">→ Pipeline legacy loop</text>
+  <text x="220" y="420" text-anchor="middle" class="s">DZ / LingBot 默认不变</text>
+
+  <rect x="600" y="250" width="360" height="280" rx="12" fill="#fff7ed" stroke="#ea580c" stroke-width="2"/>
+  <text x="780" y="280" text-anchor="middle" class="h" fill="#c2410c">backend = chunk</text>
+  <text x="780" y="310" text-anchor="middle" class="t">schedule/plan.py（纯函数）</text>
+  <text x="780" y="335" text-anchor="middle" class="t">execute/tick_loop.py</text>
+  <text x="780" y="360" text-anchor="middle" class="t">state_noisy.py</text>
+  <text x="780" y="385" text-anchor="middle" class="t">manager_noisy.py + transport</text>
+  <text x="780" y="410" text-anchor="middle" class="s">VersionPool · last_use · P2P</text>
+  <text x="780" y="445" text-anchor="middle" class="t">→ Pipeline adapter.forward(cell)</text>
+  <text x="780" y="470" text-anchor="middle" class="s">或 Runner 直接跑 tick（可选）</text>
+  <text x="780" y="505" text-anchor="middle" class="s">WaveServe / Noisy PP</text>
+
+  <rect x="40" y="560" width="920" height="70" rx="12" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="500" y="590" text-anchor="middle" class="h" fill="#15803d">kv_cache/paged.py + paged_attention.py</text>
+  <text x="500" y="612" text-anchor="middle" class="t">两边共用 · 不改 layout / 写核 / LayerInputs 契约</text>
+
+</svg>

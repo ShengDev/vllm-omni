@@ -112,25 +112,33 @@ class TinyStageWanTransformer(nn.Module):
         hidden_states: torch.Tensor | IntermediateTensors | None = None,
         kv_contexts: list[Any] | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
+        only_block: int | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if isinstance(hidden_states, IntermediateTensors):
             intermediate_tensors = hidden_states
             hidden_states = None
+        if only_block is None:
+            layer_ids = list(range(self.start_layer, self.end_layer))
+        else:
+            if not self.start_layer <= only_block < self.end_layer:
+                raise ValueError(f"only_block {only_block} out of local range")
+            layer_ids = [only_block]
+        first_local = layer_ids[0] == self.start_layer
+        last_local = layer_ids[-1] == self.end_layer - 1
         if intermediate_tensors is not None:
             hidden = intermediate_tensors["hidden_states"]
         elif hidden_states is None:
             raise RuntimeError("tiny stage transformer received no hidden states")
-        elif self.is_stage_first and hidden_states.size(-1) == self.in_features:
+        elif first_local and self.is_stage_first and hidden_states.size(-1) == self.in_features:
             hidden = self.patch_embed(hidden_states)
         else:
             hidden = hidden_states
-        local_count = self.local_num_layers
-        for idx in range(self.start_layer, self.end_layer):
+        for idx in layer_ids:
             ctx = None
             if kv_contexts is not None:
-                ctx = kv_contexts[idx - self.start_layer] if len(kv_contexts) == local_count else kv_contexts[idx]
+                ctx = kv_contexts[0] if len(kv_contexts) == 1 else kv_contexts[idx - self.start_layer]
             hidden = self.blocks[idx](hidden, ctx)
-        if self.is_stage_last:
+        if last_local and self.is_stage_last:
             return self.proj_out(hidden)
         return IntermediateTensors({"hidden_states": hidden})
 
@@ -146,16 +154,22 @@ class TinyChunkAdapter(ChunkAdapter):
         if not tasks:
             return hidden
         outs = []
-        for i, _task in enumerate(tasks):
+        for i, (_req, cell) in enumerate(tasks):
+            _chunk, _step, block = cell
             h = hidden
             if h is None:
                 h = self.seed_hidden
+            elif isinstance(h, dict) and "hidden_states" in h:
+                hs = h["hidden_states"]
+                if isinstance(hs, torch.Tensor) and hs.shape[0] == len(tasks):
+                    hs = hs[i : i + 1]
+                h = IntermediateTensors({"hidden_states": hs})
             elif isinstance(h, torch.Tensor) and h.shape[0] == len(tasks):
                 h = h[i : i + 1]
             elif isinstance(h, IntermediateTensors) and h["hidden_states"].shape[0] == len(tasks):
                 h = IntermediateTensors({key: value[i : i + 1] for key, value in h.tensors.items()})
             ctx = kv_contexts[i] if i < len(kv_contexts) else None
-            outs.append(self.transformer(h, kv_contexts=ctx))
+            outs.append(self.transformer(h, kv_contexts=ctx, only_block=block))
         return self._stack(outs)
 
     @staticmethod
