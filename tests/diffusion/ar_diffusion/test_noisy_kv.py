@@ -21,6 +21,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     NoisyKVCache,
     NoisyKVState,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import paged_write_attn
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -59,7 +60,8 @@ def test_capacity_covers_latest_stage_frontier():
 
 def test_capacity_respects_memory_budget():
     cache = _cache(layer_groups=2, max_batch_size=2)
-    # Force a tiny budget: only one version slot fits.
+    # Force a tiny budget: only one version slot fits across all local layers.
+    bytes_per_slot = cache.bytes_per_version * cache.spec.num_layers
     tiny = NoisyKVCache(
         cache.spec,
         dtype=torch.float32,
@@ -67,21 +69,56 @@ def test_capacity_respects_memory_budget():
         layer_groups=2,
         max_batch_size=2,
         gpu_memory_fraction=1.0,
-        available_bytes=cache.bytes_per_version + 8,
+        available_bytes=bytes_per_slot + 8,
     )
     assert tiny.capacity == 1
-    assert tiny.reserved_bytes == tiny.bytes_per_version
+    assert tiny.reserved_bytes == bytes_per_slot
 
 
 def test_reset_all_releases_versions():
     cache = _cache()
     state = NoisyKVState(cache)
-    key = ("A", 0, 0)
+    key = ("A", 0, 0, 0)
     cache.pool.alloc(key)
     assert cache.pool.has(key)
     state.reset_all()
     assert not cache.pool.has(key)
-    assert cache.pool.free
+    assert cache.pool.has_free
+    assert all(len(stack) == cache.capacity for stack in cache.pool.free)
+
+
+def test_per_layer_free_stacks_do_not_share_slots():
+    """Each local block has its own capacity; filling layer 0 must not starve layer 1."""
+    cache = _cache()
+    cap = cache.capacity
+    # Fill every per-layer slot on block/layer 0.
+    for i in range(cap):
+        cache.pool.alloc(("A", i, 0, 0))
+    assert len(cache.pool.free[0]) == 0
+    with pytest.raises(RuntimeError, match="layer=0"):
+        cache.pool.alloc(("A", cap, 0, 0))
+    # Layer 1 still has a full free stack.
+    assert len(cache.pool.free[1]) == cap
+    for i in range(cap):
+        cache.pool.alloc(("A", i, 0, 1))
+    assert len(cache.pool.keys) == 2 * cap
+    assert len(cache.pool.free[1]) == 0
+
+
+@pytest.mark.parametrize("chunk_tokens", [4, 8, 12])
+@pytest.mark.parametrize("write_slot", [0, 1, 3])
+def test_cached_write_slots_match_compute_slot_mapping(chunk_tokens, write_slot):
+    cache = _cache(max_chunk_tokens=12)
+    state = NoisyKVState(cache)
+    device = torch.device("cpu")
+    got = state._cached_write_slots(write_slot, chunk_tokens, device)
+    write_blocks = cache.pool.block_ids(write_slot)[: chunk_tokens // cache.pool.block_size]
+    expect = compute_slot_mapping(
+        write_blocks, torch.arange(chunk_tokens, dtype=torch.long), cache.pool.block_size
+    )
+    torch.testing.assert_close(got, expect)
+    # Second call hits cache (same tensor object).
+    assert state._cached_write_slots(write_slot, chunk_tokens, device) is got
 
 
 def test_prepare_evict_releases_last_use():
@@ -102,17 +139,17 @@ def test_prepare_evict_releases_last_use():
     inflight = (Inflight(req="A", t0=0, plan=plan),)
     state.set_inflight(inflight)
     # Slot 0 writes (0,0)
-    state.prepare((("A", (0, 0)),))
+    state.prepare((("A", (0, 0, 0)),))
     assert state.resident_versions == 1
     state.evict(0)
     # last-use of (0,0) on r0 is later than slot 0
     assert state.resident_versions == 1
-    state.prepare((("A", (1, 0)),))
-    state.prepare((("A", (2, 0)),))
+    state.prepare((("A", (1, 0, 0)),))
+    state.prepare((("A", (2, 0, 0)),))
     # after slot 2, (0,0) should still be resident until evict(2)
     before = state.resident_versions
     state.evict(2)
-    assert state.resident_versions < before or (0, 0) not in [(k[1], k[2]) for k in cache.pool.keys if k[0] == "A"]
+    assert state.resident_versions < before or (0, 0, 0) not in [(k[1], k[2], k[3]) for k in cache.pool.keys if k[0] == "A"]
 
 
 def _vertical_plan() -> ChunkPlan:
@@ -172,17 +209,17 @@ def test_attention_reads_only_valid_version_pages(stages, chunk, chunk_tokens):
     state = NoisyKVState(cache)
     state.bind_rank(0, None)
     state.begin_request("A", plan, chunk_tokens=chunk_tokens)
-    task = (chunk, 0)
+    task = (chunk, 0, 0)
     sources = plan.sources(task, 0)
     assert len(sources) == chunk
     source_slots = [cache.pool.alloc(("A", *src.version)) for src in sources]
     # 同一 chunk 的未选版本也驻留，读取仍只能遵守计划。
-    first_chunk, first_step = sources[0].version
-    cache.pool.alloc(("A", first_chunk, (first_step + 1) % 3))
+    first_chunk, first_step, first_block = sources[0].version
+    cache.pool.alloc(("A", first_chunk, (first_step + 1) % 3, first_block))
     contexts = state.prepare((("A", task),))[0]
     generator = torch.Generator().manual_seed(42)
     shape = (chunk_tokens, cache.spec.num_kv_heads, cache.spec.head_size)
-    for context in contexts:
+    for context in contexts:  # one layer per cell
         context.key_pool.zero_()
         context.value_pool.zero_()
         unused = torch.ones(context.key_pool.shape[0], dtype=torch.bool)

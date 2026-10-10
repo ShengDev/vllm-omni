@@ -12,7 +12,7 @@ Features: Cache-DiT, CFG-Parallel, Ulysses-SP, Tensor-Parallel + VAE-Patch-Paral
 HSDP, Ring-Attn.
 
 NPU coverage (Wan-AI/Wan2.2-I2V-A14B-Diffusers only): 2 cases.
-- 4-card combined: cfg=2 + usp=2 + vae-patch=2 + hsdp.
+- 4-card combined: cfg=2 + usp=2 + vae-patch=4 + hsdp-shard=4.
 - 2-card tp_layerwise: tp=2 + enable-layerwise-offload.
 
 assert_diffusion_response validates successful generation
@@ -56,6 +56,9 @@ PARALLEL_CONFIGS = [
 ]
 
 # NPU: 2 cases only.
+# Required on NPU + HSDP/FSDP2 (recipe Wan2.2-I2V); harmless for the TP case.
+_NPU_SERVER_ENV = {"MULTI_STREAM_MEMORY_REUSE": "2"}
+
 NPU_PARALLEL_CONFIGS = [
     (
         "combined",
@@ -127,7 +130,11 @@ def _get_wan22_feature_cases():
         for feat_id, server_args, marks in NPU_PARALLEL_CONFIGS:
             cases.append(
                 pytest.param(
-                    OmniServerParams(model=model_path, server_args=server_args),
+                    OmniServerParams(
+                        model=model_path,
+                        server_args=server_args,
+                        env_dict=_NPU_SERVER_ENV,
+                    ),
                     id=f"npu_{model_key}_{feat_id}",
                     marks=marks,
                 )

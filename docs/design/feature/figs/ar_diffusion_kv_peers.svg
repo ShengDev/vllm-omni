@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="640" viewBox="0 0 1000 640">
+  <defs>
+    <style>
+      .title { font: 700 22px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #0f172a; }
+      .sub { font: 500 13px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #475569; }
+      .h { font: 700 14px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #0f172a; }
+      .t { font: 12px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #1e293b; }
+      .s { font: 11px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #64748b; }
+      .w { font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #334155; }
+    </style>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#64748b"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#ea580c"/>
+    </marker>
+  </defs>
+  <rect width="100%" height="100%" fill="#f8fafc"/>
+  
+  <text x="40" y="40" class="title">KV 模块对等关系</text>
+  <text x="40" y="64" class="sub">同一 paged 底座 · 两套策略 · noisy 未按 state/manager 拆分</text>
+
+  <!-- headers -->
+  <rect x="40" y="90" width="440" height="40" rx="8" fill="#2563eb"/>
+  <text x="260" y="116" text-anchor="middle" class="h" fill="#fff">Legacy · Session KV</text>
+  <rect x="520" y="90" width="440" height="40" rx="8" fill="#ea580c"/>
+  <text x="740" y="116" text-anchor="middle" class="h" fill="#fff">Chunk · Noisy KV</text>
+
+  <!-- row state -->
+  <rect x="40" y="150" width="440" height="70" rx="8" fill="#dbeafe" stroke="#3b82f6"/>
+  <text x="60" y="178" class="h">state.py</text>
+  <text x="60" y="200" class="w">ARDiffusionKVState · prepare / commit / close</text>
+  <rect x="520" y="150" width="440" height="70" rx="8" fill="#ffedd5" stroke="#f97316"/>
+  <text x="540" y="178" class="h">NoisyKVState（在 noisy.py）</text>
+  <text x="540" y="200" class="w">prepare / publish / exchange / evict</text>
+  <line x1="480" y1="185" x2="520" y2="185" stroke="#94a3b8" stroke-width="2" stroke-dasharray="4 3"/>
+  <text x="500" y="175" text-anchor="middle" class="s">≈</text>
+
+  <!-- row manager -->
+  <rect x="40" y="240" width="440" height="90" rx="8" fill="#dbeafe" stroke="#3b82f6"/>
+  <text x="60" y="268" class="h">manager.py</text>
+  <text x="60" y="290" class="w">ARDiffusionKVCache</text>
+  <text x="60" y="310" class="w">RequestAdapter + BlockPool + ChunkWindow</text>
+  <rect x="520" y="240" width="440" height="90" rx="8" fill="#ffedd5" stroke="#f97316"/>
+  <text x="540" y="268" class="h">NoisyKVCache + VersionPool（noisy.py）</text>
+  <text x="540" y="290" class="w">定长 version 栈 · last_use</text>
+  <text x="540" y="310" class="w">+ NoisyKVTransport（PP，老栈无）</text>
+  <line x1="480" y1="285" x2="520" y2="285" stroke="#94a3b8" stroke-width="2" stroke-dasharray="4 3"/>
+  <text x="500" y="275" text-anchor="middle" class="s">≈</text>
+
+  <!-- shared base -->
+  <rect x="40" y="360" width="920" height="100" rx="12" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="500" y="395" text-anchor="middle" class="h" fill="#15803d">已共用底座（对齐）</text>
+  <text x="500" y="425" text-anchor="middle" class="w">paged.py · allocate_kv_pool_with_views · compute_slot_mapping</text>
+  <text x="500" y="448" text-anchor="middle" class="w">paged_attention.py · ARDiffusionPagedLayerInputs · paged_write_attn</text>
+
+  <!-- arrows down -->
+  <line x1="260" y1="330" x2="260" y2="360" stroke="#16a34a" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="740" y1="330" x2="740" y2="360" stroke="#16a34a" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- keys -->
+  <rect x="40" y="490" width="440" height="80" rx="8" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="60" y="518" class="t">键：绝对 token 位置</text>
+  <text x="60" y="540" class="t">淘汰：sink + sliding window</text>
+  <text x="60" y="562" class="t">寿命：session 跨请求</text>
+  <rect x="520" y="490" width="440" height="80" rx="8" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="540" y="518" class="t">键：(req, chunk, step, block)</text>
+  <text x="540" y="540" class="t">淘汰：plan last_use + send barrier</text>
+  <text x="540" y="562" class="t">寿命：主路径单次请求（+可选 clean）</text>
+
+  <text x="500" y="610" text-anchor="middle" class="sub">合并方向：拆 noisy → state_noisy / manager_noisy / transport；不要硬并进 BlockPool</text>
+
+</svg>
