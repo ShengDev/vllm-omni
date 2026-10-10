@@ -453,19 +453,9 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         if envs.VLLM_USE_OINK_OPS:
             rms_norm = ["oink"] + default
 
-        # Mirrors upstream CudaPlatformBase defaults when the installed vLLM
-        # IrOpPriorityConfig knows the field. Older vLLM (e.g. 0.29) only has
-        # rms_norm / fused_add_rms_norm — skip unknown kwargs to stay bootable.
-        kwargs: dict[str, list[str]] = {
-            "rms_norm": rms_norm,
-            "fused_add_rms_norm": rms_norm,
-            "gelu_and_mul_sparse": ["triton", "native"],
-        }
-        fields = getattr(IrOpPriorityConfig, "model_fields", None)
-        if fields is not None:
-            kwargs = {k: v for k, v in kwargs.items() if k in fields}
-        else:
-            annotations = getattr(IrOpPriorityConfig, "__annotations__", {})
-            if annotations:
-                kwargs = {k: v for k, v in kwargs.items() if k in annotations}
-        return IrOpPriorityConfig.with_default(default, **kwargs)
+        return cls._build_ir_op_priority(
+            default,
+            rms_norm=rms_norm,
+            fused_add_rms_norm=rms_norm,
+            gelu_and_mul_sparse=["triton", "native"],
+        )

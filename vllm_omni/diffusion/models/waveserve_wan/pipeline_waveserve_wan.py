@@ -417,12 +417,14 @@ class WaveServeWanPipeline(nn.Module):
     def _plan_for(self, req: OmniDiffusionRequest):
         extra = (req.sampling_params.extra_args or {}) if req.sampling_params is not None else {}
         chunks = int(extra.get("num_chunks", extra.get("chunks", 2)))
-        explicit_denoise = (
-            extra.get("num_inference_steps")
-            or extra.get("num_denoise_steps")
-            or getattr(req.sampling_params, "num_inference_steps", None)
-        )
-        denoise = int(explicit_denoise or 4)
+        explicit_denoise = extra.get("num_inference_steps")
+        if explicit_denoise is None:
+            explicit_denoise = extra.get("num_denoise_steps")
+        if explicit_denoise is None:
+            explicit_denoise = getattr(req.sampling_params, "num_inference_steps", None)
+        denoise = 4 if explicit_denoise is None else int(explicit_denoise)
+        if denoise < 1:
+            raise ValueError(f"num_denoise_steps must be positive, got {denoise}")
         history = int(extra.get("kv_history_chunks", 0) or 0)
         if self.stage_parallel_size > 1 and history < 1:
             history = self.max_history_chunks
@@ -435,7 +437,7 @@ class WaveServeWanPipeline(nn.Module):
             raise ValueError(f"chunk_schedule must be 'serial' or 'latest', got {schedule_name!r}")
         stages = self.stage_parallel_size
         if stages not in (1, denoise + 1):
-            if explicit_denoise:
+            if explicit_denoise is not None:
                 raise ValueError(f"WaveServe stages must be 1 or num_denoise_steps+1 ({denoise + 1}), got {stages}")
             denoise = stages - 1
         schedule = ChunkSchedule(
@@ -564,9 +566,13 @@ class WaveServeWanPipeline(nn.Module):
             shift = float(extra.get("shift", _DEFAULT_SHIFT))
             seed = int(extra.get("seed", getattr(item.sampling_params, "seed", 0) or 0))
             chunk_tokens = self.transformer.seq_len_for_latent(shape)
-            # Resize noisy KV paging to this request's token count.
-            self.block_size = chunk_tokens
-            self.max_chunk_tokens = chunk_tokens
+            # KV pool 在加载时定型；请求不能通过改 pipeline 字段扩容。
+            spec = ctx.kv.cache.spec
+            if chunk_tokens != spec.max_chunk_tokens:
+                raise ValueError(
+                    f"latent_shape token count {chunk_tokens} does not match preallocated NoisyKV "
+                    f"max_chunk_tokens={spec.max_chunk_tokens}"
+                )
             ctx.enqueue(req_id, plan, chunk_tokens=chunk_tokens)
 
             prompt = item.prompt if isinstance(item.prompt, str) else str(item.prompt or "")

@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import nullcontext
+from dataclasses import fields
 from enum import Enum
 from typing import Any
 
 import torch
 import torch.nn as nn
 from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config.kernel import IrOpPriorityConfig
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.platforms import Platform
@@ -68,6 +70,14 @@ class OmniPlatform(Platform):
     @classmethod
     def get_default_stage_config_path(cls) -> str:
         raise NotImplementedError
+
+    @staticmethod
+    def _build_ir_op_priority(default: list[str], **overrides: list[str]) -> IrOpPriorityConfig:
+        # vLLM 版本决定可用 op 字段；三个平台共享同一兼容边界。
+        supported = {field.name for field in fields(IrOpPriorityConfig)}
+        return IrOpPriorityConfig.with_default(
+            default, **{name: priority for name, priority in overrides.items() if name in supported}
+        )
 
     @classmethod
     def prepare_diffusion_op_runtime(cls, op_name: str, **kwargs: Any) -> None:

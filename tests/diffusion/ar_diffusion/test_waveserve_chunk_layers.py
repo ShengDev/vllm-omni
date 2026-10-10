@@ -19,7 +19,7 @@ from vllm_omni.diffusion.models.waveserve_wan.pipeline_waveserve_wan import (
     WaveServeWanPipeline,
     _LatentChunkAdapter,
 )
-from vllm_omni.diffusion.models.waveserve_wan.transformer import stage_layer_range
+from vllm_omni.diffusion.models.waveserve_wan.transformer import StageWanTransformer, stage_layer_range
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.experimental.ar_diffusion.chunk_executor import (
     ARDiffusionChunkContext,
@@ -89,6 +89,68 @@ def test_chunk_schedule_rejects_unknown_values():
     )
     with pytest.raises(ValueError, match="chunk_schedule"):
         pipeline._plan_for(req)
+
+
+@pytest.mark.parametrize("source", ["num_inference_steps", "num_denoise_steps", "sampling_params"])
+@pytest.mark.parametrize("steps", [0, -1])
+def test_chunk_schedule_rejects_nonpositive_steps(source, steps):
+    pipeline = WaveServeWanPipeline.__new__(WaveServeWanPipeline)
+    pipeline.stage_parallel_size = 1
+    pipeline.layer_groups = 1
+    pipeline.max_history_chunks = 1
+    extra = {} if source == "sampling_params" else {source: steps}
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="invalid-steps",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_inference_steps=steps if source == "sampling_params" else 4, extra_args=extra
+        ),
+    )
+    with pytest.raises(ValueError, match="num_denoise_steps must be positive"):
+        pipeline._plan_for(req)
+
+
+@pytest.mark.parametrize(("stages", "expected_steps"), [(1, 4), (4, 3), (5, 4)])
+def test_chunk_schedule_unset_steps_keep_topology_default(stages, expected_steps):
+    pipeline = WaveServeWanPipeline.__new__(WaveServeWanPipeline)
+    pipeline.stage_parallel_size = stages
+    pipeline.layer_groups = 1
+    pipeline.max_history_chunks = 6
+    req = OmniDiffusionRequest(prompt="x", request_id="default-steps", sampling_params=OmniDiffusionSamplingParams())
+    plan, _, steps = pipeline._plan_for(req)
+    assert steps == plan.schedule.num_denoise_steps == expected_steps
+
+
+@pytest.mark.parametrize("shape", [(1, 16, 1, 4, 8), (1, 16, 1, 8, 16)])
+def test_pipeline_rejects_token_count_change_before_admission(shape):
+    pipeline = WaveServeWanPipeline.__new__(WaveServeWanPipeline)
+    torch.nn.Module.__init__(pipeline)
+    transformer = StageWanTransformer.__new__(StageWanTransformer)
+    torch.nn.Module.__init__(transformer)
+    transformer.patch_size = (1, 2, 2)
+    transformer.register_parameter("test_device", torch.nn.Parameter(torch.zeros(1)))
+    pipeline.transformer = transformer
+    pipeline.stage_parallel_size = pipeline.layer_groups = pipeline.max_history_chunks = 1
+    pipeline.block_size = pipeline.max_chunk_tokens = 16
+    pipeline._chunk_ctx = None
+    cache = NoisyKVCache(
+        ARDiffusionNoisyKVSpec(1, 1, 1, 16, 16, 1),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        layer_groups=1,
+        max_batch_size=1,
+    )
+    ctx = ARDiffusionChunkContext(ChunkRunSpec(ChunkTopology(1, 1)), NoisyKVState(cache))
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="different-shape",
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"latent_shape": shape, "num_denoise_steps": 1}),
+    )
+    with pipeline.bind_ar_diffusion_chunk_context(ctx):
+        with pytest.raises(ValueError, match="does not match preallocated NoisyKV"):
+            pipeline.forward(req)
+    assert pipeline.block_size == pipeline.max_chunk_tokens == cache.spec.max_chunk_tokens == 16
+    assert not ctx.pending and not ctx.inflight and not cache.pool.keys
 
 
 def test_waveserve_tiny_helper_forward_cpu():

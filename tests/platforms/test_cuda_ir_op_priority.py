@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from dataclasses import fields
+
 import pytest
 from vllm.config import CompilationConfig, CompilationMode, DeviceConfig, VllmConfig
+from vllm.config.kernel import IrOpPriorityConfig
 from vllm.platforms import current_platform
 
 # Importing CudaOmniPlatform pulls in vllm.platforms.cuda, which imports the
@@ -63,7 +66,8 @@ def test_cuda_default_ir_op_priority_names_only_registered_providers(mode: Compi
     and the omni diffusion forward context.
     """
     priority = CudaOmniPlatform.get_default_ir_op_priority(_vllm_config(mode=mode))
-    assert priority.gelu_and_mul_sparse == ["triton", "native"]
+    if "gelu_and_mul_sparse" in {field.name for field in fields(IrOpPriorityConfig)}:
+        assert priority.gelu_and_mul_sparse == ["triton", "native"]
     # Scoped context manager: runs the real upstream provider validation for
     # every field and restores the previous priorities on exit.
     with priority.set_priority():

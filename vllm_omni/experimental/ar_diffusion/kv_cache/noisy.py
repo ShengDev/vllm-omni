@@ -287,12 +287,11 @@ class NoisyKVCache:
                     f"budget={budget} bytes_per_version={bytes_per_version}"
                 )
             if max_by_budget < desired:
-                # Shrink capacity to fit free HBM rather than OOM after DiT load.
-                self.capacity = max_by_budget
-            else:
-                self.capacity = desired
-        else:
-            self.capacity = desired
+                raise RuntimeError(
+                    f"NoisyKV budget fits {max_by_budget} versions but configured schedule requires {desired}: "
+                    f"budget={budget} required_bytes={desired * bytes_per_version}"
+                )
+        self.capacity = desired
         self.pool = VersionPool(
             capacity=self.capacity,
             chunk_blocks=chunk_blocks,

@@ -226,7 +226,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         # Mirrors upstream RocmPlatform defaults: `gelu_and_mul_sparse` has no
         # ROCm-specific provider, so it must not fall back to `default` (which
         # contains `vllm_c`) via IrOpPriorityConfig.with_default.
-        return IrOpPriorityConfig.with_default(
+        return cls._build_ir_op_priority(
             default,
             rms_norm=rms_norm,
             fused_add_rms_norm=rms_norm,

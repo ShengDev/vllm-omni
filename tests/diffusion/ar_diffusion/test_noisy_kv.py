@@ -57,20 +57,34 @@ def test_capacity_covers_latest_stage_frontier():
     assert cache.capacity == 11
 
 
-def test_capacity_respects_memory_budget():
+def test_capacity_rejects_undersized_memory_budget():
     cache = _cache(layer_groups=2, max_batch_size=2)
-    # Force a tiny budget: only one version slot fits.
-    tiny = NoisyKVCache(
+    with pytest.raises(RuntimeError, match="budget fits 1 versions.*requires 20"):
+        NoisyKVCache(
+            cache.spec,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            layer_groups=2,
+            max_batch_size=2,
+            gpu_memory_fraction=1.0,
+            available_bytes=cache.bytes_per_version + 8,
+        )
+
+
+@pytest.mark.parametrize("extra_bytes", [0, 8])
+def test_capacity_accepts_complete_schedule_budget(extra_bytes):
+    cache = _cache(layer_groups=1, stages=5)
+    bounded = NoisyKVCache(
         cache.spec,
         dtype=torch.float32,
         device=torch.device("cpu"),
-        layer_groups=2,
-        max_batch_size=2,
-        gpu_memory_fraction=1.0,
-        available_bytes=cache.bytes_per_version + 8,
+        layer_groups=1,
+        max_batch_size=1,
+        stages=5,
+        available_bytes=cache.reserved_bytes + extra_bytes,
     )
-    assert tiny.capacity == 1
-    assert tiny.reserved_bytes == tiny.bytes_per_version
+    assert bounded.capacity == cache.capacity == 11
+    assert bounded.reserved_bytes == cache.reserved_bytes
 
 
 def test_reset_all_releases_versions():

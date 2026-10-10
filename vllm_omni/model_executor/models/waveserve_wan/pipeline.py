@@ -17,6 +17,8 @@ WAVESERVE_WAN_PIPELINE = PipelineConfig(
     model_type="waveserve_wan",
     default_deploy_config_name="waveserve_wan.yaml",
     model_arch="WaveServeWanPipeline",
+    diffusers_class_name="WaveServeWanPipeline",
+    diffusers_class_aliases=("WanPipeline",),
     stages=(
         StagePipelineConfig(
             stage_id=0,
