@@ -46,15 +46,20 @@ default paged-session deploys must not regress.
 
 Standard diffusion PP partitions one weight replica across `G` ranks and runs
 every denoise step on that same set of ranks. Noisy PP places **`S` weight
-replicas** on the same PP process group (`pipeline_parallel_size = S·G`):
+replicas** on the DiT ranks of the PP process group:
 
 - `S = 1`: native layer PP (no stage replicas).
 - `S = T+1`: one stage per denoise step plus a final clean-KV stage.
 
+DiT world size is always `S·G`. WaveServe’s default deploy optionally appends a
+**dedicated VAE decoder** rank so
+`pipeline_parallel_size = S·G + 1` (`dedicated_decoder=true`); without that flag
+`pipeline_parallel_size = S·G` and rank 0 still owns the VAE.
+
 Within a stage, ranks still own contiguous layer groups (`G = ⌈B/K⌉`). A chunk
-walks the PP chain; activations move along `next_rank`, while versioned KV moves
-**within a column** (same `g`, higher stage → lower stage) when Latest needs a
-remote history page.
+walks the DiT PP chain; activations move along `next_rank`, while versioned KV
+moves **within a column** (same `g`, higher stage → lower stage) when Latest
+needs a remote history page.
 
 ### Serial vs Latest
 
@@ -97,6 +102,7 @@ WaveServe Wan 2.1 1.3B is the first opt-in integration:
 
 ```text
 s = pp_rank // G ,   g = pp_rank % G ,   rank(s, g) = s·G + g
+# DiT ranks only: 0 … S·G−1
 ```
 
 ```text
@@ -105,16 +111,42 @@ stage 0     rank 0 ──hidden──▶ rank 1 ──▶ … ──▶ rank G�
 (step 0)       ▲ KV               ▲ KV                     ▲ KV
 stage 1     rank G ──────────▶ … ─────────────────────▶ rank 2G−1
    ⋮
-stage S−1   rank (S−1)G ─────▶ … ─────────────────────▶ rank SG−1 ──▶ gather
-(clean)
+stage S−1   rank (S−1)G ─────▶ … ─────────────────────▶ rank SG−1
+(clean)                                                      │ finished latent
+                                                             ▼  (stream_decode)
+                                              rank SG  VAE decode (optional)
+                                              dedicated_decoder → PP0 reply
 ```
 
 Layer split for Noisy PP uses `(g, G)` (`get_pp_indices(B, pp_rank % G, G)`),
-not a naive split over `world = S·G`. WaveServe builds Wan with explicit
+not a naive split over `dit_world = S·G`. WaveServe builds Wan with explicit
 `layer_pp_rank` / `layer_pp_world`; production Wan2.2 PP stays on its existing
 `make_layers` path. Real Wan activations: non-last groups pack
 `{latent, hidden_states}`; stage-last unpatches, advances with FlowEuler, and
 packs `{latent}` to the next stage (or back to rank 0 when `S=1`).
+
+### Dedicated decoder (WaveServe)
+
+Opt-in via `ar_diffusion_stage_config.dedicated_decoder` (see
+`vllm_omni/deploy/waveserve_wan.yaml`):
+
+| Role | Ranks | Work |
+| --- | --- | --- |
+| DiT | `0 … S·G−1` | Noisy PP chunk loop, NoisyKV, activation P2P |
+| VAE decoder | `S·G` | Recv finished latents, decode, return video to PP0 |
+
+Contract details:
+
+- Layout helper: `resolve_chunk_parallel_layout(..., dedicated_decoder=True)` →
+  `ChunkParallelLayout` with `dit_world = PP−1`, `decoder_rank = dit_world`.
+- DiT activation / NoisyKV `batch_isend_irecv` uses a **DiT-only** NCCL/Gloo
+  subgroup. The decoder never joins `run_chunk_pipeline`; the first
+  `batch_isend_irecv` on a process group must include every member, so the full
+  PP group cannot host DiT-only P2P when a silent decoder rank is present.
+- Latents: last denoise DiT rank → decoder over a gloo pair group
+  (`stream_decode`). Video: decoder → PP0 for the engine reply.
+- Overlap: decode proceeds as chunks finish; client-visible e2e still waits for
+  the assembled video on PP0 unless a streaming API is added later.
 
 ### Components
 
@@ -224,16 +256,18 @@ Capability surface: `SupportsARDiffusionChunkPipeline` with
 
 | Layer | Key | Meaning |
 | --- | --- | --- |
-| Deploy `parallel_config` | `pipeline_parallel_size` | `S·G` |
-| `ar_diffusion_stage_config` | `stage_parallel_size` | `S` |
+| Deploy `parallel_config` | `pipeline_parallel_size` | `S·G`, or `S·G+1` with `dedicated_decoder` |
+| `ar_diffusion_stage_config` | `stage_parallel_size` | DiT stages `S` |
+| `ar_diffusion_stage_config` | `dedicated_decoder` | Last PP rank is VAE-only (WaveServe) |
 | `ar_diffusion_stage_config` | `max_batch_size` | Micro-batch `R` |
 | `ar_diffusion_stage_config` | `max_history_chunks` | Cap for `H` |
 | Request `extra_args` | `chunk_schedule` | `serial` \| `latest` |
+| Request `extra_args` | `stream_decode` | Stream finished latents to decode owner |
 | Request `extra_args` | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `T`, `H` |
 
 Engine backend: `ARDiffusionEngine`. Use the mp executor from deploy YAML; do
 not wrap Omni in `torchrun`. Keep `S = num_denoise_steps + 1` when overriding
-PP size for `S > 1`.
+sizes for `S > 1`, and set `pipeline_parallel_size = S·G (+1 if dedicated_decoder)`.
 
 ## Testing
 
@@ -252,6 +286,8 @@ PP size for `S > 1`.
 - 2 GPU: `S=2` (`T=1`), real Wan weights, gather→VAE device pinning
 - Multi-GPU: `S=T+1` Serial vs Latest via
   `benchmarks/noisy_pp/waveserve_serial_vs_latest.py`
+- 6 GPU WaveServe: `S=5`, `G=1`, `dedicated_decoder` (`PP=6`), Latest +
+  `stream_decode` — see `benchmarks/noisy_pp/REMOTE_E2E_6GPU.md`
 - Recipe commands: `recipes/Physis-AI/WaveServe-Wan.md`
 
 ## Limitations and open issues
@@ -262,6 +298,10 @@ PP size for `S > 1`.
 - Noisy PP is not wired to session yet.
 - Micro-batch packing in a slot (`R`): varlen vs pad; metadata envelope when a
   tick carries `N>1` chunks / multiple identities.
+- Dedicated decoder overlaps VAE with DiT, but the engine reply still returns
+  from PP0 after the full video is assembled (no first-frame / chunk streaming
+  API yet). Harness `e2e_fps` that wraps `Omni()` construction must not be
+  compared to generate-only upstream FPS.
 
 ## Related
 

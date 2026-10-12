@@ -175,6 +175,12 @@ class TinyChunkAdapter(ChunkAdapter):
             return {"hidden_states": output}
         raise TypeError(f"tiny adapter packs IntermediateTensors/tensor, got {type(output)}")
 
+    def activation_spec(self, *, batch: int, include_hidden: bool):
+        del include_hidden
+        shape = list(self.seed_hidden.shape)
+        shape[0] = max(1, int(batch))
+        return [("hidden_states", tuple(shape), self.seed_hidden.dtype)]
+
     def unpack_activation(self, payload: dict):
         if "hidden_states" in payload and len(payload) == 1:
             return payload["hidden_states"]

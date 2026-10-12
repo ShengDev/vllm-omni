@@ -33,7 +33,7 @@ def _parse_args() -> argparse.Namespace:
         "--world-size",
         type=int,
         default=None,
-        help="Override PP (= S*G). Default: value from deploy YAML (or denoise_steps+1).",
+        help="Override PP. With dedicated decoder: S*G+1; else S*G. Default from deploy YAML.",
     )
     parser.add_argument("--chunks", type=int, default=7)
     parser.add_argument("--denoise-steps", type=int, default=3)
@@ -41,6 +41,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--repeat", type=int, default=3, help="Timed requests per regime.")
     parser.add_argument("--regimes", default="serial,latest")
     parser.add_argument("--gpus-per-stage", type=int, default=1)
+    parser.add_argument(
+        "--dedicated-decoder",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override deploy dedicated_decoder (default: read from YAML).",
+    )
     parser.add_argument("--json-out", type=Path, default=None)
     return parser.parse_args()
 
@@ -60,7 +66,7 @@ def _dit_ms(output: Any) -> float | None:
     return ms if ms > 0 else None
 
 
-def _resolve_deploy(args: argparse.Namespace, world: int) -> Path:
+def _resolve_deploy(args: argparse.Namespace, world: int, *, dedicated_decoder: bool) -> Path:
     """Return deploy path; rewrite PP/stage size only when overriding world-size."""
     base = Path(args.deploy_config).expanduser().resolve()
     if not base.is_file():
@@ -74,25 +80,46 @@ def _resolve_deploy(args: argparse.Namespace, world: int) -> Path:
     current_s = int(
         OmegaConf.select(stage0, "model_config.ar_diffusion_stage_config.stage_parallel_size") or current_pp
     )
+    current_decoder = bool(
+        OmegaConf.select(stage0, "model_config.ar_diffusion_stage_config.dedicated_decoder") or False
+    )
     stages = args.denoise_steps + 1
     layer_groups = args.gpus_per_stage
-    if stages * layer_groups != world:
-        raise SystemExit(f"need stages*layer_groups == world; got {stages}*{layer_groups} != {world}")
+    dit_world = stages * layer_groups
+    expected = dit_world + (1 if dedicated_decoder else 0)
+    if expected != world:
+        raise SystemExit(
+            f"need stages*layer_groups(+1 if dedicated_decoder) == world; "
+            f"got {stages}*{layer_groups}{'+1' if dedicated_decoder else ''}={expected} != {world}"
+        )
 
     current_history = int(
         OmegaConf.select(stage0, "model_config.ar_diffusion_stage_config.max_history_chunks") or args.history
     )
-    if current_pp == world and current_s == stages and args.history == current_history:
+    if (
+        current_pp == world
+        and current_s == stages
+        and args.history == current_history
+        and current_decoder == dedicated_decoder
+    ):
         return base
 
     OmegaConf.update(stage0, "parallel_config.pipeline_parallel_size", world, force_add=True)
     OmegaConf.update(stage0, "model_config.ar_diffusion_stage_config.stage_parallel_size", stages, force_add=True)
     OmegaConf.update(
         stage0,
+        "model_config.ar_diffusion_stage_config.dedicated_decoder",
+        dedicated_decoder,
+        force_add=True,
+    )
+    OmegaConf.update(
+        stage0,
         "model_config.ar_diffusion_stage_config.max_history_chunks",
         max(1, args.history),
         force_add=True,
     )
+    if dedicated_decoder:
+        OmegaConf.update(stage0, "default_sampling_params.extra_args.stream_decode", True, force_add=True)
     with tempfile.NamedTemporaryFile("w", suffix=".yaml", prefix="waveserve_wan_pp_", delete=False) as fh:
         fh.write(OmegaConf.to_yaml(cfg))
         return Path(fh.name)
@@ -140,6 +167,7 @@ def _run_regime(omni: Any, args: argparse.Namespace, regime: str, stages: int, l
                 "num_denoise_steps": args.denoise_steps,
                 "kv_history_chunks": args.history,
                 "chunk_schedule": chunk_schedule,
+                "stream_decode": True,
                 "reset": True,
             }
         )
@@ -181,9 +209,17 @@ def main() -> None:
     args = _parse_args()
     stages = args.denoise_steps + 1
     layer_groups = args.gpus_per_stage
-    world = args.world_size or (stages * layer_groups)
+    from omegaconf import OmegaConf
+
+    base_cfg = OmegaConf.load(Path(args.deploy_config).expanduser().resolve())
+    yaml_decoder = bool(
+        OmegaConf.select(base_cfg.stages[0], "model_config.ar_diffusion_stage_config.dedicated_decoder") or False
+    )
+    dedicated_decoder = yaml_decoder if args.dedicated_decoder is None else bool(args.dedicated_decoder)
+    dit_world = stages * layer_groups
+    world = args.world_size or (dit_world + (1 if dedicated_decoder else 0))
     regimes = [item.strip() for item in args.regimes.split(",") if item.strip()]
-    deploy_path = _resolve_deploy(args, world)
+    deploy_path = _resolve_deploy(args, world, dedicated_decoder=dedicated_decoder)
 
     from vllm_omni import Omni
 

@@ -11,6 +11,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
+import torch
+import torch.distributed as dist
 from vllm.logger import init_logger
 
 from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
@@ -20,7 +22,11 @@ from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
     can_admit,
     rank_work,
 )
-from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVState
+from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
+    NoisyKVState,
+    _pp_global_rank,
+    _pp_group_for_tensor,
+)
 
 #: Wall time of each *active* slot (rank has work) on rank 0.
 #: Experimental telemetry only; a harness clears it per request.
@@ -103,6 +109,112 @@ class ChunkTopology:
         return g == self.layer_groups - 1
 
 
+@dataclass(frozen=True)
+class ChunkParallelLayout:
+    """DiT chunk-PP ranks plus an optional dedicated VAE decoder rank.
+
+    When ``decoder_rank`` is set, ``pipeline_parallel_size = dit_world + 1`` and
+    the last PP rank owns only VAE decode. DiT KV/activation P2P stays inside
+    ``topology.world``; the decoder never joins ``run_chunk_pipeline``.
+    """
+
+    topology: ChunkTopology
+    decoder_rank: int | None = None
+
+    @property
+    def dit_world(self) -> int:
+        return self.topology.world
+
+    @property
+    def dedicated_decoder(self) -> bool:
+        return self.decoder_rank is not None
+
+    def is_decoder_rank(self, rank: int) -> bool:
+        return self.decoder_rank is not None and rank == self.decoder_rank
+
+    def is_dit_rank(self, rank: int) -> bool:
+        return 0 <= rank < self.dit_world
+
+
+def resolve_chunk_parallel_layout(
+    *,
+    stages: int,
+    pp_world: int,
+    dedicated_decoder: bool = False,
+) -> ChunkParallelLayout:
+    """Map deploy PP size onto DiT topology (+ optional trailing decoder rank)."""
+    if stages < 1:
+        raise ValueError(f"stage_parallel_size must be >= 1, got {stages}")
+    if pp_world < 1:
+        raise ValueError(f"pipeline_parallel_size must be >= 1, got {pp_world}")
+    if dedicated_decoder:
+        dit_world = pp_world - 1
+        if dit_world < stages:
+            raise ValueError(
+                "dedicated_decoder requires pipeline_parallel_size >= stage_parallel_size + 1; "
+                f"got pipeline_parallel_size={pp_world}, stage_parallel_size={stages}"
+            )
+        if dit_world % stages != 0:
+            raise ValueError(
+                "with dedicated_decoder, (pipeline_parallel_size - 1) must be divisible by "
+                f"stage_parallel_size; got dit_world={dit_world}, stages={stages}"
+            )
+        layer_groups = dit_world // stages
+        return ChunkParallelLayout(
+            topology=ChunkTopology(stages=stages, layer_groups=layer_groups),
+            decoder_rank=dit_world,
+        )
+    if pp_world % stages != 0:
+        raise ValueError(f"pipeline_parallel_size={pp_world} must be divisible by stage_parallel_size={stages}")
+    return ChunkParallelLayout(
+        topology=ChunkTopology(stages=stages, layer_groups=pp_world // stages),
+        decoder_rank=None,
+    )
+
+
+@dataclass(frozen=True)
+class DitProcessGroup:
+    """NCCL/Gloo subgroup covering only DiT ranks (excludes dedicated decoder).
+
+    Activation and NoisyKV ``batch_isend_irecv`` must run on this group when a
+    dedicated decoder shares the PP world: PyTorch requires every member of the
+    P2P ``group`` to enter the *first* ``batch_isend_irecv``, and idle decoder
+    ranks never join the chunk loop.
+    """
+
+    ranks: list[int]
+    device_group: Any
+    cpu_group: Any
+
+    @property
+    def world_size(self) -> int:
+        return len(self.ranks)
+
+
+def make_dit_process_group(pp_group: Any, dit_world: int) -> DitProcessGroup | None:
+    """Create DiT-only subgroups; **all** PP ranks must call this collectively."""
+    if pp_group is None or dit_world < 1:
+        return None
+    ranks = list(getattr(pp_group, "ranks", []) or [])
+    if not ranks or dit_world > len(ranks):
+        raise ValueError(f"dit_world={dit_world} incompatible with pp ranks={ranks}")
+    if dit_world == len(ranks):
+        # No dedicated decoder — reuse the existing PP coordinator as-is.
+        return None
+    dit_ranks = ranks[:dit_world]
+    backend = dist.get_backend(getattr(pp_group, "device_group", None) or pp_group)
+    device_group = dist.new_group(ranks=dit_ranks, backend=backend)
+    cpu_group = dist.new_group(ranks=dit_ranks, backend="gloo")
+    return DitProcessGroup(ranks=dit_ranks, device_group=device_group, cpu_group=cpu_group)
+
+
+def prime_dit_process_group(dit: DitProcessGroup | None, rank: int) -> None:
+    """Barrier on the DiT device group so later subset P2P is well-defined."""
+    if dit is None or rank not in dit.ranks:
+        return
+    dist.barrier(group=dit.device_group)
+
+
 @dataclass
 class ChunkRunSpec:
     topology: ChunkTopology
@@ -176,6 +288,12 @@ class ChunkAdapter:
     def unpack_activation(self, payload: dict) -> Any:
         raise NotImplementedError
 
+    def activation_spec(
+        self, *, batch: int, include_hidden: bool
+    ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
+        """Fixed activation shapes for ``batch_isend_irecv`` (required when PP>1)."""
+        raise NotImplementedError
+
 
 def _wait(handles: list[Any]) -> None:
     for handle in handles:
@@ -187,6 +305,75 @@ def _assert_i8(tasks: tuple[tuple[str, ChunkStep], ...]) -> None:
     reqs = [req for req, _task in tasks]
     if len(reqs) != len(set(reqs)):
         raise RuntimeError(f"I8 violated: same request appears twice in one microbatch: {tasks}")
+
+
+def _act_peers(rank: int, world: int, stages: int) -> tuple[int | None, int | None]:
+    """Precomputed activation ring peers for this rank (no per-slot topology walk).
+
+    Chain ``r → r+1``; when ``stages==1`` also wrap ``last → 0``.
+    """
+    send_to = rank + 1 if rank < world - 1 else (0 if stages == 1 else None)
+    recv_from = rank - 1 if rank > 0 else (world - 1 if stages == 1 else None)
+    return send_to, recv_from
+
+
+def _post_activation_batch(
+    pp: Any,
+    *,
+    rank: int,
+    send_to: int | None,
+    recv_from: int | None,
+    do_send: bool,
+    do_recv: bool,
+    output: Any | None,
+    adapter: ChunkAdapter,
+    topology: ChunkTopology,
+    batch: int,
+    device: torch.device,
+) -> tuple[list[Any], Any | None]:
+    """One ``batch_isend_irecv`` for this rank's activation edge(s) (no Gloo metadata)."""
+    send_spec = (
+        adapter.activation_spec(batch=batch, include_hidden=not topology.is_stage_last(rank))
+        if do_send
+        else []
+    )
+    recv_spec = (
+        adapter.activation_spec(batch=batch, include_hidden=not topology.is_stage_last(recv_from or 0))
+        if do_recv and recv_from is not None
+        else []
+    )
+    if do_send and not send_spec:
+        raise RuntimeError("activation send requires adapter.activation_spec()")
+    if do_recv and not recv_spec:
+        raise RuntimeError("activation recv requires adapter.activation_spec()")
+
+    ops: list[dist.P2POp] = []
+    send_kept: list[torch.Tensor] = []
+    pending_hidden = None
+
+    if do_send and send_to is not None and output is not None:
+        packed = adapter.pack_activation(output)
+        peer = _pp_global_rank(pp, send_to)
+        for key, _shape, _dtype in send_spec:
+            tensor = packed[key]
+            if not tensor.is_contiguous():
+                tensor = tensor.contiguous()
+            send_kept.append(tensor)
+            if tensor.is_cuda:
+                tensor.record_stream(torch.cuda.current_stream(tensor.device))
+            ops.append(dist.P2POp(dist.isend, tensor, peer, _pp_group_for_tensor(pp, tensor)))
+
+    if do_recv and recv_from is not None:
+        peer = _pp_global_rank(pp, recv_from)
+        payload = {key: torch.empty(shape, dtype=dtype, device=device) for key, shape, dtype in recv_spec}
+        for key, _shape, _dtype in recv_spec:
+            tensor = payload[key]
+            ops.append(dist.P2POp(dist.irecv, tensor, peer, _pp_group_for_tensor(pp, tensor)))
+        pending_hidden = adapter.unpack_activation(payload)
+
+    works = list(dist.batch_isend_irecv(ops)) if ops else []
+    del send_kept  # kept alive via ops/tensor refs until works wait
+    return works, pending_hidden
 
 
 def run_chunk_pipeline(
@@ -205,13 +392,19 @@ def run_chunk_pipeline(
     kv = ctx.kv
     kv.bind_rank(spec.rank, spec.pp_group)
     pp = spec.pp_group
+    world = spec.topology.world
+    # Activation topology is static for the run — compute peers once.
+    act_send_to, act_recv_from = _act_peers(spec.rank, world, spec.topology.stages)
     logger.info(
-        "[chunk_pipeline] start: stages=%d layer_groups=%d rank=%d inflight=%d pending=%d",
+        "[chunk_pipeline] start: stages=%d layer_groups=%d rank=%d inflight=%d pending=%d "
+        "act_send_to=%s act_recv_from=%s",
         spec.topology.stages,
         spec.topology.layer_groups,
         spec.rank,
         len(ctx.inflight),
         len(ctx.pending),
+        act_send_to,
+        act_recv_from,
     )
     slot = 0
     limit = max_slots if max_slots is not None else 10**9
@@ -230,28 +423,36 @@ def run_chunk_pipeline(
                 output = adapter.forward(tasks, contexts, hidden=pending_hidden)
                 kv.publish(tasks)
             comm_handles: list[Any] = []
-            world = spec.topology.world
             if pp is not None and world > 1:
-                last_rank = world - 1
-                # S=1: last→0 is latent feedback for the next denoise step.
-                # S=T+1: the next step lives on the next ranks; rank 0 starts new chunks.
-                if spec.topology.stages == 1 and rank_work(tuple(ctx.inflight), slot, last_rank):
-                    if output is not None and spec.rank == last_rank:
-                        comm_handles.extend(pp.isend_tensor_dict(adapter.pack_activation(output), dst=0))
-                    elif spec.rank == 0:
-                        recv, recv_handles, _ = pp.irecv_tensor_dict(src=last_rank)
-                        comm_handles.extend(recv_handles)
-                        pending_hidden = adapter.unpack_activation(recv)
-                for src in range(last_rank):
-                    dst = src + 1
-                    if not rank_work(tuple(ctx.inflight), slot, src):
-                        continue
-                    if spec.rank == src and output is not None:
-                        comm_handles.extend(pp.isend_tensor_dict(adapter.pack_activation(output), dst=dst))
-                    elif spec.rank == dst:
-                        recv, recv_handles, _ = pp.irecv_tensor_dict(src=src)
-                        comm_handles.extend(recv_handles)
-                        pending_hidden = adapter.unpack_activation(recv)
+                inflight_t = tuple(ctx.inflight)
+                do_send = bool(tasks) and act_send_to is not None
+                do_recv = act_recv_from is not None and bool(
+                    rank_work(inflight_t, slot, act_recv_from)
+                )
+                if do_send or do_recv:
+                    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+                    # Prefer a tensor device from output when present.
+                    if output is not None and isinstance(output, dict):
+                        for v in output.values():
+                            if isinstance(v, torch.Tensor):
+                                device = v.device
+                                break
+                    act_works, recv_hidden = _post_activation_batch(
+                        pp,
+                        rank=spec.rank,
+                        send_to=act_send_to,
+                        recv_from=act_recv_from,
+                        do_send=do_send,
+                        do_recv=do_recv,
+                        output=output,
+                        adapter=adapter,
+                        topology=spec.topology,
+                        batch=max(1, len(tasks) if tasks else 1),
+                        device=device,
+                    )
+                    comm_handles.extend(act_works)
+                    if do_recv:
+                        pending_hidden = recv_hidden
             comm_handles.extend(kv.exchange(slot))
             # ① Outbound not left dangling: only this rank's own posted handles.
             _wait(comm_handles)

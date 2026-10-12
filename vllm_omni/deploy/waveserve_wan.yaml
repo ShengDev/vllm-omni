@@ -1,13 +1,19 @@
 # WaveServe Wan opt-in deploy for Noisy PP (Serial / Latest-KV).
 #
-# Topology: pipeline_parallel_size = S * G with S = num_denoise_steps + 1
+# Topology: DiT pipeline_parallel_size = S * G with S = num_denoise_steps + 1
 # (one stage per denoise pass plus a clean KV pass) and G = layer groups
-# (default G = 1). Chunk schedule (serial vs latest) is a per-request
-# ``extra_args.chunk_schedule`` choice, not a deploy fork.
+# (default G = 1), plus one dedicated VAE decoder rank:
+#   pipeline_parallel_size = S*G + 1
+#   stage_parallel_size = S
+#   dedicated_decoder = true
+#
+# The decoder rank receives each finished latent as it completes and decodes
+# while later DiT work continues (WaveServe-style overlap). Chunk schedule
+# (serial vs latest) is a per-request ``extra_args.chunk_schedule`` choice.
 #
 # Requires the AR-Diffusion engine. Single-process mp executor only
 # (do not wrap in torchrun). Override PP / stage_parallel_size together when
-# changing the denoise step count so S still equals T+1.
+# changing the denoise step count so S still equals T+1 and PP = S*G+1.
 # Design: docs/design/feature/noisy_pp.md ; tracking: JiusiServe/vllm-omni-project-manage#102
 
 pipeline: waveserve_wan
@@ -22,16 +28,19 @@ stages:
     model_class_name: WaveServeWanPipeline
     engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
     parallel_config:
-      pipeline_parallel_size: 4
+      # 4 DiT ranks (S=T+1 with T=3) + 1 dedicated decoder
+      pipeline_parallel_size: 5
     default_sampling_params:
       extra_args:
         num_chunks: 7
         num_denoise_steps: 3
         kv_history_chunks: 6
         chunk_schedule: serial
+        stream_decode: true
         reset: true
     model_config:
       ar_diffusion_stage_config:
         stage_parallel_size: 4
+        dedicated_decoder: true
         max_batch_size: 1
         max_history_chunks: 6

@@ -173,26 +173,48 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 raw = model_config.get("ar_diffusion_stage_config")
         return dict(raw) if isinstance(raw, dict) else {}
 
-    def _preallocate_noisy_kv(
-        self, capability: SupportsARDiffusionChunkPipeline, *, available_bytes: int | None = None
-    ) -> None:
-        spec = capability.ar_diffusion_noisy_kv_spec()
+    def _chunk_parallel_layout(self):
+        from vllm_omni.experimental.ar_diffusion.chunk_executor import resolve_chunk_parallel_layout
+
         stage_cfg = self._stage_config()
         stages = int(stage_cfg.get("stage_parallel_size", 1) or 1)
         pp_world = int(getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
-        if stages < 1 or pp_world % stages != 0:
-            raise ValueError(f"pipeline_parallel_size={pp_world} must be divisible by stage_parallel_size={stages}")
-        layer_groups = pp_world // stages
-        max_batch_size = int(stage_cfg.get("max_batch_size", 1) or 1)
+        dedicated_decoder = bool(stage_cfg.get("dedicated_decoder", False))
+        return resolve_chunk_parallel_layout(
+            stages=stages,
+            pp_world=pp_world,
+            dedicated_decoder=dedicated_decoder,
+        )
+
+    def _preallocate_noisy_kv(
+        self, capability: SupportsARDiffusionChunkPipeline, *, available_bytes: int | None = None
+    ) -> None:
+        from vllm_omni.experimental.ar_diffusion.chunk_executor import resolve_pp_rank_and_group
+
+        layout = self._chunk_parallel_layout()
+        rank, _pp_group = resolve_pp_rank_and_group()
         self._ar_diffusion_chunk_capability = capability
+        self._chunk_layout = layout
+        if layout.is_decoder_rank(rank):
+            # Decoder owns VAE only; skip NoisyKV / DiT paging on this rank.
+            self.noisy_kv_cache = None
+            logger.info(
+                "AR-Diffusion dedicated decoder rank=%d (DiT world=%d); skipping noisy KV",
+                rank,
+                layout.dit_world,
+            )
+            return
+        spec = capability.ar_diffusion_noisy_kv_spec()
+        stage_cfg = self._stage_config()
+        max_batch_size = int(stage_cfg.get("max_batch_size", 1) or 1)
         avail = self._available_memory_bytes() if available_bytes is None else available_bytes
         self.noisy_kv_cache = NoisyKVCache(
             spec,
             dtype=self.od_config.dtype,
             device=self.device,
-            layer_groups=layer_groups,
+            layer_groups=layout.topology.layer_groups,
             max_batch_size=max_batch_size,
-            stages=stages,
+            stages=layout.topology.stages,
             gpu_memory_fraction=float(stage_cfg.get("gpu_memory_fraction", 1.0)),
             available_bytes=avail,
         )
@@ -202,9 +224,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             self.noisy_kv_cache.reserved_bytes,
             spec.num_layers,
             spec.max_history_chunks,
-            layer_groups,
+            layout.topology.layer_groups,
             max_batch_size,
-            stages,
+            layout.topology.stages,
         )
 
     def _preallocate_kv_cache(self, *, available_bytes: int | None = None) -> None:
@@ -426,23 +448,22 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         from vllm_omni.experimental.ar_diffusion.chunk_executor import (
             ARDiffusionChunkContext,
             ChunkRunSpec,
-            ChunkTopology,
             resolve_pp_rank_and_group,
         )
 
         if self.noisy_kv_cache is None:
             raise RuntimeError("noisy KV cache is not initialized")
+        layout = getattr(self, "_chunk_layout", None) or self._chunk_parallel_layout()
         stage_cfg = self._stage_config()
-        stages = int(stage_cfg.get("stage_parallel_size", 1) or 1)
-        pp_world = int(getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
-        topology = ChunkTopology(stages=stages, layer_groups=max(1, pp_world // max(1, stages)))
         rank, pp_group = resolve_pp_rank_and_group()
+        # Prefer DiT-only subgroup when dedicated decoder shares the PP world.
+        dit_pp = getattr(self.pipeline, "_dit_pp_group", None)
         return ARDiffusionChunkContext(
             spec=ChunkRunSpec(
-                topology=topology,
+                topology=layout.topology,
                 max_batch_size=int(stage_cfg.get("max_batch_size", 1) or 1),
                 rank=rank,
-                pp_group=pp_group,
+                pp_group=dit_pp if dit_pp is not None else pp_group,
             ),
             kv=NoisyKVState(self.noisy_kv_cache),
         )
@@ -453,8 +474,27 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         kv_prefetch_job: KVPrefetchJob | None = None,
         diffusion_kv_metadata: DiffusionKVMetadata | None = None,
     ) -> DiffusionOutput:
+        # Dedicated decoder rank: no NoisyKV; pipeline.forward owns recv/decode.
+        if (
+            self.noisy_kv_cache is None
+            and self._ar_diffusion_chunk_capability is not None
+            and bool(self._stage_config().get("dedicated_decoder", False))
+        ):
+            started = time.perf_counter()
+            init_groups = getattr(self.pipeline, "_init_decode_process_groups", None)
+            if callable(init_groups):
+                init_groups()
+            output = super().execute_model(
+                req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
+            )
+            self._perf_e2e_times.append(time.perf_counter() - started)
+            return output
         if self.noisy_kv_cache is not None and self._ar_diffusion_chunk_capability is not None:
             started = time.perf_counter()
+            # Create DiT/decoder process groups before ChunkRunSpec binds pp_group.
+            init_groups = getattr(self.pipeline, "_init_decode_process_groups", None)
+            if callable(init_groups):
+                init_groups()
             ctx = self._make_chunk_context()
             try:
                 with self._ar_diffusion_chunk_capability.bind_ar_diffusion_chunk_context(ctx):
@@ -495,7 +535,16 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         od_config: OmniDiffusionConfig,
     ) -> BatchRunnerOutput:
         """Noisy PP chunk path may micro-batch requests; paged timeline KV stays single-seq."""
+        if (
+            self.noisy_kv_cache is None
+            and self._ar_diffusion_chunk_capability is not None
+            and bool(self._stage_config().get("dedicated_decoder", False))
+        ):
+            return super().execute_model_batch(scheduler_output, od_config)
         if self.noisy_kv_cache is not None and self._ar_diffusion_chunk_capability is not None:
+            init_groups = getattr(self.pipeline, "_init_decode_process_groups", None)
+            if callable(init_groups):
+                init_groups()
             ctx = self._make_chunk_context()
             try:
                 with self._ar_diffusion_chunk_capability.bind_ar_diffusion_chunk_context(ctx):

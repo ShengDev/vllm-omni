@@ -5,7 +5,11 @@
 Checkpoint: ``Physis-AI/waveserve-wan2.1-1.3b-diffusers-rf-dev``.
 DiT weights load through shared ``wan2_2.WanTransformer3DModel`` (standard Wan
 layout). Path: text encode → 5D latent noise → vertical Chunk SERIAL/Latest
-with real Wan forward + FlowEuler → VAE decode on rank 0.
+with real Wan forward + FlowEuler → VAE decode.
+
+With ``dedicated_decoder=true``, the last PP rank owns only the VAE and decodes
+each finished latent as it arrives (WaveServe-style overlap). DiT ranks never
+run VAE; rank 0 collects the assembled video for the engine reply.
 """
 
 from __future__ import annotations
@@ -36,6 +40,11 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.experimental.ar_diffusion.chunk_executor import (
     ARDiffusionChunkContext,
     ChunkAdapter,
+    ChunkParallelLayout,
+    DitProcessGroup,
+    make_dit_process_group,
+    prime_dit_process_group,
+    resolve_chunk_parallel_layout,
     resolve_pp_rank_and_group,
     run_chunk_pipeline,
 )
@@ -222,6 +231,19 @@ class _LatentChunkAdapter(ChunkAdapter):
             return {"latent": output.contiguous()}
         raise TypeError(f"latent adapter packs dict/tensor, got {type(output)}")
 
+    def activation_spec(self, *, batch: int, include_hidden: bool):
+        """Fixed shapes for NCCL activation ``batch_isend_irecv`` (no Gloo metadata)."""
+        batch = max(1, int(batch))
+        _b, c, t, h, w = self.latent_shape
+        spec: list[tuple[str, tuple[int, ...], torch.dtype]] = [
+            ("latent", (batch, int(c), int(t), int(h), int(w)), self.dtype),
+        ]
+        if include_hidden:
+            seq = self.transformer.seq_len_for_latent(self.latent_shape)
+            dim = int(self.transformer.dim)
+            spec.append(("hidden_states", (batch, seq, dim), self.dtype))
+        return spec
+
     def unpack_activation(self, payload: dict):
         return payload
 
@@ -246,7 +268,14 @@ class WaveServeWanPipeline(nn.Module):
             stage_cfg = {**stage_cfg, **(model_cfg.get("ar_diffusion_stage_config") or {})}
         self.stage_parallel_size = int(stage_cfg.get("stage_parallel_size", 1) or 1)
         pp_world = int(getattr(getattr(od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
-        self.layer_groups = max(1, pp_world // max(1, self.stage_parallel_size))
+        self.layout: ChunkParallelLayout = resolve_chunk_parallel_layout(
+            stages=self.stage_parallel_size,
+            pp_world=pp_world,
+            dedicated_decoder=bool(stage_cfg.get("dedicated_decoder", False)),
+        )
+        self.layer_groups = self.layout.topology.layer_groups
+        self.dedicated_decoder = self.layout.dedicated_decoder
+        self.decoder_rank = self.layout.decoder_rank
         if bool(stage_cfg.get("tiny", False)):
             raise ValueError(
                 "WaveServeWanPipeline no longer supports tiny=True; use tests/diffusion/ar_diffusion/waveserve_tiny.py"
@@ -255,63 +284,90 @@ class WaveServeWanPipeline(nn.Module):
         self.max_history_chunks = int(stage_cfg.get("max_history_chunks", 6) or 6)
         pp_rank, _pp_group = resolve_pp_rank_and_group()
         self.pp_rank = pp_rank
+        self.is_decoder_rank = self.layout.is_decoder_rank(pp_rank)
         model_path = str(getattr(od_config, "model", None) or HF_MODEL_ID)
         self.model_path = model_path
-        transformer_config: dict[str, Any] | None = None
-        try:
-            from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import load_transformer_config
-
-            loaded = load_transformer_config(model_path, local_files_only=True)
-            if not loaded:
-                loaded = load_transformer_config(model_path, local_files_only=False)
-            transformer_config = loaded or None
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("WaveServe: could not load transformer config from %s: %s", model_path, exc)
-        self.transformer = StageWanTransformer(
-            num_layers=int(geo["num_layers"]),
-            dim=int(geo["dim"]),
-            num_heads=int(geo["num_heads"]),
-            ffn_dim=int(geo["ffn_dim"]),
-            in_channels=int(geo["in_channels"]),
-            patch_size=tuple(geo["patch_size"]),
-            layer_groups=self.layer_groups,
-            pp_rank=pp_rank,
-            transformer_config=transformer_config,
-        )
-        # Without this the Diffusers loader's get_all_weights() is empty, so the
-        # DiT stays at init (zeros / garbage NaN biases) and every video is NaN.
-        self.weights_sources = [
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=model_path,
-                subfolder="transformer",
-                revision=None,
-                prefix="transformer.",
-                fall_back_to_pt=True,
+        patch = tuple(geo["patch_size"])
+        if self.is_decoder_rank:
+            # Decoder rank: no DiT weights — tiny placeholder only.
+            self.transformer = nn.Identity()
+            self.weights_sources = []
+            self._dit_seq_len_for_latent = lambda shape, _p=patch: int(
+                (shape[2] * shape[3] * shape[4]) // (_p[0] * _p[1] * _p[2])
             )
-        ]
+        else:
+            transformer_config: dict[str, Any] | None = None
+            try:
+                from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import load_transformer_config
+
+                loaded = load_transformer_config(model_path, local_files_only=True)
+                if not loaded:
+                    loaded = load_transformer_config(model_path, local_files_only=False)
+                transformer_config = loaded or None
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("WaveServe: could not load transformer config from %s: %s", model_path, exc)
+            self.transformer = StageWanTransformer(
+                num_layers=int(geo["num_layers"]),
+                dim=int(geo["dim"]),
+                num_heads=int(geo["num_heads"]),
+                ffn_dim=int(geo["ffn_dim"]),
+                in_channels=int(geo["in_channels"]),
+                patch_size=patch,
+                layer_groups=self.layer_groups,
+                pp_rank=pp_rank,
+                transformer_config=transformer_config,
+            )
+            # Without this the Diffusers loader's get_all_weights() is empty, so the
+            # DiT stays at init (zeros / garbage NaN biases) and every video is NaN.
+            self.weights_sources = [
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=model_path,
+                    subfolder="transformer",
+                    revision=None,
+                    prefix="transformer.",
+                    fall_back_to_pt=True,
+                )
+            ]
         self.tokenizer = None
         self.text_encoder = None
         self.vae = None
         self._init_codec(model_path)
-        # Prefer a page size that divides the default WaveServe latent token count.
-        default_tokens = self.transformer.seq_len_for_latent(_DEFAULT_LATENT_SHAPE)
+        if self.is_decoder_rank:
+            default_tokens = int(self._dit_seq_len_for_latent(_DEFAULT_LATENT_SHAPE))
+        else:
+            default_tokens = self.transformer.seq_len_for_latent(_DEFAULT_LATENT_SHAPE)
         self.block_size = default_tokens
         self.max_chunk_tokens = default_tokens
         self._chunk_ctx: ARDiffusionChunkContext | None = None
         self._stream_decode_group = None
-        logger.info(
-            "WaveServe Wan pipeline: S=%d G=%d layers=%d local=[%d, %d) codec=%s model=%s",
-            self.stage_parallel_size,
-            self.layer_groups,
-            self.transformer.num_layers,
-            self.transformer.start_layer,
-            self.transformer.end_layer,
-            self.vae is not None,
-            model_path,
-        )
+        self._video_return_group = None
+        self._dit_pp_group: DitProcessGroup | None = None
+        self._decode_groups_ready = False
+        # Process groups are created on the first forward so every PP rank
+        # enters ``new_group`` together after model load (not during __init__).
+        if self.is_decoder_rank:
+            logger.info(
+                "WaveServe Wan pipeline: dedicated decoder rank=%d (DiT S=%d G=%d) model=%s",
+                pp_rank,
+                self.stage_parallel_size,
+                self.layer_groups,
+                model_path,
+            )
+        else:
+            logger.info(
+                "WaveServe Wan pipeline: S=%d G=%d layers=%d local=[%d, %d) codec=%s decoder=%s model=%s",
+                self.stage_parallel_size,
+                self.layer_groups,
+                self.transformer.num_layers,
+                self.transformer.start_layer,
+                self.transformer.end_layer,
+                self.vae is not None,
+                self.decoder_rank,
+                model_path,
+            )
 
     def _init_codec(self, model_path: str) -> None:
-        """Load UMT5 + Wan VAE. Prefer rank 0 for VAE decode ownership."""
+        """Load UMT5 on DiT ranks; VAE on decode owner (dedicated decoder or PP0)."""
         from transformers import AutoTokenizer, UMT5EncoderModel
 
         from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
@@ -320,16 +376,39 @@ class WaveServeWanPipeline(nn.Module):
         from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch
 
         dtype = torch.bfloat16
-        try:
-            param = next(self.transformer.parameters())
-            dtype = param.dtype
-            device = param.device
-        except StopIteration:
+        if torch.cuda.is_available():
+            device = torch.device("cuda", torch.cuda.current_device())
+        else:
             device = torch.device("cpu")
+        if not self.is_decoder_rank:
+            try:
+                param = next(self.transformer.parameters())
+                dtype = param.dtype
+                device = param.device
+            except StopIteration:
+                pass
 
-        # Text encoder on every DiT rank (needed each denoise step).
-        # VAE decode ownership is rank 0 only — skip allocating it elsewhere.
-        prefetch = ("tokenizer", "text_encoder", "vae") if self.pp_rank == 0 else ("tokenizer", "text_encoder")
+        if self.is_decoder_rank:
+            self.tokenizer = None
+            self.text_encoder = None
+            self.vae = (
+                from_pretrained_with_prefetch(
+                    DistributedAutoencoderKLWan.from_pretrained,
+                    model_path,
+                    subfolder="vae",
+                    prefetch_list=("vae",),
+                    local_files_only=False,
+                    torch_dtype=dtype,
+                )
+                .to(device)
+                .eval()
+            )
+            for p in self.vae.parameters():
+                p.requires_grad_(False)
+            return
+
+        vae_owner = not self.dedicated_decoder and self.pp_rank == 0
+        prefetch = ("tokenizer", "text_encoder", "vae") if vae_owner else ("tokenizer", "text_encoder")
         self.tokenizer = from_pretrained_with_prefetch(
             AutoTokenizer.from_pretrained,
             model_path,
@@ -351,7 +430,7 @@ class WaveServeWanPipeline(nn.Module):
         )
         for p in self.text_encoder.parameters():
             p.requires_grad_(False)
-        if self.pp_rank != 0:
+        if not vae_owner:
             self.vae = None
             return
         self.vae = (
@@ -370,6 +449,16 @@ class WaveServeWanPipeline(nn.Module):
             p.requires_grad_(False)
 
     def ar_diffusion_noisy_kv_spec(self) -> ARDiffusionNoisyKVSpec:
+        if self.is_decoder_rank:
+            # Spec is unused on the decoder rank (runner skips NoisyKV there).
+            return ARDiffusionNoisyKVSpec(
+                num_layers=1,
+                num_kv_heads=1,
+                head_size=1,
+                block_size=self.block_size,
+                max_chunk_tokens=self.max_chunk_tokens,
+                max_history_chunks=max(1, self.max_history_chunks),
+            )
         local_layers = max(1, self.transformer.local_num_layers)
         return ARDiffusionNoisyKVSpec(
             num_layers=local_layers,
@@ -380,6 +469,17 @@ class WaveServeWanPipeline(nn.Module):
             max_history_chunks=max(1, self.max_history_chunks),
         )
 
+    def load_weights(self, weights):
+        """Load Wan DiT weights via ``wan2_2.WanTransformer3DModel.load_weights``."""
+        if self.is_decoder_rank:
+            # VAE was already materialized by ``_init_codec`` / from_pretrained.
+            # Still drain the weight iterator so multi-thread shard producers
+            # do not hang, then report every resident parameter as loaded.
+            for _ in weights:
+                pass
+            return {name for name, _ in self.named_parameters()}
+        return self.transformer.load_weights(weights)
+
     @contextmanager
     def bind_ar_diffusion_chunk_context(self, ctx: ARDiffusionChunkContext) -> Iterator[None]:
         prev = self._chunk_ctx
@@ -388,10 +488,6 @@ class WaveServeWanPipeline(nn.Module):
             yield
         finally:
             self._chunk_ctx = prev
-
-    def load_weights(self, weights):
-        """Load Wan DiT weights via ``wan2_2.WanTransformer3DModel.load_weights``."""
-        return self.transformer.load_weights(weights)
 
     def _encode_prompt(self, prompt: str, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         assert self.tokenizer is not None and self.text_encoder is not None
@@ -543,16 +639,134 @@ class WaveServeWanPipeline(nn.Module):
         finally:
             vae.clear_cache()
 
+    def _placeholder(self, device: torch.device, dtype: torch.dtype) -> DiffusionOutput:
+        return DiffusionOutput(output=torch.zeros(1, 3, 8, 8, 8, device=device, dtype=dtype))
+
+    def _init_decode_process_groups(self) -> None:
+        """Create gloo/NCCL subgroups on every PP rank (required by ``dist.new_group``)."""
+        if self._decode_groups_ready or not dist.is_initialized():
+            return
+        if not self.dedicated_decoder:
+            self._decode_groups_ready = True
+            return
+        pp_rank, pp_group = resolve_pp_rank_and_group()
+        if pp_group is None or getattr(pp_group, "world_size", 1) <= 1:
+            self._decode_groups_ready = True
+            return
+        ranks = list(pp_group.ranks)
+        # Finished latents are emitted after the last denoise step (not the clean pass).
+        # source = denoise * G - 1 with denoise = S - 1 → (S-1)*G - 1.
+        source_rank = (self.stage_parallel_size - 1) * self.layer_groups - 1
+        decoder = self.decoder_rank
+        assert decoder is not None
+        if source_rank < 0 or source_rank >= self.layout.dit_world:
+            raise ValueError(
+                f"invalid stream-decode source_rank={source_rank} for S={self.stage_parallel_size} "
+                f"G={self.layer_groups} dit_world={self.layout.dit_world}"
+            )
+        # DiT-only NCCL/Gloo group for activation + NoisyKV P2P (excludes decoder).
+        self._dit_pp_group = make_dit_process_group(pp_group, self.layout.dit_world)
+        prime_dit_process_group(self._dit_pp_group, pp_rank)
+        # Latents: last-denoise DiT rank → decoder. Video: decoder → PP0.
+        self._stream_decode_group = dist.new_group(ranks=[ranks[decoder], ranks[source_rank]], backend="gloo")
+        self._video_return_group = dist.new_group(ranks=[ranks[0], ranks[decoder]], backend="gloo")
+        self._decode_groups_ready = True
+        logger.info(
+            "WaveServe dedicated-decoder groups ready: dit_world=%d decoder=%d source=%d",
+            self.layout.dit_world,
+            decoder,
+            source_rank,
+        )
+
+    def _ensure_stream_decode_group(self, owner: int, source: int):
+        if self._stream_decode_group is None:
+            # Legacy (no dedicated decoder): create on first use; all DiT ranks must
+            # enter new_group together — callers post irecv/isend only on members.
+            self._stream_decode_group = dist.new_group(ranks=[owner, source], backend="gloo")
+        return self._stream_decode_group
+
+    def _ensure_video_return_group(self, owner: int, decoder: int):
+        if self._video_return_group is None:
+            self._video_return_group = dist.new_group(ranks=[owner, decoder], backend="gloo")
+        return self._video_return_group
+
+    def _forward_dedicated_decoder(
+        self,
+        *,
+        plan,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+        source_rank: int,
+        pp_group: Any,
+    ) -> DiffusionOutput:
+        """Recv finished latents and decode each chunk as it arrives; return video to PP0."""
+        assert self.vae is not None
+        if self.vae.use_tiling or self.vae.is_distributed_enabled():
+            raise ValueError("dedicated_decoder requires non-tiled single-owner VAE")
+        source = pp_group.ranks[source_rank]
+        owner = pp_group.ranks[0]
+        decoder = pp_group.ranks[self.decoder_rank]
+        group = self._ensure_stream_decode_group(decoder, source)
+        buffers = [
+            torch.empty(shape, device="cpu", dtype=dtype, pin_memory=True) for _ in range(plan.schedule.chunks)
+        ]
+        works = [dist.irecv(buffer, src=source, group=group) for buffer in buffers]
+
+        def ready_chunks() -> Iterator[torch.Tensor]:
+            for buffer, work in zip(buffers, works):
+                work.wait()
+                yield buffer.to(device=device, non_blocking=True)
+
+        video = self._decode_latent_chunks(ready_chunks(), plan.schedule.chunks * shape[2])
+        # Engine replies from PP0 — ship shape then pixels.
+        ret = self._ensure_video_return_group(owner, decoder)
+        host = video.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        meta = torch.tensor(host.shape, dtype=torch.int64)
+        dist.send(meta, dst=owner, group=ret)
+        dist.send(host, dst=owner, group=ret)
+        return self._placeholder(device, dtype)
+
     def forward(self, req: OmniDiffusionRequest | DiffusionRequestBatch) -> list[DiffusionOutput]:
+        requests = _as_request_list(req)
+        pp_rank, pp_group = resolve_pp_rank_and_group()
+        # All ranks (DiT + decoder) must enter before any rank posts stream P2P.
+        self._init_decode_process_groups()
+
+        if self.is_decoder_rank:
+            if torch.cuda.is_available():
+                device = torch.device("cuda", torch.cuda.current_device())
+            else:
+                device = torch.device("cpu")
+            dtype = torch.bfloat16
+            outputs: list[DiffusionOutput] = []
+            for item in requests:
+                plan, extra, denoise = self._plan_for(item)
+                shape = tuple(int(x) for x in (extra.get("latent_shape") or _DEFAULT_LATENT_SHAPE))
+                if len(shape) != 5:
+                    raise ValueError(f"latent_shape must be B,C,T,H,W; got {shape}")
+                source_rank = denoise * self.layer_groups - 1 if self.stage_parallel_size == denoise + 1 else None
+                if source_rank is None or pp_group is None:
+                    raise ValueError("dedicated_decoder requires S=T+1 DiT topology with a remote final denoise rank")
+                outputs.append(
+                    self._forward_dedicated_decoder(
+                        plan=plan,
+                        shape=shape,
+                        dtype=dtype,
+                        device=device,
+                        source_rank=source_rank,
+                        pp_group=pp_group,
+                    )
+                )
+            return outputs
+
         ctx = self._chunk_ctx
         if ctx is None:
             raise RuntimeError("WaveServeWanPipeline requires bind_ar_diffusion_chunk_context")
-        requests = _as_request_list(req)
-        pp_rank, pp_group = resolve_pp_rank_and_group()
 
         param = next(self.transformer.parameters())
         device, dtype = param.device, param.dtype
-        outputs: list[DiffusionOutput] = []
+        outputs = []
         for item in requests:
             plan, extra, denoise = self._plan_for(item)
             req_id = str(getattr(item, "request_id", None) or extra.get("request_id") or "")
@@ -564,7 +778,6 @@ class WaveServeWanPipeline(nn.Module):
             shift = float(extra.get("shift", _DEFAULT_SHIFT))
             seed = int(extra.get("seed", getattr(item.sampling_params, "seed", 0) or 0))
             chunk_tokens = self.transformer.seq_len_for_latent(shape)
-            # Resize noisy KV paging to this request's token count.
             self.block_size = chunk_tokens
             self.max_chunk_tokens = chunk_tokens
             ctx.enqueue(req_id, plan, chunk_tokens=chunk_tokens)
@@ -572,36 +785,49 @@ class WaveServeWanPipeline(nn.Module):
             prompt = item.prompt if isinstance(item.prompt, str) else str(item.prompt or "")
             prompt_embeds = self._encode_prompt(prompt, device, dtype)
             sampler = FlowEuler(denoise, shift=shift)
-            stream_decode = bool(extra.get("stream_decode", False))
-            decode_buffers = []
-            recv_works = []
-            send_works = []
+            # Dedicated decoder implies overlapping stream decode.
+            stream_decode = bool(extra.get("stream_decode", False)) or self.dedicated_decoder
+            timeline_file = extra.get("chunk_timeline_file")
+            decode_buffers: list[torch.Tensor] = []
+            recv_works: list[Any] = []
+            send_works: list[tuple[torch.Tensor, Any]] = []
             on_finished = None
+            source_rank = denoise * self.layer_groups - 1 if self.stage_parallel_size == denoise + 1 else None
+            stream_cb = None
+            decode_owner_rank = self.decoder_rank if self.dedicated_decoder else 0
             if stream_decode:
-                source_rank = denoise * self.layer_groups - 1
-                if self.stage_parallel_size != denoise + 1 or source_rank == 0 or pp_group is None:
+                if source_rank is None or source_rank == decode_owner_rank or pp_group is None:
                     raise ValueError("stream_decode requires a remote final denoise rank in S=T+1 topology")
                 if self.vae is not None and (self.vae.use_tiling or self.vae.is_distributed_enabled()):
                     raise ValueError("stream_decode requires non-tiled single-owner VAE")
                 source = pp_group.ranks[source_rank]
-                owner = pp_group.ranks[0]
-                if self._stream_decode_group is None:
-                    # CPU 潜变量通信不被 PP0 的设备同步阻塞；不混用激活/KV 顺序。
-                    self._stream_decode_group = dist.new_group(ranks=[owner, source], backend="gloo")
-                if pp_rank == 0:
+                owner = pp_group.ranks[decode_owner_rank]
+                group = self._ensure_stream_decode_group(owner, source)
+                if not self.dedicated_decoder and pp_rank == 0:
+                    # Legacy: PP0 owns VAE but decodes only after DiT (no overlap).
                     decode_buffers = [
                         torch.empty(shape, device="cpu", dtype=dtype, pin_memory=True)
                         for _ in range(plan.schedule.chunks)
                     ]
-                    recv_works = [
-                        dist.irecv(buffer, src=source, group=self._stream_decode_group) for buffer in decode_buffers
-                    ]
+                    recv_works = [dist.irecv(buffer, src=source, group=group) for buffer in decode_buffers]
                 elif pp_rank == source_rank:
 
-                    def on_finished(chunk: int, latent: torch.Tensor) -> None:
+                    def stream_cb(chunk: int, latent: torch.Tensor) -> None:
                         assert chunk == len(send_works)
                         host = latent.to(device="cpu").contiguous()
-                        send_works.append((host, dist.isend(host, dst=owner, group=self._stream_decode_group)))
+                        send_works.append((host, dist.isend(host, dst=owner, group=group)))
+
+            if timeline_file or stream_cb is not None:
+                import time as _time
+
+                def on_finished(chunk: int, latent: torch.Tensor) -> None:
+                    if timeline_file and source_rank is not None and pp_rank == source_rank:
+                        if latent.is_cuda:
+                            torch.cuda.synchronize(latent.device)
+                        with open(str(timeline_file), "a", encoding="utf-8") as fh:
+                            fh.write(f"{int(chunk)}\t{_time.time()}\n")
+                    if stream_cb is not None:
+                        stream_cb(chunk, latent)
 
             adapter = _LatentChunkAdapter(
                 self.transformer,
@@ -617,7 +843,18 @@ class WaveServeWanPipeline(nn.Module):
             if stream_decode:
                 for _latent, work in send_works:
                     work.wait()
-                if pp_rank == 0:
+                if self.dedicated_decoder and pp_rank == 0:
+                    # Decoder assembles video and sends it back for the engine reply.
+                    assert self.decoder_rank is not None and pp_group is not None
+                    ret = self._ensure_video_return_group(pp_group.ranks[0], pp_group.ranks[self.decoder_rank])
+                    meta = torch.empty(5, dtype=torch.int64)
+                    dist.recv(meta, src=pp_group.ranks[self.decoder_rank], group=ret)
+                    video_shape = tuple(int(x) for x in meta.tolist())
+                    host = torch.empty(video_shape, dtype=torch.float32)
+                    dist.recv(host, src=pp_group.ranks[self.decoder_rank], group=ret)
+                    video = host.to(device=device, dtype=dtype, non_blocking=True)
+                    outputs.append(self._video_output(video))
+                elif not self.dedicated_decoder and pp_rank == 0:
 
                     def ready_chunks() -> Iterator[torch.Tensor]:
                         for buffer, work in zip(decode_buffers, recv_works):
@@ -627,17 +864,15 @@ class WaveServeWanPipeline(nn.Module):
                     video = self._decode_latent_chunks(ready_chunks(), plan.schedule.chunks * shape[2])
                     outputs.append(self._video_output(video))
                 else:
-                    outputs.append(DiffusionOutput(output=torch.zeros(1, 3, 8, 8, 8, device=device, dtype=dtype)))
+                    outputs.append(self._placeholder(device, dtype))
                 continue
             finished = self._gather_finished(adapter.finished, pp_group)
             chunk_map = finished.get(req_id, {})
             if pp_rank == 0 and chunk_map:
                 ordered = [chunk_map[c] for c in sorted(chunk_map)]
-                # Concatenate along time for multi-chunk video.
                 latents = torch.cat(ordered, dim=2)
                 video = self._decode_latents(latents)
                 outputs.append(self._video_output(video))
             else:
-                # Non-owner ranks still return a typed placeholder for the engine.
-                outputs.append(DiffusionOutput(output=torch.zeros(1, 3, 8, 8, 8, device=device, dtype=dtype)))
+                outputs.append(self._placeholder(device, dtype))
         return outputs

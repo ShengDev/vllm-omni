@@ -8,19 +8,37 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import torch
+import torch.distributed as dist
 
 from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
     ChunkPlan,
     ChunkStep,
     Inflight,
     RequestKVTransfer,
-    union_transfers,
     union_wait_ready,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import allocate_kv_pool_with_views, compute_slot_mapping
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import ARDiffusionPagedLayerInputs
 
 VersionKey = tuple[str, int, int]  # req, chunk, step
+
+
+def _pp_global_rank(pp_group: Any, group_rank: int) -> int:
+    ranks = getattr(pp_group, "ranks", None)
+    if ranks is not None:
+        return int(ranks[group_rank])
+    return int(group_rank)
+
+
+def _pp_group_for_tensor(pp_group: Any, tensor: torch.Tensor):
+    """CPU tensors → cpu_group; CUDA tensors → device_group."""
+    if tensor.is_cpu:
+        return getattr(pp_group, "cpu_group", None) or getattr(pp_group, "device_group", None) or pp_group
+    return getattr(pp_group, "device_group", None) or getattr(pp_group, "cpu_group", None) or pp_group
+
+
+def _pp_device_group(pp_group: Any):
+    return getattr(pp_group, "device_group", None) or pp_group
 
 
 def _version_key(req: str, version: ChunkStep) -> VersionKey:
@@ -121,6 +139,16 @@ class VersionPool:
             payload[f"v.{layer}"] = self.kv_pools[layer][1][start:end].contiguous()
         return payload
 
+    def empty_tensor_dict(self, num_blocks: int) -> dict[str, torch.Tensor]:
+        """Allocate fixed-shape K/V staging buffers (no Gloo metadata)."""
+        payload: dict[str, torch.Tensor] = {}
+        for layer in range(self.num_layers):
+            k_ref = self.kv_pools[layer][0][:num_blocks]
+            v_ref = self.kv_pools[layer][1][:num_blocks]
+            payload[f"k.{layer}"] = torch.empty(k_ref.shape, dtype=k_ref.dtype, device=k_ref.device)
+            payload[f"v.{layer}"] = torch.empty(v_ref.shape, dtype=v_ref.dtype, device=v_ref.device)
+        return payload
+
     def copy_into(self, slot: int, payload: dict[str, torch.Tensor]) -> None:
         start = slot * self.chunk_blocks
         end = start + payload["k.0"].shape[0]
@@ -176,6 +204,7 @@ class NoisyKVTransport:
         self.pool = pool
         self._pending_recv: dict[VersionKey, tuple[Any, dict[str, torch.Tensor]]] = {}
         self._send_handles: list[Any] = []
+        self._send_keepalives: list[torch.Tensor] = []
         self.bytes_sent = 0
         self.bytes_received = 0
 
@@ -187,29 +216,54 @@ class NoisyKVTransport:
         pp_group: Any | None,
         chunk_tokens_by_request: dict[str, int],
     ) -> list[Any]:
-        """Post this slot's transfers. Returns only the local *send* handles.
+        """Post this slot's transfers via one ``batch_isend_irecv``.
 
-        Receive handles stay in ``_pending_recv`` and are waited on demand by
-        ``await_ready``; a rank never blocks on inbound data it does not read
-        next slot.
+        Fixed-shape K/V tensors (no Gloo metadata). Returns local *send* works;
+        receive works stay in ``_pending_recv`` until ``await_ready``.
         """
         self._send_handles = []
+        self._send_keepalives = []
         if pp_group is None or getattr(pp_group, "world_size", 1) <= 1:
             return []
+        if not transfers:
+            return []
+
+        ops: list[dist.P2POp] = []
+        send_kept: list[torch.Tensor] = []
+        recv_jobs: list[tuple[VersionKey, dict[str, torch.Tensor]]] = []
+        n_send = 0
+
         for xfer in transfers:
             key = _version_key(xfer.req, xfer.version)
+            num_blocks = chunk_tokens_by_request[xfer.req] // self.pool.block_size
             if xfer.src == rank:
                 slot = self.pool.slot_of(key)
-                num_blocks = chunk_tokens_by_request[xfer.req] // self.pool.block_size
                 payload = self.pool.tensor_dict(slot, num_blocks)
                 self.bytes_sent += _payload_bytes(payload)
-                self._send_handles.extend(pp_group.isend_tensor_dict(payload, dst=xfer.dst))
+                peer = _pp_global_rank(pp_group, xfer.dst)
+                for tensor in payload.values():
+                    group = _pp_group_for_tensor(pp_group, tensor)
+                    ops.append(dist.P2POp(dist.isend, tensor, peer, group))
+                    if tensor.is_cuda:
+                        tensor.record_stream(torch.cuda.current_stream(tensor.device))
+                    send_kept.append(tensor)
+                n_send += 1
             elif xfer.dst == rank:
-                slot = self.pool.alloc(key)
-                payload, recv_handles, _ = pp_group.irecv_tensor_dict(src=xfer.src)
-                merged = list(self._pending_recv.get(key, (None, payload))[0] or [])
-                merged.extend(recv_handles)
-                self._pending_recv[key] = (merged, payload)
+                self.pool.alloc(key)
+                payload = self.pool.empty_tensor_dict(num_blocks)
+                peer = _pp_global_rank(pp_group, xfer.src)
+                for tensor in payload.values():
+                    group = _pp_group_for_tensor(pp_group, tensor)
+                    ops.append(dist.P2POp(dist.irecv, tensor, peer, group))
+                recv_jobs.append((key, payload))
+
+        works = list(dist.batch_isend_irecv(ops)) if ops else []
+        if n_send:
+            self._send_handles = list(works)
+            self._send_keepalives = send_kept
+        for key, payload in recv_jobs:
+            # NCCL/Gloo batch works complete as a set; share the same work list.
+            self._pending_recv[key] = (list(works), payload)
         return list(self._send_handles)
 
     def await_ready(self, wanted: frozenset[VersionKey]) -> int:
@@ -317,6 +371,8 @@ class NoisyKVState:
         self._plans: dict[str, ChunkPlan] = {}
         self._chunk_tokens: dict[str, int] = {}
         self._last_use_global: dict[str, dict[ChunkStep, int]] = {}
+        # Precomputed rank-local KV edges: req -> local_slot -> transfers involving this rank.
+        self._local_xfers: dict[str, dict[int, tuple[RequestKVTransfer, ...]]] = {}
         self.bytes_sent = 0
         self.bytes_received = 0
         self.transfers_deduped = 0
@@ -341,6 +397,18 @@ class NoisyKVState:
         self._chunk_tokens[req] = chunk_tokens
         mapped = {version: t0 + slot for version, slot in plan.last_use(self._rank).items()}
         self._last_use_global[req] = mapped
+        # Bake this rank's send/recv edges once; exchange only indexes the table.
+        rank = self._rank
+        local_map: dict[int, tuple[RequestKVTransfer, ...]] = {}
+        for local in range(plan.num_slots):
+            edges = tuple(
+                RequestKVTransfer(req=req, version=xfer.version, src=xfer.src, dst=xfer.dst)
+                for xfer in plan.transfers(local)
+                if xfer.src == rank or xfer.dst == rank
+            )
+            if edges:
+                local_map[local] = edges
+        self._local_xfers[req] = local_map
 
     def set_inflight(self, inflight: tuple[Inflight, ...]) -> None:
         self._inflight = inflight
@@ -354,6 +422,7 @@ class NoisyKVState:
         self._plans.pop(req, None)
         self._chunk_tokens.pop(req, None)
         self._last_use_global.pop(req, None)
+        self._local_xfers.pop(req, None)
 
     def reset_all(self) -> None:
         """Fail-closed: drop every version and local request bookkeeping."""
@@ -367,6 +436,7 @@ class NoisyKVState:
         self._plans.clear()
         self._chunk_tokens.clear()
         self._last_use_global.clear()
+        self._local_xfers.clear()
         self._inflight = ()
 
     def prepare(self, tasks: tuple[tuple[str, ChunkStep], ...]) -> list[list[NoisyLayerContext]]:
@@ -425,7 +495,13 @@ class NoisyKVState:
         del tasks
 
     def exchange(self, slot: int) -> list[Any]:
-        transfers = union_transfers(self._inflight, slot)
+        # Topology was precomputed in begin_request; only gather this slot's edges.
+        acc: list[RequestKVTransfer] = []
+        for item in self._inflight:
+            local = slot - item.t0
+            acc.extend(self._local_xfers.get(item.req, {}).get(local, ()))
+        acc.sort(key=lambda x: (x.src, x.dst, x.req, x.version))
+        transfers = tuple(acc)
         self.transfers_deduped = len(transfers)
         handles = self.cache.transport.exchange(
             transfers, rank=self._rank, pp_group=self._pp_group, chunk_tokens_by_request=self._chunk_tokens

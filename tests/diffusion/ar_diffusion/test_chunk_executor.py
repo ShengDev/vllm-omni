@@ -12,6 +12,7 @@ from vllm_omni.experimental.ar_diffusion.chunk_executor import (
     ChunkAdapter,
     ChunkRunSpec,
     ChunkTopology,
+    resolve_chunk_parallel_layout,
     run_chunk_pipeline,
 )
 from vllm_omni.experimental.ar_diffusion.chunk_schedule import ChunkSchedule, Ordering, build_chunk_plan
@@ -37,6 +38,10 @@ class CountingAdapter(ChunkAdapter):
 
     def unpack_activation(self, payload):
         return payload["hidden_states"]
+
+    def activation_spec(self, *, batch: int, include_hidden: bool):
+        del include_hidden
+        return [("hidden_states", (max(1, int(batch)), 4, 8), torch.float32)]
 
 
 def test_executor_runs_all_slots_r1():
@@ -190,3 +195,21 @@ def test_executor_releases_versions_when_forward_raises():
     assert not ctx.inflight
     assert not ctx.pending
     assert len(cache.pool.keys) == 0
+
+
+def test_resolve_chunk_parallel_layout_dedicated_decoder():
+    layout = resolve_chunk_parallel_layout(stages=4, pp_world=5, dedicated_decoder=True)
+    assert layout.dit_world == 4
+    assert layout.topology.stages == 4
+    assert layout.topology.layer_groups == 1
+    assert layout.decoder_rank == 4
+    assert layout.is_decoder_rank(4)
+    assert layout.is_dit_rank(3)
+    assert not layout.is_dit_rank(4)
+
+    plain = resolve_chunk_parallel_layout(stages=4, pp_world=4, dedicated_decoder=False)
+    assert plain.decoder_rank is None
+    assert plain.dit_world == 4
+
+    with pytest.raises(ValueError, match="dedicated_decoder"):
+        resolve_chunk_parallel_layout(stages=4, pp_world=4, dedicated_decoder=True)

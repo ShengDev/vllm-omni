@@ -33,7 +33,7 @@ Python API and the noisy_pp bench script.
 | Checkpoint | `Physis-AI/waveserve-wan2.1-1.3b-diffusers-rf-dev` (experimental distilled RF) |
 | Entrypoint | Omni + `vllm_omni/deploy/waveserve_wan.yaml` (not `vllm serve --omni` GA path) |
 | `chunk_schedule` | Request `extra_args`: `serial` \| `latest` (unknown values raise) |
-| Topology | `pipeline_parallel_size = S · G`, `S ∈ {1, T+1}`, `G ≥ 1` |
+| Topology | DiT `S · G` with `S ∈ {1, T+1}`, `G ≥ 1`; default deploy uses `pipeline_parallel_size = S·G+1` with `dedicated_decoder` (last rank is VAE-only) |
 | Acceptance (#102) | Reproducible basic function + config logging; no FPS / realtime SLA |
 
 ## References
@@ -47,7 +47,7 @@ Python API and the noisy_pp bench script.
 ## Hardware
 
 - Accelerator: NVIDIA CUDA GPUs (NVLink or PCIe); qualify with enough cards for `S · G`
-- Profile used for #102 smoke: 5× GPU with `S=5`, `G=1` (`T=4` denoise + clean)
+- Profile used for #102 smoke: 6× GPU with `S=5`, `G=1`, dedicated decoder (`T=4` denoise + clean + VAE rank)
 - Qualification scope: experimental; not a GA hardware claim
 
 ## Software environment
@@ -59,7 +59,7 @@ Python API and the noisy_pp bench script.
 
 ## Command
 
-### Offline generate (Latest-KV, S=5)
+### Offline generate (Latest-KV, S=5 DiT + dedicated decoder)
 
 ```bash
 python - <<'PY'
@@ -71,9 +71,11 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 repo = Path(".").resolve()
 cfg = OmegaConf.load(repo / "vllm_omni/deploy/waveserve_wan.yaml")
 stage0 = cfg.stages[0]
-OmegaConf.update(stage0, "parallel_config.pipeline_parallel_size", 5, force_add=True)
+# T=4 → S=5 DiT ranks + 1 VAE decoder
+OmegaConf.update(stage0, "parallel_config.pipeline_parallel_size", 6, force_add=True)
 OmegaConf.update(stage0, "model_config.ar_diffusion_stage_config.stage_parallel_size", 5, force_add=True)
-deploy = repo / "outputs/waveserve_wan_s5.yaml"
+OmegaConf.update(stage0, "model_config.ar_diffusion_stage_config.dedicated_decoder", True, force_add=True)
+deploy = repo / "outputs/waveserve_wan_s5_dec.yaml"
 deploy.parent.mkdir(parents=True, exist_ok=True)
 deploy.write_text(OmegaConf.to_yaml(cfg))
 
@@ -90,6 +92,7 @@ try:
                 "num_denoise_steps": 4,
                 "kv_history_chunks": 6,
                 "chunk_schedule": "latest",
+                "stream_decode": True,
                 "reset": True,
             }
         ),
@@ -144,13 +147,15 @@ and `num_denoise_steps: 1` if you need S=1 with T≥1 on a single card (Omni all
 
 ## Notes
 
-- **Noisy PP** topology: `pipeline_parallel_size = S · G` with `S = num_denoise_steps + 1`
-  (denoise stages + clean). `G = 1` keeps a full DiT per stage rank; `G > 1`
-  splits layers within each stage (`forward_latent_step` + activation pack
-  `{latent[, hidden_states]}`).
+- **Noisy PP** DiT topology: `dit_world = S · G` with `S = num_denoise_steps + 1`
+  (denoise stages + clean). Default deploy sets `dedicated_decoder=true` so
+  `pipeline_parallel_size = S·G+1` (last rank VAE-only + `stream_decode`).
+  `G = 1` keeps a full DiT per stage rank; `G > 1` splits layers within each
+  stage (`forward_latent_step` + activation pack `{latent[, hidden_states]}`).
 - Do **not** wrap Omni in `torchrun`; use the mp executor from deploy YAML.
 - The test checkpoint was distilled with timestep **shift 5.0**.
 - FPS / speedup / realtime SLA are out of scope for this phase (#102).
+- 6-GPU remote e2e notes: `benchmarks/noisy_pp/REMOTE_E2E_6GPU.md`.
 
 ## Supported features
 
