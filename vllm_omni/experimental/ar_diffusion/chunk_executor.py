@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import os
-import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -24,15 +23,15 @@ from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
     rank_work,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVState
-from vllm_omni.experimental.ar_diffusion.phase_profile import (
-    PhaseProfiler,
-    bind_profiler,
-    measure_forward,
-    timed,
-)
+
+logger = init_logger(__name__)
+
+# Backward-compatible alias.
+ChunkStep = Cell
+
 
 def activation_use_tensor_dict() -> bool:
-    """Opt into legacy Gloo-metadata ``isend_tensor_dict`` activation path."""
+    """Legacy Gloo-metadata activation path (``AR_DIFFUSION_ACT_USE_TENSOR_DICT=1``)."""
     return os.environ.get("AR_DIFFUSION_ACT_USE_TENSOR_DICT", "").strip().lower() in {
         "1",
         "true",
@@ -45,12 +44,8 @@ def _pp_global_rank(pp_group: Any, group_rank: int) -> int:
     return int(pp_group.ranks[group_rank])
 
 
-def _pp_group_for_tensor(pp_group: Any, tensor: torch.Tensor) -> Any:
-    return pp_group.cpu_group if tensor.is_cpu else pp_group.device_group
-
-
 def _stash_meta_from_tasks(src_tasks: tuple[tuple[str, Cell], ...]) -> tuple[str, int, int]:
-    """Key peer stash without reading recv tensors (avoids sync before wait)."""
+    """Stash key from schedule meta (no tensor sync)."""
     _req, cell = src_tasks[0]
     chunk, step, _block = cell
     return ("", int(chunk), int(step))
@@ -63,7 +58,7 @@ def _activation_edges(
     slot: int,
     schedule: Any,
 ) -> list[tuple[int, int, tuple[tuple[str, Cell], ...]]]:
-    """Same edge list on every rank for this tick's activation P2P."""
+    """Identical edge list on every rank for this tick."""
     edges: list[tuple[int, int, tuple[tuple[str, Cell], ...]]] = []
     last_rank = topology.world - 1
     if topology.stages == 1:
@@ -79,11 +74,7 @@ def _activation_edges(
 
 
 def _warmup_activation_p2p(pp_group: Any, *, world: int, rank: int, device: torch.device) -> None:
-    """Ring ``batch_isend_irecv`` once so NCCL P2P channels exist before the hot path.
-
-    Without this, the first unbatched/lazy P2P on a multi-rank group can host-block
-    while creating 2-rank communicators (see ProcessGroupNCCL warnings).
-    """
+    """One ring P2P so NCCL channels exist before the hot path."""
     if world <= 1 or not torch.cuda.is_available():
         return
     group = pp_group.device_group
@@ -108,16 +99,9 @@ def _post_activations_ws(
     adapter: ChunkAdapter,
     topology: ChunkTopology,
     device: torch.device,
-    profiler: PhaseProfiler,
-) -> tuple[list[Any], list[torch.Tensor]]:
-    """WaveServe-style activation: one ``batch_isend_irecv``, wait at consume.
-
-    Every rank walks the same ``edges`` list. Local send/recv ops are posted in a
-    single batch (no Gloo metadata). Recv ``Pending``-like wait happens in
-    ``take_stashed_activation``; send keepalives stay alive via returned works.
-    """
+) -> None:
+    """Fixed-shape activation P2P: one ``batch_isend_irecv``, wait before return."""
     ops: list[dist.P2POp] = []
-    send_kept: list[torch.Tensor] = []
     recv_jobs: list[tuple[dict[str, torch.Tensor], tuple[str, int, int]]] = []
     group = pp_group.device_group
 
@@ -135,9 +119,6 @@ def _post_activations_ws(
                 tensor = packed[key]
                 if not tensor.is_contiguous():
                     tensor = tensor.contiguous()
-                send_kept.append(tensor)
-                if tensor.is_cuda:
-                    tensor.record_stream(torch.cuda.current_stream(tensor.device))
                 ops.append(dist.P2POp(dist.isend, tensor, peer, group))
         elif rank == dst:
             peer = _pp_global_rank(pp_group, src)
@@ -148,99 +129,10 @@ def _post_activations_ws(
                 ops.append(dist.P2POp(dist.irecv, payload[key], peer, group))
             recv_jobs.append((payload, _stash_meta_from_tasks(src_tasks)))
 
-    t0 = time.perf_counter()
-    works = list(dist.batch_isend_irecv(ops)) if ops else []
-    profiler.add("act_batch_isend_irecv", time.perf_counter() - t0)
-    profiler.add_total("act_batch_ops", len(ops))
-    profiler.add_total("act_batch_works", len(works))
-
-    # Match WaveServe: attach the batch work list to each received payload; the
-    # consumer waits in take_stashed_activation (not in this tick's wait_outbound).
+    if ops:
+        _wait(list(dist.batch_isend_irecv(ops)))
     for payload, meta in recv_jobs:
-        adapter.stash_activation(payload, handles=list(works), meta=meta)
-
-    return works, send_kept
-
-
-def _prune_act_inflight(
-    inflight: list[tuple[list[Any], list[torch.Tensor]]],
-) -> list[tuple[list[Any], list[torch.Tensor]]]:
-    """Drop completed activation send batches (WaveServe transport.inflight)."""
-    kept: list[tuple[list[Any], list[torch.Tensor]]] = []
-    for works, tensors in inflight:
-        try:
-            if works and all(getattr(w, "is_completed", lambda: False)() for w in works):
-                continue
-        except Exception:
-            pass
-        kept.append((works, tensors))
-    return kept
-
-
-def _profile_cuda_sync() -> None:
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-    except Exception:
-        return
-
-# Backward-compatible alias.
-ChunkStep = Cell
-
-#: Wall time of each *active* slot (rank has work) on rank 0.
-#: Experimental telemetry only; a harness clears it per request.
-SLOT_TIMES: list[float] = []
-
-#: End-to-end wall of one ``run_chunk_pipeline`` call on rank 0 (seconds).
-PIPELINE_TIMES: list[float] = []
-
-
-def _slot_times_file() -> str | None:
-    return os.environ.get("AR_DIFFUSION_SLOT_TIMES_FILE") or None
-
-
-def _pipeline_times_file() -> str | None:
-    return os.environ.get("AR_DIFFUSION_PIPELINE_TIMES_FILE") or None
-
-
-def _slot_telemetry_enabled() -> bool:
-    """Opt-in only: sync+record costs a device barrier every active tick on rank 0."""
-    return _slot_times_file() is not None
-
-
-def _pipeline_telemetry_enabled() -> bool:
-    return _pipeline_times_file() is not None
-
-
-def _cuda_sync() -> None:
-    try:
-        import torch
-
-        if torch.accelerator.is_available():
-            torch.accelerator.synchronize()
-    except Exception:
-        return
-
-
-def _record_slot(delta: float) -> None:
-    SLOT_TIMES.append(delta)
-    path = _slot_times_file()
-    if path:
-        with open(path, "a") as fh:
-            fh.write(f"{delta}\n")
-
-
-def _record_pipeline(delta: float) -> None:
-    PIPELINE_TIMES.append(delta)
-    path = _pipeline_times_file()
-    if path:
-        with open(path, "a") as fh:
-            fh.write(f"{delta}\n")
-
-
-logger = init_logger(__name__)
+        adapter.stash_activation(payload, meta=meta)
 
 
 def resolve_pp_rank_and_group() -> tuple[int, Any | None]:
@@ -335,7 +227,7 @@ class ARDiffusionChunkContext:
 
 
 class ChunkAdapter:
-    """Model-side cell step. ``forward`` receives one block per request on this rank."""
+    """Model-side cell step: one block per request on this rank."""
 
     def forward(
         self,
@@ -355,11 +247,7 @@ class ChunkAdapter:
     def activation_spec(
         self, *, batch: int, include_hidden: bool
     ) -> list[tuple[str, tuple[int, ...], torch.dtype]] | None:
-        """Optional fixed recv schema for NCCL activation P2P.
-
-        Return ``[(key, shape, dtype), ...]`` in send order, or ``None`` to
-        fall back to ``isend_tensor_dict`` (Gloo metadata).
-        """
+        """Fixed NCCL recv schema ``[(key, shape, dtype), ...]``, or ``None`` for tensor_dict."""
         del batch, include_hidden
         return None
 
@@ -370,11 +258,7 @@ class ChunkAdapter:
         handles: list[Any] | None = None,
         meta: tuple[str, int, int] | None = None,
     ) -> None:
-        """Optional: buffer a peer activation until the matching cell runs.
-
-        ``handles`` are waited in ``take_stashed_activation`` (deferred recv).
-        ``meta`` keys the stash without reading ``chunk``/``step`` tensors.
-        """
+        """Buffer peer activation until the matching cell runs (recv already waited)."""
         del payload, handles, meta
 
     def take_stashed_activation(self, req: str, chunk: int, step: int) -> Any | None:
@@ -398,7 +282,7 @@ def _tasks_need_activation_send(
     tasks: tuple[tuple[str, Cell], ...],
     schedule: Any | None,
 ) -> bool:
-    """PP activation leaves a rank only after its last local block of the group."""
+    """Activation P2P only after the last local block of a layer group."""
     if not tasks or schedule is None:
         return bool(tasks)
     return any(is_group_boundary(cell, schedule) for _req, cell in tasks)
@@ -410,12 +294,10 @@ def run_chunk_pipeline(
     adapter: ChunkAdapter,
     max_slots: int | None = None,
 ) -> None:
-    """Drive inflight plans to completion on this rank (one cell per tick).
+    """Run inflight plans on this rank (one cell per tick).
 
-    Each tick waits on two disjoint sets only: the handles this rank posted
-    (outbound not left dangling) and the inbound versions the *next* tick
-    consumes. Activation P2P fires only on layer-group boundaries; mid-group
-    cells keep hidden locally for the next block tick.
+    Per tick: prepare → forward → publish → post act/KV → wait outbound.
+    Mid-group cells keep ``hidden`` locally; group-boundary cells P2P.
     """
     spec = ctx.spec
     kv = ctx.kv
@@ -432,169 +314,92 @@ def run_chunk_pipeline(
     slot = 0
     limit = max_slots if max_slots is not None else 10**9
     pending_hidden: Any | None = None
-    pipeline_started = time.perf_counter()
-    profiler = PhaseProfiler.maybe(spec.rank)
     try:
-        with bind_profiler(profiler):
-            kv_stream = kv.uses_comm_stream
-            prev_slot_for_evict: int | None = None
-            # WaveServe-style: posted activation batches kept until complete / flush.
-            act_inflight: list[tuple[list[Any], list[torch.Tensor]]] = []
-            act_device = getattr(adapter, "device", None)
-            if act_device is None and torch.cuda.is_available():
-                act_device = torch.device("cuda", torch.cuda.current_device())
-            elif act_device is None:
-                act_device = torch.device("cpu")
-            use_ws_act = (
-                pp is not None
-                and spec.topology.world > 1
-                and not activation_use_tensor_dict()
-                and adapter.activation_spec(batch=1, include_hidden=False) is not None
-            )
-            if use_ws_act:
-                with timed(profiler, "act_p2p_warmup"):
-                    _warmup_activation_p2p(
-                        pp, world=spec.topology.world, rank=spec.rank, device=act_device
-                    )
-            while (ctx.inflight or ctx.pending) and slot < limit:
-                slot_started = time.perf_counter()
-                # Full-device sync kills comm/compute overlap; skip in stream mode.
-                if profiler.enabled and not kv_stream and (ctx.inflight or ctx.pending):
-                    t_stall = time.perf_counter()
-                    _profile_cuda_sync()
-                    profiler.add("stall_prev_gpu", time.perf_counter() - t_stall)
-                ctx.admit_pending(slot)
-                kv.set_inflight(tuple(ctx.inflight))
-                tasks = rank_work(tuple(ctx.inflight), slot, spec.rank)
-                _assert_i8(tasks)
-                schedule = ctx.inflight[0].plan.schedule if ctx.inflight else None
-                sample_gpu = bool(tasks) and profiler.note_active_tick()
-                with timed(profiler, "prepare"):
-                    contexts = kv.prepare(tasks) if tasks else []
-                output = None
-                if tasks:
-                    # Dependency wait for peer activations happens inside adapter
-                    # take_stashed_activation (WaveServe Pending.wait at consume).
-                    output = measure_forward(
-                        profiler,
-                        lambda: adapter.forward(tasks, contexts, hidden=pending_hidden),
-                        sample_gpu=sample_gpu,
-                    )
-                    kv.publish(tasks)
-                    # Mid-group: keep hidden on this rank for the next local block.
-                    if schedule is not None and not _tasks_need_activation_send(tasks, schedule):
-                        pending_hidden = output
-                    else:
-                        pending_hidden = None
-                # After forward is queued: finish prior KV isend, then evict last-use.
-                if kv_stream and prev_slot_for_evict is not None:
-                    with timed(profiler, "wait_outbound"):
-                        kv.wait_sends()
-                    with timed(profiler, "evict"):
-                        kv.evict(prev_slot_for_evict)
-                    prev_slot_for_evict = None
-                comm_handles: list[Any] = []
-                if pp is not None and spec.topology.world > 1 and schedule is not None:
-                    edges = _activation_edges(
-                        topology=spec.topology,
-                        inflight=tuple(ctx.inflight),
-                        slot=slot,
-                        schedule=schedule,
-                    )
-                    with timed(profiler, "activation_post"):
-                        if not use_ws_act:
-                            for src, dst, src_tasks in edges:
-                                if spec.rank == src and output is not None:
-                                    t0 = time.perf_counter()
-                                    handles = pp.isend_tensor_dict(
-                                        adapter.pack_activation(output), dst=dst
-                                    )
-                                    profiler.add("act_isend_tensor_dict", time.perf_counter() - t0)
-                                    comm_handles.extend(handles)
-                                elif spec.rank == dst:
-                                    t0 = time.perf_counter()
-                                    recv, recv_handles, _ = pp.irecv_tensor_dict(src=src)
-                                    profiler.add("act_irecv_tensor_dict", time.perf_counter() - t0)
-                                    comm_handles.extend(recv_handles)
-                                    adapter.stash_activation(
-                                        recv, meta=_stash_meta_from_tasks(src_tasks)
-                                    )
-                        elif edges:
-                            act_inflight = _prune_act_inflight(act_inflight)
-                            works, kept = _post_activations_ws(
-                                pp,
-                                edges,
-                                rank=spec.rank,
-                                output=output,
-                                adapter=adapter,
-                                topology=spec.topology,
-                                device=act_device,
-                                profiler=profiler,
-                            )
-                            # Do not host-wait here — recv waits at take_stashed;
-                            # send works stay in act_inflight (WaveServe transport).
-                            if works:
-                                act_inflight.append((works, kept))
-                with timed(profiler, "kv_exchange"):
-                    kv_handles = kv.exchange(slot)
-                    if not kv_stream:
-                        comm_handles.extend(kv_handles)
-                    profiler.add_total("kv_handles", len(kv_handles) if not kv_stream else 0)
-                # ① Outbound only (KV isend + legacy act). Recv wait is next tick's await_ready.
-                with timed(profiler, "wait_outbound"):
-                    _wait(comm_handles)
-                still = []
-                for item in ctx.inflight:
-                    local = slot - item.t0
-                    if local + 1 < item.plan.num_slots:
-                        still.append(item)
-                    else:
-                        kv.end_request(item.req)
-                ctx.inflight = still
-                kv.set_inflight(tuple(ctx.inflight))
-                if kv_stream:
-                    # Defer evict(slot) to after next forward so isend overlaps compute.
-                    prev_slot_for_evict = slot
-                else:
-                    with timed(profiler, "evict"):
-                        kv.evict(slot)
-                    # ② Original cell order (noisy_pp §2.5): await next tick's sources
-                    # at end of this tick, immediately before the next prepare.
-                    with timed(profiler, "await_ready"):
-                        kv.await_ready(slot)
-                # Hot path: do not cudaSynchronize every tick. Slot timing is
-                # opt-in via AR_DIFFUSION_SLOT_TIMES_FILE (sync then required).
-                if spec.rank == 0 and tasks and _slot_telemetry_enabled():
-                    _cuda_sync()
-                    _record_slot(time.perf_counter() - slot_started)
-                slot += 1
-            if kv_stream and prev_slot_for_evict is not None:
-                with timed(profiler, "wait_outbound"):
-                    kv.wait_sends()
-                with timed(profiler, "evict"):
-                    kv.evict(prev_slot_for_evict)
-            # WaveServe transport.flush() equivalent for activation sends.
-            if act_inflight:
-                with timed(profiler, "act_flush"):
-                    for works, _kept in act_inflight:
-                        _wait(works)
-                act_inflight = []
-            with timed(profiler, "drain"):
-                kv.drain()
-        profiler.dump(
-            extra={
-                "stages": spec.topology.stages,
-                "layer_groups": spec.topology.layer_groups,
-                "slots": slot,
-                "bytes_sent": getattr(kv, "bytes_sent", None),
-                "bytes_received": getattr(kv, "bytes_received", None),
-                "transfers_deduped": getattr(kv, "transfers_deduped", None),
-                "pipeline_wall_s": time.perf_counter() - pipeline_started,
-            }
+        kv_stream = kv.uses_comm_stream
+        prev_slot_for_evict: int | None = None
+        act_device = getattr(adapter, "device", None)
+        if act_device is None and torch.cuda.is_available():
+            act_device = torch.device("cuda", torch.cuda.current_device())
+        elif act_device is None:
+            act_device = torch.device("cpu")
+        use_ws_act = (
+            pp is not None
+            and spec.topology.world > 1
+            and not activation_use_tensor_dict()
+            and adapter.activation_spec(batch=1, include_hidden=False) is not None
         )
-        if spec.rank == 0 and _pipeline_telemetry_enabled():
-            _cuda_sync()
-            _record_pipeline(time.perf_counter() - pipeline_started)
+        if use_ws_act:
+            _warmup_activation_p2p(pp, world=spec.topology.world, rank=spec.rank, device=act_device)
+        while (ctx.inflight or ctx.pending) and slot < limit:
+            ctx.admit_pending(slot)
+            kv.set_inflight(tuple(ctx.inflight))
+            tasks = rank_work(tuple(ctx.inflight), slot, spec.rank)
+            _assert_i8(tasks)
+            schedule = ctx.inflight[0].plan.schedule if ctx.inflight else None
+            contexts = kv.prepare(tasks) if tasks else []
+            output = None
+            if tasks:
+                output = adapter.forward(tasks, contexts, hidden=pending_hidden)
+                kv.publish(tasks)
+                if schedule is not None and not _tasks_need_activation_send(tasks, schedule):
+                    pending_hidden = output
+                else:
+                    pending_hidden = None
+            if kv_stream and prev_slot_for_evict is not None:
+                kv.wait_sends()
+                kv.evict(prev_slot_for_evict)
+                prev_slot_for_evict = None
+            comm_handles: list[Any] = []
+            if pp is not None and spec.topology.world > 1 and schedule is not None:
+                edges = _activation_edges(
+                    topology=spec.topology,
+                    inflight=tuple(ctx.inflight),
+                    slot=slot,
+                    schedule=schedule,
+                )
+                if not use_ws_act:
+                    for src, dst, src_tasks in edges:
+                        if spec.rank == src and output is not None:
+                            handles = pp.isend_tensor_dict(adapter.pack_activation(output), dst=dst)
+                            comm_handles.extend(handles)
+                        elif spec.rank == dst:
+                            recv, recv_handles, _ = pp.irecv_tensor_dict(src=src)
+                            comm_handles.extend(recv_handles)
+                            adapter.stash_activation(recv, meta=_stash_meta_from_tasks(src_tasks))
+                elif edges:
+                    _post_activations_ws(
+                        pp,
+                        edges,
+                        rank=spec.rank,
+                        output=output,
+                        adapter=adapter,
+                        topology=spec.topology,
+                        device=act_device,
+                    )
+            kv_handles = kv.exchange(slot)
+            if not kv_stream:
+                comm_handles.extend(kv_handles)
+            # Outbound KV (+ legacy act). Fixed-shape act already waited in _post_activations_ws.
+            _wait(comm_handles)
+            still = []
+            for item in ctx.inflight:
+                local = slot - item.t0
+                if local + 1 < item.plan.num_slots:
+                    still.append(item)
+                else:
+                    kv.end_request(item.req)
+            ctx.inflight = still
+            kv.set_inflight(tuple(ctx.inflight))
+            if kv_stream:
+                prev_slot_for_evict = slot
+            else:
+                kv.evict(slot)
+                kv.await_ready(slot)
+            slot += 1
+        if kv_stream and prev_slot_for_evict is not None:
+            kv.wait_sends()
+            kv.evict(prev_slot_for_evict)
+        kv.drain()
     except Exception:
         for req in {item.req for item in ctx.inflight} | {item.req for item in ctx.pending}:
             ctx.drop(req)

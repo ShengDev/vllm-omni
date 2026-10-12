@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import os
-import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, ClassVar
@@ -26,7 +25,6 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
     ARDiffusionPagedLayerInputs,
     _layer_idx_tensor,
 )
-from vllm_omni.experimental.ar_diffusion.phase_profile import current_profiler
 
 VersionKey = tuple[str, int, int, int]  # req, chunk, step, block
 
@@ -36,13 +34,10 @@ def _version_key(req: str, version: Cell) -> VersionKey:
 
 
 def _layer_of(key: VersionKey, *, num_layers: int, layer_offset: int = 0) -> int:
-    """Map absolute block index to a local pool layer index on this rank."""
+    """Absolute block → local pool layer; remote versions use ``block % num_layers``."""
     block = key[3]
     local = block - layer_offset
     if not 0 <= local < num_layers:
-        # Absolute block stored on a remote owner; recv still lands in local pool
-        # slot using the same local index 0..num_layers-1 when num_layers==1, else
-        # block % num_layers for multi-layer ranks that own a contiguous range.
         local = block % num_layers
     return local
 
@@ -73,14 +68,7 @@ class ARDiffusionNoisyKVSpec:
 
 
 class VersionPool:
-    """Per-layer fixed-length version slots on ``allocate_kv_pool_with_views``.
-
-    Design §4.2: one pool per transformer block. ``capacity`` is the number of
-    version slots **per layer**; each layer owns an independent free stack so
-    concurrent ``(c,s,b)`` cells on different blocks do not steal each other's
-    slots. Slot indices are local to a layer (0 .. capacity-1) and index that
-    layer's K/V tensor only.
-    """
+    """Per-layer version slots. ``capacity`` is slots per layer (independent free stacks)."""
 
     def __init__(
         self,
@@ -117,7 +105,6 @@ class VersionPool:
         self.kv_pools = kv_pools
         self.k_pools = k_pools
         self.v_pools = v_pools
-        # One free stack per local layer — not a shared global stack.
         self.free: list[list[int]] = [list(range(capacity - 1, -1, -1)) for _ in range(num_layers)]
         self.keys: dict[VersionKey, int] = {}
 
@@ -148,7 +135,6 @@ class VersionPool:
 
     @property
     def has_free(self) -> bool:
-        """True if any layer still has a free slot."""
         return any(bool(stack) for stack in self.free)
 
     def block_ids(self, slot: int) -> list[int]:
@@ -159,7 +145,7 @@ class VersionPool:
         return _layer_of(key, num_layers=self.num_layers, layer_offset=self.layer_offset)
 
     def kv_block_views(self, key: VersionKey, num_blocks: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """K/V block-table slices for one version (shape ``[num_blocks, block_size, H, D]``)."""
+        """K/V views ``[num_blocks, block_size, H, D]`` for one version."""
         slot = self.slot_of(key)
         layer = self.local_layer(key)
         start = slot * self.chunk_blocks
@@ -167,7 +153,6 @@ class VersionPool:
         return self.kv_pools[layer][0][start:end], self.kv_pools[layer][1][start:end]
 
     def tensor_dict(self, key: VersionKey, num_blocks: int) -> dict[str, torch.Tensor]:
-        """Single-layer K/V payload for one cell version."""
         k, v = self.kv_block_views(key, num_blocks)
         return {
             "k": k.contiguous(),
@@ -198,8 +183,7 @@ class NoisyLayerContext:
     max_query_len: int
     max_seq_len: int
     seq_len: int
-    # Bottom storage unchanged; cache the paged-attn view so each cell does not
-    # re-allocate layer_idx / empty action_slots tensors on the hot path.
+    # Cached paged-attn view (avoids realloc on the hot path).
     _inputs: ARDiffusionPagedLayerInputs | None = None
     _empty_action_slots: ClassVar[dict[tuple[str, int | None], torch.Tensor]] = {}
 
@@ -245,7 +229,7 @@ def _wait_handles(handles: list[Any] | None) -> None:
 
 
 def kv_comm_stream_enabled() -> bool:
-    """Opt-in: dedicated CUDA stream + deferred send wait for compute overlap."""
+    """Dedicated CUDA stream + deferred send wait (``AR_DIFFUSION_KV_COMM_STREAM=1``)."""
     return os.environ.get("AR_DIFFUSION_KV_COMM_STREAM", "").strip().lower() in {
         "1",
         "true",
@@ -255,7 +239,7 @@ def kv_comm_stream_enabled() -> bool:
 
 
 def kv_use_tensor_dict() -> bool:
-    """Opt into legacy Gloo-metadata ``isend_tensor_dict`` path (debug / A-B)."""
+    """Legacy Gloo-metadata KV path (``AR_DIFFUSION_KV_USE_TENSOR_DICT=1``)."""
     return os.environ.get("AR_DIFFUSION_KV_USE_TENSOR_DICT", "").strip().lower() in {
         "1",
         "true",
@@ -275,7 +259,6 @@ def _global_rank(pp_group: Any, group_rank: int) -> int:
 class NoisyKVTransport:
     def __init__(self, pool: VersionPool) -> None:
         self.pool = pool
-        # handles, optional staging payload, nbytes
         self._pending_recv: dict[VersionKey, tuple[list[Any], dict[str, torch.Tensor] | None, int]] = {}
         self._send_handles: list[Any] = []
         self._send_keepalives: list[torch.Tensor] = []
@@ -285,7 +268,6 @@ class NoisyKVTransport:
 
     @property
     def uses_comm_stream(self) -> bool:
-        # Stream overlap only applies on top of fixed-shape NCCL.
         return kv_comm_stream_enabled() and not kv_use_tensor_dict()
 
     def _ensure_comm_stream(self) -> torch.cuda.Stream | None:
@@ -303,13 +285,7 @@ class NoisyKVTransport:
         pp_group: Any | None,
         chunk_tokens_by_request: dict[str, int],
     ) -> list[Any]:
-        """Post this tick's transfers. Returns local *send* handles (empty if deferred).
-
-        Default: fixed-shape ``dist.isend/irecv`` (no Gloo metadata). Set
-        ``AR_DIFFUSION_KV_USE_TENSOR_DICT=1`` for the legacy path. With
-        ``AR_DIFFUSION_KV_COMM_STREAM=1``, posts on a dedicated CUDA stream and
-        defers host wait to ``wait_sends()``.
-        """
+        """Post transfers. Returns send handles, or ``[]`` when deferred to ``wait_sends``."""
         self._send_handles = []
         self._send_keepalives = []
         if pp_group is None or getattr(pp_group, "world_size", 1) <= 1:
@@ -326,7 +302,6 @@ class NoisyKVTransport:
             chunk_tokens_by_request=chunk_tokens_by_request,
             use_stream=defer,
         )
-        # Stream mode: caller must not host-wait before the next forward.
         return [] if defer else list(self._send_handles)
 
     def _exchange_tensor_dict(
@@ -337,33 +312,23 @@ class NoisyKVTransport:
         pp_group: Any,
         chunk_tokens_by_request: dict[str, int],
     ) -> list[Any]:
-        prof = current_profiler()
         n_send = n_recv = 0
         for xfer in transfers:
             key = _version_key(xfer.req, xfer.version)
             if xfer.src == rank:
                 num_blocks = chunk_tokens_by_request[xfer.req] // self.pool.block_size
-                t0 = time.perf_counter()
                 payload = self.pool.tensor_dict(key, num_blocks)
-                prof.add("kv_pack", time.perf_counter() - t0)
                 self.bytes_sent += _payload_bytes(payload)
-                t0 = time.perf_counter()
                 self._send_handles.extend(pp_group.isend_tensor_dict(payload, dst=xfer.dst))
-                prof.add("kv_isend_tensor_dict", time.perf_counter() - t0)
                 n_send += 1
             elif xfer.dst == rank:
                 self.pool.alloc(key)
-                t0 = time.perf_counter()
                 payload, recv_handles, _ = pp_group.irecv_tensor_dict(src=xfer.src)
-                prof.add("kv_irecv_tensor_dict", time.perf_counter() - t0)
                 nbytes = _payload_bytes(payload)
                 merged = list(self._pending_recv.get(key, ([], None, 0))[0] or [])
                 merged.extend(recv_handles)
                 self._pending_recv[key] = (merged, payload, nbytes)
                 n_recv += 1
-        prof.add_total("kv_xfer_send", n_send)
-        prof.add_total("kv_xfer_recv", n_recv)
-        prof.add_total("kv_xfer_planned", len(transfers))
         return list(self._send_handles)
 
     def _exchange_fixed_nccl(
@@ -375,11 +340,9 @@ class NoisyKVTransport:
         chunk_tokens_by_request: dict[str, int],
         use_stream: bool,
     ) -> None:
-        """Fixed-shape K/V P2P via one ``batch_isend_irecv`` (WaveServe transport)."""
-        prof = current_profiler()
+        """Fixed-shape K/V P2P via one ``batch_isend_irecv``."""
         stream = self._ensure_comm_stream() if use_stream else None
         n_send = n_recv = 0
-        # Published KV lives on the compute stream; make it visible to comm.
         if stream is not None:
             stream.wait_stream(torch.cuda.current_stream(self.pool.device))
 
@@ -391,11 +354,9 @@ class NoisyKVTransport:
             key = _version_key(xfer.req, xfer.version)
             num_blocks = chunk_tokens_by_request[xfer.req] // self.pool.block_size
             if xfer.src == rank:
-                t0 = time.perf_counter()
                 k_view, v_view = self.pool.kv_block_views(key, num_blocks)
                 k = k_view if k_view.is_contiguous() else k_view.contiguous()
                 v = v_view if v_view.is_contiguous() else v_view.contiguous()
-                prof.add("kv_pack", time.perf_counter() - t0)
                 nbytes = k.numel() * k.element_size() + v.numel() * v.element_size()
                 self.bytes_sent += nbytes
                 dst_global = _global_rank(pp_group, xfer.dst)
@@ -429,14 +390,9 @@ class NoisyKVTransport:
                 recv_jobs.append((key, staging, nbytes))
                 n_recv += 1
 
-        t0 = time.perf_counter()
         ctx = torch.cuda.stream(stream) if stream is not None else nullcontext()
         with ctx:
             works = list(dist.batch_isend_irecv(ops)) if ops else []
-        prof.add("kv_batch_isend_irecv", time.perf_counter() - t0)
-        prof.add_total("kv_batch_ops", len(ops))
-        prof.add_total("kv_batch_works", len(works))
-        # NCCL batch works must be waited as a set (same as WaveServe transport).
         if n_send:
             self._send_handles.extend(works)
             self._send_keepalives.extend(send_kept)
@@ -447,40 +403,27 @@ class NoisyKVTransport:
             else:
                 merged.extend(works)
             self._pending_recv[key] = (merged, staging, nbytes)
-        prof.add_total("kv_xfer_send", n_send)
-        prof.add_total("kv_xfer_recv", n_recv)
-        prof.add_total("kv_xfer_planned", len(transfers))
 
     def wait_sends(self) -> None:
-        """Host-wait outbound KV posted by the previous ``exchange`` (stream mode)."""
+        """Host-wait deferred outbound KV (comm-stream mode)."""
         if not self._send_handles:
             return
-        prof = current_profiler()
-        t0 = time.perf_counter()
         _wait_handles(self._send_handles)
-        prof.add("kv_wait_sends", time.perf_counter() - t0)
         self._send_handles = []
         self._send_keepalives = []
 
     def await_ready(self, wanted: frozenset[VersionKey]) -> int:
         if not self._pending_recv:
             return 0
-        prof = current_profiler()
         ready = [key for key in self._pending_recv if key in wanted]
         for key in ready:
             handles, payload, nbytes = self._pending_recv.pop(key)
-            t0 = time.perf_counter()
             _wait_handles(handles)
-            prof.add("kv_recv_wait", time.perf_counter() - t0)
             self.bytes_received += nbytes
             if payload is not None:
-                t0 = time.perf_counter()
                 self.pool.copy_into(key, payload)
-                prof.add("kv_copy_into", time.perf_counter() - t0)
-            # In-place recv landed on comm stream; compute must see it before prepare.
             if self._comm_stream is not None and self.pool.device.type == "cuda":
                 torch.cuda.current_stream(self.pool.device).wait_stream(self._comm_stream)
-            prof.counts["kv_recv_ready"] += 1
         return len(self._pending_recv)
 
     def drain_all(self) -> None:
@@ -525,12 +468,9 @@ class NoisyKVCache:
         self.max_batch_size = max(1, max_batch_size)
         self.blocks_per_rank = max(1, blocks_per_rank)
         chunk_blocks = spec.max_chunk_tokens // spec.block_size
-        # Per-layer residency ~ H+2+G (design §4.2). Capacity is per layer;
-        # ``VersionPool`` keeps an independent free stack for each local block.
-        # ``blocks_per_rank`` is retained for logging / PP geometry only.
+        # Per-layer residency ~ H+2+G; capacity is per layer.
         per_req = max(spec.max_history_chunks + 2 + layer_groups, spec.max_history_chunks + stages)
         desired = self.max_batch_size * per_req
-        # One version = one layer's chunk K/V; total bytes scale with num_layers.
         bytes_per_version = (
             2
             * chunk_blocks
@@ -544,7 +484,6 @@ class NoisyKVCache:
             budget = int(available_bytes * float(gpu_memory_fraction))
             if bytes_all_layers <= 0:
                 raise RuntimeError("invalid NoisyKV geometry: bytes_all_layers <= 0")
-            # Budget buys N slots on *every* layer (one free stack each).
             max_by_budget = budget // bytes_all_layers
             if max_by_budget < 1:
                 raise RuntimeError(
@@ -572,7 +511,7 @@ class NoisyKVCache:
 
 
 class NoisyKVState:
-    """Per-request (and in-flight) bridge used by the chunk executor."""
+    """Per-request bridge used by the chunk executor."""
 
     def __init__(self, cache: NoisyKVCache) -> None:
         self.cache = cache
@@ -585,7 +524,6 @@ class NoisyKVState:
         self._inflight: tuple[Inflight, ...] = ()
         self._rank = 0
         self._pp_group: Any | None = None
-        # Prepare hot-path caches (plan A): avoid per-tick arange/H2D for write slots.
         self._write_slots_cache: dict[tuple[int, int], torch.Tensor] = {}
         self._query_start_cache: dict[int, torch.Tensor] = {}
         self._block_table_dev: torch.Tensor | None = None
@@ -622,7 +560,6 @@ class NoisyKVState:
         self._inflight = inflight
 
     def end_request(self, req: str) -> None:
-        # Finish any still-inflight send before reclaiming slots.
         self.cache.transport.wait_sends()
         drop = [key for key in self.cache.pool.keys if key[0] == req]
         for key in drop:
@@ -678,20 +615,19 @@ class NoisyKVState:
         return qsl
 
     def _cached_write_slots(self, write_slot: int, chunk_tokens: int, device: torch.device) -> torch.Tensor:
-        """Physical write slots for a VersionPool slot; equivalent to compute_slot_mapping on contiguous blocks."""
+        """Contiguous write-slot mapping for one VersionPool slot."""
         key = (write_slot, chunk_tokens)
         hit = self._write_slots_cache.get(key)
         if hit is not None and hit.device == device:
             return hit
         pool = self.cache.pool
-        # write_blocks = [slot*cb, ...,]; mapping collapses to arange + slot * (cb*bs).
         base = write_slot * pool.chunk_blocks * pool.block_size
         slots = torch.arange(chunk_tokens, dtype=torch.long, device=device) + base
         self._write_slots_cache[key] = slots
         return slots
 
     def prepare(self, tasks: tuple[tuple[str, Cell], ...]) -> list[list[NoisyLayerContext]]:
-        """Prepare contexts for each cell (one layer each)."""
+        """One ``NoisyLayerContext`` per cell (single block)."""
         spec = self.cache.spec
         pool = self.cache.pool
         h = spec.max_history_chunks
@@ -699,15 +635,12 @@ class NoisyKVState:
         max_seq_len = (h + 1) * spec.max_chunk_tokens
         max_query_len = self.cache.max_batch_size * spec.max_chunk_tokens
         batch: list[list[NoisyLayerContext]] = []
-        prof = current_profiler()
         device = pool.k_pools[0].device
         self._ensure_prepare_bufs(width, device)
         assert self._block_table_cpu is not None and self._block_table_dev is not None
         assert self._seq_lens_dev is not None
-        # Reused device buffers are only safe when a single task owns them this tick.
         share_bufs = len(tasks) <= 1
         for req, task in tasks:
-            t0 = time.perf_counter()
             chunk_tokens = self._chunk_tokens[req]
             num_chunk_blocks = chunk_tokens // pool.block_size
             plan = self._plans[req]
@@ -728,17 +661,12 @@ class NoisyKVState:
             if len(blocks) < width:
                 self._block_table_cpu[0, len(blocks) :].zero_()
             seq_len = (len(srcs) + 1) * chunk_tokens
-            prof.add("prepare_meta_cpu", time.perf_counter() - t0)
-            t0 = time.perf_counter()
             self._block_table_dev.copy_(self._block_table_cpu, non_blocking=device.type == "cuda")
             self._seq_lens_dev.fill_(seq_len)
             query_start_loc = self._cached_query_start(chunk_tokens, device)
             block_table = self._block_table_dev if share_bufs else self._block_table_dev.clone()
             seq_lens = self._seq_lens_dev if share_bufs else self._seq_lens_dev.clone()
-            prof.add("prepare_h2d_small", time.perf_counter() - t0)
-            t0 = time.perf_counter()
             video_slots = self._cached_write_slots(write_slot, chunk_tokens, device)
-            prof.add("prepare_slot_mapping", time.perf_counter() - t0)
             local_layer = pool.local_layer(write_key)
             batch.append(
                 [
@@ -774,7 +702,6 @@ class NoisyKVState:
         return handles
 
     def evict(self, slot: int) -> None:
-        # ① Stream mode: host-wait prior isend before reclaiming last-use slots.
         if self.uses_comm_stream:
             self.cache.transport.wait_sends()
         drop: list[VersionKey] = []

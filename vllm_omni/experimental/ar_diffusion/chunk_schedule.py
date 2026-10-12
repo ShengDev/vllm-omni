@@ -2,15 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Pure-function chunk timetable, Latest-KV visibility, and transfer plan.
 
-No torch. ``S ∈ {1, T+1}`` only.
+No torch. ``S ∈ {1, T+1}``. Schedule/KV unit is cell ``(chunk, step, block)``.
 
-Schedule / KV unit is a **cell** ``(chunk, step, block)``. Model weight split
-stays PP layer-groups (``G = ceil(B/K)``); each coarse ``(c,s)`` on a rank
-expands to ``K`` ticks (one transformer block each).
-
-* ``S = 1``: traditional layer-split (``SERIAL`` / ``INTERLEAVED``).
-* ``S = T+1``: one denoise-stage replica per denoise/clean step. ``SERIAL`` keeps
-  a single chunk in flight; non-serial uses the diagonal Latest-KV pipeline.
+* Weight split: PP layer-groups ``G``; each coarse ``(c,s)`` expands to local blocks.
+* ``S = 1``: layer PP. ``S = T+1``: one replica per denoise/clean step.
+* ``SERIAL``: one chunk in flight; ``INTERLEAVED``: diagonal Latest-KV.
 """
 
 from __future__ import annotations
@@ -83,11 +79,8 @@ class ChunkSchedule:
             raise ValueError(f"blocks must be positive, got {blocks}")
         if k < 1:
             raise ValueError(f"blocks_per_rank must be positive, got {k}")
-        expected_g = (blocks + k - 1) // k
-        if self.layer_groups != expected_g and self.blocks is not None:
-            # Allow even-split G that does not equal ceil(B/K) when caller passes
-            # explicit G from deploy; only enforce when both B and K are set and
-            # G disagrees with even split of B.
+        if self.blocks is not None:
+            # Deploy may set G independently of ceil(B/K); only reject empty groups.
             start0, end0 = _block_range(blocks, 0, self.layer_groups)
             if end0 - start0 < 1:
                 raise ValueError(f"layer_groups={self.layer_groups} leaves group 0 empty for blocks={blocks}")
