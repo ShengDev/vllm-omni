@@ -174,3 +174,21 @@ def test_i2_sources_strictly_earlier():
                 continue
             for src in plan.sources(task, rank):
                 assert plan.completion_tick(src.version) < t
+
+
+def test_wait_ready_nonempty_after_cell_expand():
+    """Remote history first-consume must produce wait_ready entries (REPORT regression)."""
+    plan = build_chunk_plan(
+        ChunkSchedule(
+            chunks=8,
+            num_denoise_steps=4,
+            stages=5,
+            layer_groups=1,
+            ordering=Ordering.INTERLEAVED,
+            kv_history_chunks=6,
+            blocks=30,
+            blocks_per_rank=30,
+        )
+    )
+    wait_entries = sum(len(plan.wait_ready(slot, rank)) for slot in range(plan.num_slots) for rank in range(plan.world))
+    assert wait_entries > 0

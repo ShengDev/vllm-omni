@@ -528,6 +528,7 @@ class NoisyKVState:
         self._query_start_cache: dict[int, torch.Tensor] = {}
         self._block_table_dev: torch.Tensor | None = None
         self._block_table_cpu: torch.Tensor | None = None
+        self._block_table_h2d_event: Any | None = None
         self._seq_lens_dev: torch.Tensor | None = None
         self._prepare_buf_width: int = -1
 
@@ -588,6 +589,7 @@ class NoisyKVState:
         self._query_start_cache.clear()
         self._block_table_dev = None
         self._block_table_cpu = None
+        self._block_table_h2d_event = None
         self._seq_lens_dev = None
         self._prepare_buf_width = -1
 
@@ -603,8 +605,23 @@ class NoisyKVState:
         self._block_table_dev = torch.zeros(1, width, dtype=torch.int32, device=device)
         self._seq_lens_dev = torch.zeros(1, dtype=torch.int32, device=device)
         self._prepare_buf_width = width
+        self._block_table_h2d_event = None
         self._write_slots_cache.clear()
         self._query_start_cache.clear()
+
+    def _wait_block_table_h2d(self) -> None:
+        """Keep pinned ``_block_table_cpu`` live until the prior async H2D finishes."""
+        event = self._block_table_h2d_event
+        if event is not None:
+            event.synchronize()
+
+    def _record_block_table_h2d(self, device: torch.device) -> None:
+        if device.type != "cuda":
+            self._block_table_h2d_event = None
+            return
+        if self._block_table_h2d_event is None:
+            self._block_table_h2d_event = torch.cuda.Event()
+        self._block_table_h2d_event.record()
 
     def _cached_query_start(self, chunk_tokens: int, device: torch.device) -> torch.Tensor:
         hit = self._query_start_cache.get(chunk_tokens)
@@ -657,11 +674,14 @@ class NoisyKVState:
             blocks.extend(write_blocks)
             if len(blocks) > width:
                 raise RuntimeError(f"block_table width {width} too small for {len(blocks)} blocks")
+            # Do not overwrite pinned CPU source while a prior non_blocking H2D is in flight.
+            self._wait_block_table_h2d()
             self._block_table_cpu[0, : len(blocks)] = torch.as_tensor(blocks, dtype=torch.int32)
             if len(blocks) < width:
                 self._block_table_cpu[0, len(blocks) :].zero_()
             seq_len = (len(srcs) + 1) * chunk_tokens
             self._block_table_dev.copy_(self._block_table_cpu, non_blocking=device.type == "cuda")
+            self._record_block_table_h2d(device)
             self._seq_lens_dev.fill_(seq_len)
             query_start_loc = self._cached_query_start(chunk_tokens, device)
             block_table = self._block_table_dev if share_bufs else self._block_table_dev.clone()
@@ -716,6 +736,21 @@ class NoisyKVState:
 
     def await_ready(self, slot: int) -> int:
         wanted = {_version_key(req, version) for req, version in union_wait_ready(self._inflight, slot, self._rank)}
+        pending = self.cache.transport.await_ready(frozenset(wanted))
+        self.bytes_sent = self.cache.transport.bytes_sent
+        self.bytes_received = self.cache.transport.bytes_received
+        return pending
+
+    def await_task_sources(self, tasks: tuple[tuple[str, Cell], ...]) -> int:
+        """Wait remote history KV before attention reads it (first or later consume)."""
+        wanted: set[VersionKey] = set()
+        for req, task in tasks:
+            plan = self._plans.get(req)
+            if plan is None:
+                continue
+            for src in plan.sources(task, self._rank):
+                if src.owner != self._rank:
+                    wanted.add(_version_key(req, src.version))
         pending = self.cache.transport.await_ready(frozenset(wanted))
         self.bytes_sent = self.cache.transport.bytes_sent
         self.bytes_received = self.cache.transport.bytes_received

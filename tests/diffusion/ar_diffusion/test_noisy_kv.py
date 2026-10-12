@@ -13,7 +13,6 @@ from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
     Inflight,
     Ordering,
     build_chunk_plan,
-    incoming_transfers,
     union_wait_ready,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
@@ -165,14 +164,26 @@ def _vertical_plan() -> ChunkPlan:
     )
 
 
-def test_wait_ready_matches_incoming_transfers():
-    """I9②: the awaited set is exactly slot T's inbound, read at slot T+1."""
+def test_wait_ready_covers_first_remote_consume():
+    """Await remotes at the tick before first consume (not only same-slot inbound)."""
     plan = _vertical_plan()
     inflight = (Inflight(req="A", t0=0, plan=plan),)
+    first_consume: dict[tuple[int, int, int], int] = {}
     for slot in range(plan.num_slots):
-        incoming = sorted(incoming_transfers(plan._transfers, slot, 0), key=lambda x: x.version)
-        ready = sorted(union_wait_ready(inflight, slot, 0), key=lambda item: item[1])
-        assert [x.version for x in incoming] == [version for _req, version in ready]
+        task = plan.task(slot, 0)
+        if task is None:
+            continue
+        for src in plan.sources(task, 0):
+            if src.owner != 0:
+                first_consume.setdefault(src.version, slot)
+    # Every first remote consume at C has wait_ready at C-1 (or 0 if C==0).
+    for version, consume_slot in first_consume.items():
+        wait_slot = 0 if consume_slot == 0 else consume_slot - 1
+        ready = {v for _req, v in union_wait_ready(inflight, wait_slot, 0)}
+        assert version in ready, f"{version} first used at {consume_slot} missing wait at {wait_slot}"
+    # wait_ready must be non-empty when there is any remote history (cell expand).
+    assert first_consume
+    assert any(union_wait_ready(inflight, slot, 0) for slot in range(plan.num_slots))
 
 
 def test_wait_ready_is_empty_without_kv_history():

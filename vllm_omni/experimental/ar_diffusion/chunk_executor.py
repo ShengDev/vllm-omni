@@ -44,10 +44,21 @@ def _pp_global_rank(pp_group: Any, group_rank: int) -> int:
     return int(pp_group.ranks[group_rank])
 
 
-def _stash_meta_from_tasks(src_tasks: tuple[tuple[str, Cell], ...]) -> tuple[str, int, int]:
-    """Stash key from schedule meta (no tensor sync)."""
+def _consumer_stash_meta(
+    src_tasks: tuple[tuple[str, Cell], ...],
+    *,
+    topology: ChunkTopology,
+    src: int,
+) -> tuple[str, int, int]:
+    """Stash under the consumer's ``(chunk, step)`` (what ``take_stashed_activation`` looks up).
+
+    Producer schedule meta alone is wrong across denoise stages: consumer step is
+    ``producer_step + 1``. Same-stage layer-group boundaries keep the step.
+    """
     _req, cell = src_tasks[0]
     chunk, step, _block = cell
+    if topology.is_stage_last(src):
+        step = int(step) + 1
     return ("", int(chunk), int(step))
 
 
@@ -127,7 +138,9 @@ def _post_activations_ws(
             }
             for key, _shape, _dtype in spec_list:
                 ops.append(dist.P2POp(dist.irecv, payload[key], peer, group))
-            recv_jobs.append((payload, _stash_meta_from_tasks(src_tasks)))
+            recv_jobs.append(
+                (payload, _consumer_stash_meta(src_tasks, topology=topology, src=src))
+            )
 
     if ops:
         _wait(list(dist.batch_isend_irecv(ops)))
@@ -336,9 +349,12 @@ def run_chunk_pipeline(
             tasks = rank_work(tuple(ctx.inflight), slot, spec.rank)
             _assert_i8(tasks)
             schedule = ctx.inflight[0].plan.schedule if ctx.inflight else None
-            contexts = kv.prepare(tasks) if tasks else []
+            contexts: list[Any] = []
             output = None
             if tasks:
+                # Consume-time wait: covers prefetch that landed many ticks earlier.
+                kv.await_task_sources(tasks)
+                contexts = kv.prepare(tasks)
                 output = adapter.forward(tasks, contexts, hidden=pending_hidden)
                 kv.publish(tasks)
                 if schedule is not None and not _tasks_need_activation_send(tasks, schedule):
@@ -365,7 +381,12 @@ def run_chunk_pipeline(
                         elif spec.rank == dst:
                             recv, recv_handles, _ = pp.irecv_tensor_dict(src=src)
                             comm_handles.extend(recv_handles)
-                            adapter.stash_activation(recv, meta=_stash_meta_from_tasks(src_tasks))
+                            adapter.stash_activation(
+                                recv,
+                                meta=_consumer_stash_meta(
+                                    src_tasks, topology=spec.topology, src=src
+                                ),
+                            )
                 elif edges:
                     _post_activations_ws(
                         pp,
@@ -390,11 +411,12 @@ def run_chunk_pipeline(
                     kv.end_request(item.req)
             ctx.inflight = still
             kv.set_inflight(tuple(ctx.inflight))
+            # End-of-slot wait for remotes first consumed at slot+1 (plan wait_ready).
+            kv.await_ready(slot)
             if kv_stream:
                 prev_slot_for_evict = slot
             else:
                 kv.evict(slot)
-                kv.await_ready(slot)
             slot += 1
         if kv_stream and prev_slot_for_evict is not None:
             kv.wait_sends()

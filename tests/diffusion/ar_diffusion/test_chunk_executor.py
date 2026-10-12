@@ -12,6 +12,7 @@ from vllm_omni.experimental.ar_diffusion.chunk_executor import (
     ChunkAdapter,
     ChunkRunSpec,
     ChunkTopology,
+    _consumer_stash_meta,
     run_chunk_pipeline,
 )
 from vllm_omni.experimental.ar_diffusion.chunk_schedule import ChunkSchedule, Ordering, build_chunk_plan
@@ -37,6 +38,20 @@ class CountingAdapter(ChunkAdapter):
 
     def unpack_activation(self, payload):
         return payload["hidden_states"]
+
+
+def test_consumer_stash_meta_cross_stage_vs_same_stage():
+    """Stash key is the consumer cell: step+1 only when leaving a denoise stage."""
+    # S=T+1, G=2: ranks 0,1 stage0; 2,3 stage1. Producer (c,s) → consumer key.
+    topo = ChunkTopology(stages=2, layer_groups=2)
+    src_tasks = (("r", (3, 0, 1)),)  # chunk=3, step=0, last block of group
+    # Mid-stage: rank 0 → 1, keep step.
+    assert _consumer_stash_meta(src_tasks, topology=topo, src=0) == ("", 3, 0)
+    # Cross stage: rank 1 (stage-last) → 2, consumer runs step+1.
+    assert _consumer_stash_meta(src_tasks, topology=topo, src=1) == ("", 3, 1)
+    # S=1 wrap last→0 also stage-last → next denoise step.
+    topo_s1 = ChunkTopology(stages=1, layer_groups=3)
+    assert _consumer_stash_meta(src_tasks, topology=topo_s1, src=2) == ("", 3, 1)
 
 
 def test_executor_runs_all_slots_r1():

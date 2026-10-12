@@ -149,7 +149,7 @@ class ChunkPlan:
         return dict(self._last_use.get(rank, {}))
 
     def wait_ready(self, slot: int, rank: int) -> frozenset[Cell]:
-        """Incoming versions of ``slot`` that ``rank`` must await before ``slot + 1``."""
+        """Remote source versions that ``rank`` first consumes at ``slot + 1`` (await by end of ``slot``)."""
         return self._wait_ready.get(rank, {}).get(slot, frozenset())
 
 
@@ -446,17 +446,28 @@ def build_chunk_plan(schedule: ChunkSchedule) -> ChunkPlan:
     sources, transfers = _sources_and_transfers(slots, completions, schedule)
     last_use = _last_use(slots, sources, transfers, schedule)
     world = schedule.stages * schedule.layer_groups
+    # Await remote KV at the tick before first consumption — not only when the
+    # transfer lands in the same slot as next-tick consume (cell expand breaks that).
     wait_ready: dict[int, dict[int, frozenset[Cell]]] = {rank: {} for rank in range(world)}
-    for slot in range(len(slots)):
-        for rank in range(world):
-            consumed = next_consumed(slots, sources, slot, rank)
-            if not consumed:
+    first_remote_consume: dict[int, dict[Cell, int]] = {rank: {} for rank in range(world)}
+    for t, row in enumerate(slots):
+        for rank, task in enumerate(row):
+            if task is None:
                 continue
-            pending = frozenset(
-                xfer.version for xfer in incoming_transfers(transfers, slot, rank) if xfer.version in consumed
-            )
-            if pending:
-                wait_ready[rank][slot] = pending
+            for src in sources.get((rank, task), ()):
+                if src.owner == rank:
+                    continue
+                first_remote_consume[rank].setdefault(src.version, t)
+    for rank, version_slots in first_remote_consume.items():
+        by_wait: dict[int, set[Cell]] = {}
+        for version, consume_slot in version_slots.items():
+            wait_slot = consume_slot - 1
+            if wait_slot < 0:
+                # Consumed at slot 0: executor also awaits in prepare path.
+                wait_slot = 0
+            by_wait.setdefault(wait_slot, set()).add(version)
+        for wait_slot, versions in by_wait.items():
+            wait_ready[rank][wait_slot] = frozenset(versions)
     plan = ChunkPlan(schedule, slots, completions, sources, transfers, last_use, wait_ready)
     _assert_invariants(plan)
     return plan
