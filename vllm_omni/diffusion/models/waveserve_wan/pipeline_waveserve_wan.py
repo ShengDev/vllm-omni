@@ -97,13 +97,7 @@ class FlowEuler:
 
 
 class _LatentChunkAdapter(ChunkAdapter):
-    """Real Wan path: 5D latents + FlowEuler along the PP chain.
-
-    Activation payload is always a dict:
-    - ``{"latent": ...}`` after stage-last (advanced / clean latent)
-    - ``{"latent": ..., "hidden_states": ...}`` after non-last layer groups
-      so the next group can RoPE from latent and resume tokens
-    """
+    """Cell tick: ``embed → block → unembed`` + FlowEuler. Mid-PP carries ``hidden_states``."""
 
     def __init__(
         self,
@@ -126,10 +120,13 @@ class _LatentChunkAdapter(ChunkAdapter):
         self.dtype = dtype
         self.on_finished = on_finished
         self.num_denoise_steps = len(sampler.timesteps)
-        # req -> chunk -> latent (after last denoise advance)
         self.finished: dict[str, dict[int, torch.Tensor]] = {}
-        # Per-request current latents keyed by chunk while in flight on this rank
         self._live: dict[str, dict[int, torch.Tensor]] = {}
+        self._stash: dict[tuple[str, int, int], dict[str, torch.Tensor]] = {}
+        self._last_meta: tuple[str, int, int] | None = None
+        self._timesteps = [torch.tensor(float(t), dtype=torch.float32) for t in sampler.timesteps]
+        self._timestep_clean = torch.zeros((), dtype=torch.float32)
+        transformer.prepare_cell(prompt_embeds)
 
     def _init_noise(self, chunk: int) -> torch.Tensor:
         gen = torch.Generator(device=self.device)
@@ -138,80 +135,87 @@ class _LatentChunkAdapter(ChunkAdapter):
 
     @staticmethod
     def _slice_batch(tensor: torch.Tensor, index: int, n_tasks: int) -> torch.Tensor:
-        if tensor.shape[0] == n_tasks:
-            return tensor[index : index + 1]
-        return tensor
+        return tensor[index : index + 1] if tensor.shape[0] == n_tasks else tensor
+
+    def stash_activation(
+        self,
+        payload: dict,
+        *,
+        handles: list | None = None,
+        meta: tuple[str, int, int] | None = None,
+    ) -> None:
+        del handles
+        tensors = {k: v for k, v in payload.items() if isinstance(v, torch.Tensor) and k not in ("chunk", "step")}
+        key = meta or self._last_meta
+        if key is None:
+            raise RuntimeError("stash_activation needs meta")
+        self._stash[key] = tensors
+
+    def take_stashed_activation(self, req: str, chunk: int, step: int):
+        return self._stash.pop((req, chunk, step), None) or self._stash.pop(("", chunk, step), None)
+
+    def _resolve_latent_hidden(
+        self, *, req: str, chunk: int, step: int, index: int, n_tasks: int, hidden: Any, live: dict[int, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        latent: torch.Tensor | None = None
+        tokens: torch.Tensor | None = None
+        src = hidden if isinstance(hidden, dict) else None
+        if src is None or "hidden_states" not in src:
+            src = self.take_stashed_activation(req, chunk, step)
+        if isinstance(src, dict):
+            if "latent" in src:
+                latent = self._slice_batch(src["latent"], index, n_tasks)
+            if "hidden_states" in src:
+                tokens = self._slice_batch(src["hidden_states"], index, n_tasks)
+        elif isinstance(hidden, torch.Tensor):
+            latent = self._slice_batch(hidden, index, n_tasks)
+        if latent is None:
+            latent = live.get(chunk) or self._init_noise(chunk)
+        return latent, tokens
 
     def forward(self, tasks, kv_contexts, *, hidden):
         if not tasks:
             return hidden
         outs: list[dict[str, torch.Tensor]] = []
-        for i, (req, (chunk, step)) in enumerate(tasks):
-            ctx = kv_contexts[i] if i < len(kv_contexts) else None
+        tf = self.transformer
+        for i, (req, cell) in enumerate(tasks):
+            chunk, step, block = cell
+            self._last_meta = (req, chunk, step)
+            ctx_list = kv_contexts[i] if i < len(kv_contexts) else None
+            kv_ctx = ctx_list[0] if isinstance(ctx_list, list) else ctx_list
             live = self._live.setdefault(req, {})
-            inter: IntermediateTensors | None = None
-            if hidden is None:
-                latent = live.get(chunk)
-                if latent is None:
-                    latent = self._init_noise(chunk)
-            elif isinstance(hidden, torch.Tensor):
-                latent = self._slice_batch(hidden, i, len(tasks))
-            elif isinstance(hidden, dict):
-                if "latent" not in hidden:
-                    raise KeyError(f"activation dict missing latent; keys={list(hidden)}")
-                latent = self._slice_batch(hidden["latent"], i, len(tasks))
-                hs = hidden.get("hidden_states")
-                if hs is not None:
-                    inter = IntermediateTensors({"hidden_states": self._slice_batch(hs, i, len(tasks))})
-            else:
-                raise TypeError(f"expected latent activation dict/tensor, got {type(hidden)}")
+            latent, tokens = self._resolve_latent_hidden(
+                req=req, chunk=chunk, step=step, index=i, n_tasks=len(tasks), hidden=hidden, live=live
+            )
+            t = self._timesteps[step] if step < self.num_denoise_steps else self._timestep_clean
+            step_key = step if step < self.num_denoise_steps else self.num_denoise_steps
 
+            if block == tf.start_layer and tf.is_stage_first:
+                tokens = tf.embed(latent)
+            elif tokens is None:
+                raise RuntimeError(f"cell {(chunk, step, block)} missing hidden_states")
+            tokens = tf.block(
+                block, tokens, chunk=chunk, step=step_key, latent=latent, timestep=t, kv_ctx=kv_ctx
+            )
+            if not (block == tf.end_layer - 1 and tf.is_stage_last):
+                live[chunk] = latent
+                outs.append({"latent": latent, "hidden_states": tokens})
+                continue
+            pred = tf.unembed(tokens, chunk=chunk, step=step_key, latent=latent, timestep=t)
             if step < self.num_denoise_steps:
-                t = torch.tensor(self.sampler.timesteps[step], device=self.device, dtype=torch.float32)
-                out = self.transformer.forward_latent_step(
-                    latent,
-                    timestep=t,
-                    encoder_hidden_states=self.prompt_embeds,
-                    kv_contexts=ctx,
-                    intermediate_tensors=inter,
-                )
-                if isinstance(out, IntermediateTensors):
-                    # Non-last layer group: forward tokens + carry 5D latent.
-                    live[chunk] = latent
-                    outs.append({"latent": latent, "hidden_states": out["hidden_states"]})
-                    continue
-                # Stage-last: unpatched pred → FlowEuler advance.
-                latent = self.sampler.advance(out, latent, step)
+                latent = self.sampler.advance(pred, latent, step)
                 if step == self.num_denoise_steps - 1:
                     self.finished.setdefault(req, {})[chunk] = latent.detach()
                     if self.on_finished is not None:
                         self.on_finished(chunk, latent)
             else:
-                # Clean KV refresh at t=0; latent already final.
-                t = torch.zeros((), device=self.device, dtype=torch.float32)
-                out = self.transformer.forward_latent_step(
-                    latent,
-                    timestep=t,
-                    encoder_hidden_states=self.prompt_embeds,
-                    kv_contexts=ctx,
-                    intermediate_tensors=inter,
-                )
-                if isinstance(out, IntermediateTensors):
-                    live[chunk] = latent
-                    outs.append({"latent": latent, "hidden_states": out["hidden_states"]})
-                    continue
                 self.finished.setdefault(req, {})[chunk] = latent.detach()
-
             live[chunk] = latent
             outs.append({"latent": latent})
-        return self._stack_payloads(outs)
-
-    @staticmethod
-    def _stack_payloads(outs: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
         if len(outs) == 1:
             return outs[0]
         keys = outs[0].keys()
-        return {key: torch.cat([out[key] for out in outs], dim=0) for key in keys}
+        return {k: torch.cat([o[k] for o in outs], dim=0) for k in keys}
 
     def pack_activation(self, output):
         if isinstance(output, dict):
@@ -220,18 +224,28 @@ class _LatentChunkAdapter(ChunkAdapter):
             return {k: v.contiguous() for k, v in output.tensors.items()}
         if isinstance(output, torch.Tensor):
             return {"latent": output.contiguous()}
-        raise TypeError(f"latent adapter packs dict/tensor, got {type(output)}")
+        raise TypeError(f"pack expects dict/tensor, got {type(output)}")
+
+    def activation_spec(self, *, batch: int, include_hidden: bool):
+        batch = max(1, int(batch))
+        _b, c, t, h, w = self.latent_shape
+        spec: list[tuple[str, tuple[int, ...], torch.dtype]] = [
+            ("latent", (batch, int(c), int(t), int(h), int(w)), self.dtype),
+        ]
+        if include_hidden:
+            seq = self.transformer.seq_len_for_latent((batch, int(c), int(t), int(h), int(w)))
+            spec.append(("hidden_states", (batch, seq, int(self.transformer.dim)), self.dtype))
+        return spec
 
     def unpack_activation(self, payload: dict):
         return payload
 
 
 class WaveServeWanPipeline(nn.Module):
-    """Chunk SERIAL/Latest pipeline (AR-Diffusion engine + noisy KV)."""
+    """Chunk SERIAL/Latest pipeline (AR-Diffusion + noisy KV)."""
 
     supports_request_batch = True
-    # Engine startup dummy forces num_inference_steps=2, which conflicts with
-    # vertical S=T+1; skip the engine dummy (not a measurement warmup).
+    # Skip engine dummy: num_inference_steps=2 breaks vertical S=T+1.
     dummy_run_num_frames: ClassVar[int] = 0
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
@@ -248,9 +262,7 @@ class WaveServeWanPipeline(nn.Module):
         pp_world = int(getattr(getattr(od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
         self.layer_groups = max(1, pp_world // max(1, self.stage_parallel_size))
         if bool(stage_cfg.get("tiny", False)):
-            raise ValueError(
-                "WaveServeWanPipeline no longer supports tiny=True; use tests/diffusion/ar_diffusion/waveserve_tiny.py"
-            )
+            raise ValueError("WaveServeWanPipeline no longer supports tiny=True")
         geo = dict(WAN21_1_3B)
         self.max_history_chunks = int(stage_cfg.get("max_history_chunks", 6) or 6)
         pp_rank, _pp_group = resolve_pp_rank_and_group()
@@ -278,8 +290,7 @@ class WaveServeWanPipeline(nn.Module):
             pp_rank=pp_rank,
             transformer_config=transformer_config,
         )
-        # Without this the Diffusers loader's get_all_weights() is empty, so the
-        # DiT stays at init (zeros / garbage NaN biases) and every video is NaN.
+        # Required so Diffusers loader populates DiT weights (else NaN video).
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=model_path,
@@ -293,7 +304,6 @@ class WaveServeWanPipeline(nn.Module):
         self.text_encoder = None
         self.vae = None
         self._init_codec(model_path)
-        # Prefer a page size that divides the default WaveServe latent token count.
         default_tokens = self.transformer.seq_len_for_latent(_DEFAULT_LATENT_SHAPE)
         self.block_size = default_tokens
         self.max_chunk_tokens = default_tokens
@@ -438,6 +448,8 @@ class WaveServeWanPipeline(nn.Module):
             if explicit_denoise:
                 raise ValueError(f"WaveServe stages must be 1 or num_denoise_steps+1 ({denoise + 1}), got {stages}")
             denoise = stages - 1
+        num_blocks = int(getattr(self.transformer, "num_layers", 0) or 0)
+        local_blocks = int(getattr(self.transformer, "local_num_layers", 0) or 0)
         schedule = ChunkSchedule(
             chunks=chunks,
             num_denoise_steps=denoise,
@@ -445,6 +457,8 @@ class WaveServeWanPipeline(nn.Module):
             layer_groups=self.layer_groups,
             ordering=ordering,
             kv_history_chunks=history,
+            blocks=num_blocks if num_blocks > 0 else None,
+            blocks_per_rank=local_blocks if local_blocks > 0 else None,
         )
         return build_chunk_plan(schedule), extra, denoise
 
@@ -573,20 +587,20 @@ class WaveServeWanPipeline(nn.Module):
             prompt_embeds = self._encode_prompt(prompt, device, dtype)
             sampler = FlowEuler(denoise, shift=shift)
             stream_decode = bool(extra.get("stream_decode", False))
+            timeline_file = extra.get("chunk_timeline_file")
             decode_buffers = []
             recv_works = []
             send_works = []
             on_finished = None
+            source_rank = denoise * self.layer_groups - 1 if self.stage_parallel_size == denoise + 1 else None
             if stream_decode:
-                source_rank = denoise * self.layer_groups - 1
-                if self.stage_parallel_size != denoise + 1 or source_rank == 0 or pp_group is None:
+                if source_rank is None or source_rank == 0 or pp_group is None:
                     raise ValueError("stream_decode requires a remote final denoise rank in S=T+1 topology")
                 if self.vae is not None and (self.vae.use_tiling or self.vae.is_distributed_enabled()):
                     raise ValueError("stream_decode requires non-tiled single-owner VAE")
                 source = pp_group.ranks[source_rank]
                 owner = pp_group.ranks[0]
                 if self._stream_decode_group is None:
-                    # CPU 潜变量通信不被 PP0 的设备同步阻塞；不混用激活/KV 顺序。
                     self._stream_decode_group = dist.new_group(ranks=[owner, source], backend="gloo")
                 if pp_rank == 0:
                     decode_buffers = [
@@ -598,10 +612,25 @@ class WaveServeWanPipeline(nn.Module):
                     ]
                 elif pp_rank == source_rank:
 
-                    def on_finished(chunk: int, latent: torch.Tensor) -> None:
+                    def _stream_send(chunk: int, latent: torch.Tensor) -> None:
                         assert chunk == len(send_works)
                         host = latent.to(device="cpu").contiguous()
                         send_works.append((host, dist.isend(host, dst=owner, group=self._stream_decode_group)))
+
+                    on_finished = _stream_send
+
+            if timeline_file is not None and source_rank is not None and pp_rank == source_rank:
+                import time as _time
+
+                _prev_finished = on_finished
+
+                def on_finished(chunk: int, latent: torch.Tensor) -> None:  # noqa: F811
+                    if latent.is_cuda:
+                        torch.cuda.synchronize(latent.device)
+                    with open(str(timeline_file), "a", encoding="utf-8") as fh:
+                        fh.write(f"{int(chunk)}\t{_time.time()}\n")
+                    if _prev_finished is not None:
+                        _prev_finished(chunk, latent)
 
             adapter = _LatentChunkAdapter(
                 self.transformer,

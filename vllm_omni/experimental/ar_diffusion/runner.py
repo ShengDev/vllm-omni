@@ -186,6 +186,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         max_batch_size = int(stage_cfg.get("max_batch_size", 1) or 1)
         self._ar_diffusion_chunk_capability = capability
         avail = self._available_memory_bytes() if available_bytes is None else available_bytes
+        layer_offset = int(getattr(getattr(self.pipeline, "transformer", None), "start_layer", 0) or 0)
+        blocks_per_rank = max(1, int(spec.num_layers))
         self.noisy_kv_cache = NoisyKVCache(
             spec,
             dtype=self.od_config.dtype,
@@ -195,9 +197,11 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             stages=stages,
             gpu_memory_fraction=float(stage_cfg.get("gpu_memory_fraction", 1.0)),
             available_bytes=avail,
+            layer_offset=layer_offset,
+            blocks_per_rank=blocks_per_rank,
         )
         logger.info(
-            "AR-Diffusion noisy KV: capacity=%d reserved_bytes=%d layers=%d H=%d G=%d R=%d S=%d",
+            "AR-Diffusion noisy KV: capacity=%d reserved_bytes=%d layers=%d H=%d G=%d R=%d S=%d K=%d",
             self.noisy_kv_cache.capacity,
             self.noisy_kv_cache.reserved_bytes,
             spec.num_layers,
@@ -205,6 +209,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             layer_groups,
             max_batch_size,
             stages,
+            blocks_per_rank,
         )
 
     def _preallocate_kv_cache(self, *, available_bytes: int | None = None) -> None:

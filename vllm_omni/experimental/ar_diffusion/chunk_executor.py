@@ -5,66 +5,147 @@
 from __future__ import annotations
 
 import os
-import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
+import torch
+import torch.distributed as dist
 from vllm.logger import init_logger
 
 from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
+    Cell,
     ChunkPlan,
-    ChunkStep,
     Inflight,
     can_admit,
+    is_group_boundary,
     rank_work,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVState
 
-#: Wall time of each *active* slot (rank has work) on rank 0.
-#: Experimental telemetry only; a harness clears it per request.
-SLOT_TIMES: list[float] = []
-
-#: End-to-end wall of one ``run_chunk_pipeline`` call on rank 0 (seconds).
-PIPELINE_TIMES: list[float] = []
-
-
-def _slot_times_file() -> str | None:
-    return os.environ.get("AR_DIFFUSION_SLOT_TIMES_FILE") or None
-
-
-def _pipeline_times_file() -> str | None:
-    return os.environ.get("AR_DIFFUSION_PIPELINE_TIMES_FILE") or None
-
-
-def _cuda_sync() -> None:
-    try:
-        import torch
-
-        if torch.accelerator.is_available():
-            torch.accelerator.synchronize()
-    except Exception:
-        return
-
-
-def _record_slot(delta: float) -> None:
-    SLOT_TIMES.append(delta)
-    path = _slot_times_file()
-    if path:
-        with open(path, "a") as fh:
-            fh.write(f"{delta}\n")
-
-
-def _record_pipeline(delta: float) -> None:
-    PIPELINE_TIMES.append(delta)
-    path = _pipeline_times_file()
-    if path:
-        with open(path, "a") as fh:
-            fh.write(f"{delta}\n")
-
-
 logger = init_logger(__name__)
+
+# Backward-compatible alias.
+ChunkStep = Cell
+
+
+def activation_use_tensor_dict() -> bool:
+    """Legacy Gloo-metadata activation path (``AR_DIFFUSION_ACT_USE_TENSOR_DICT=1``)."""
+    return os.environ.get("AR_DIFFUSION_ACT_USE_TENSOR_DICT", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _pp_global_rank(pp_group: Any, group_rank: int) -> int:
+    return int(pp_group.ranks[group_rank])
+
+
+def _consumer_stash_meta(
+    src_tasks: tuple[tuple[str, Cell], ...],
+    *,
+    topology: ChunkTopology,
+    src: int,
+) -> tuple[str, int, int]:
+    """Stash under the consumer's ``(chunk, step)`` (what ``take_stashed_activation`` looks up).
+
+    Producer schedule meta alone is wrong across denoise stages: consumer step is
+    ``producer_step + 1``. Same-stage layer-group boundaries keep the step.
+    """
+    _req, cell = src_tasks[0]
+    chunk, step, _block = cell
+    if topology.is_stage_last(src):
+        step = int(step) + 1
+    return ("", int(chunk), int(step))
+
+
+def _activation_edges(
+    *,
+    topology: ChunkTopology,
+    inflight: tuple[Any, ...],
+    slot: int,
+    schedule: Any,
+) -> list[tuple[int, int, tuple[tuple[str, Cell], ...]]]:
+    """Identical edge list on every rank for this tick."""
+    edges: list[tuple[int, int, tuple[tuple[str, Cell], ...]]] = []
+    last_rank = topology.world - 1
+    if topology.stages == 1:
+        peer_tasks = rank_work(inflight, slot, last_rank)
+        if _tasks_need_activation_send(peer_tasks, schedule):
+            edges.append((last_rank, 0, peer_tasks))
+    for src in range(last_rank):
+        dst = src + 1
+        src_tasks = rank_work(inflight, slot, src)
+        if _tasks_need_activation_send(src_tasks, schedule):
+            edges.append((src, dst, src_tasks))
+    return edges
+
+
+def _warmup_activation_p2p(pp_group: Any, *, world: int, rank: int, device: torch.device) -> None:
+    """One ring P2P so NCCL channels exist before the hot path."""
+    if world <= 1 or not torch.cuda.is_available():
+        return
+    group = pp_group.device_group
+    send_buf = torch.zeros(1, device=device, dtype=torch.float32)
+    recv_buf = torch.empty(1, device=device, dtype=torch.float32)
+    nxt = _pp_global_rank(pp_group, (rank + 1) % world)
+    prv = _pp_global_rank(pp_group, (rank - 1 + world) % world)
+    ops = [
+        dist.P2POp(dist.isend, send_buf, nxt, group),
+        dist.P2POp(dist.irecv, recv_buf, prv, group),
+    ]
+    for work in dist.batch_isend_irecv(ops):
+        work.wait()
+
+
+def _post_activations_ws(
+    pp_group: Any,
+    edges: list[tuple[int, int, tuple[tuple[str, Cell], ...]]],
+    *,
+    rank: int,
+    output: Any | None,
+    adapter: ChunkAdapter,
+    topology: ChunkTopology,
+    device: torch.device,
+) -> None:
+    """Fixed-shape activation P2P: one ``batch_isend_irecv``, wait before return."""
+    ops: list[dist.P2POp] = []
+    recv_jobs: list[tuple[dict[str, torch.Tensor], tuple[str, int, int]]] = []
+    group = pp_group.device_group
+
+    for src, dst, src_tasks in edges:
+        batch = max(1, len(src_tasks))
+        include_hidden = not topology.is_stage_last(src)
+        spec_list = adapter.activation_spec(batch=batch, include_hidden=include_hidden)
+        if not spec_list:
+            continue
+        keys = tuple(k for k, _shape, _dtype in spec_list)
+        if rank == src and output is not None:
+            packed = adapter.pack_activation(output)
+            peer = _pp_global_rank(pp_group, dst)
+            for key in keys:
+                tensor = packed[key]
+                if not tensor.is_contiguous():
+                    tensor = tensor.contiguous()
+                ops.append(dist.P2POp(dist.isend, tensor, peer, group))
+        elif rank == dst:
+            peer = _pp_global_rank(pp_group, src)
+            payload = {
+                key: torch.empty(shape, dtype=dtype, device=device) for key, shape, dtype in spec_list
+            }
+            for key, _shape, _dtype in spec_list:
+                ops.append(dist.P2POp(dist.irecv, payload[key], peer, group))
+            recv_jobs.append(
+                (payload, _consumer_stash_meta(src_tasks, topology=topology, src=src))
+            )
+
+    if ops:
+        _wait(list(dist.batch_isend_irecv(ops)))
+    for payload, meta in recv_jobs:
+        adapter.stash_activation(payload, meta=meta)
 
 
 def resolve_pp_rank_and_group() -> tuple[int, Any | None]:
@@ -159,11 +240,11 @@ class ARDiffusionChunkContext:
 
 
 class ChunkAdapter:
-    """Model-side chunk step. ``forward`` receives the microbatch on this rank."""
+    """Model-side cell step: one block per request on this rank."""
 
     def forward(
         self,
-        tasks: tuple[tuple[str, ChunkStep], ...],
+        tasks: tuple[tuple[str, Cell], ...],
         kv_contexts: list[list[Any]],
         *,
         hidden: Any | None,
@@ -176,6 +257,27 @@ class ChunkAdapter:
     def unpack_activation(self, payload: dict) -> Any:
         raise NotImplementedError
 
+    def activation_spec(
+        self, *, batch: int, include_hidden: bool
+    ) -> list[tuple[str, tuple[int, ...], torch.dtype]] | None:
+        """Fixed NCCL recv schema ``[(key, shape, dtype), ...]``, or ``None`` for tensor_dict."""
+        del batch, include_hidden
+        return None
+
+    def stash_activation(
+        self,
+        payload: dict,
+        *,
+        handles: list[Any] | None = None,
+        meta: tuple[str, int, int] | None = None,
+    ) -> None:
+        """Buffer peer activation until the matching cell runs (recv already waited)."""
+        del payload, handles, meta
+
+    def take_stashed_activation(self, req: str, chunk: int, step: int) -> Any | None:
+        del req, chunk, step
+        return None
+
 
 def _wait(handles: list[Any]) -> None:
     for handle in handles:
@@ -183,10 +285,20 @@ def _wait(handles: list[Any]) -> None:
             handle.wait()
 
 
-def _assert_i8(tasks: tuple[tuple[str, ChunkStep], ...]) -> None:
+def _assert_i8(tasks: tuple[tuple[str, Cell], ...]) -> None:
     reqs = [req for req, _task in tasks]
     if len(reqs) != len(set(reqs)):
         raise RuntimeError(f"I8 violated: same request appears twice in one microbatch: {tasks}")
+
+
+def _tasks_need_activation_send(
+    tasks: tuple[tuple[str, Cell], ...],
+    schedule: Any | None,
+) -> bool:
+    """Activation P2P only after the last local block of a layer group."""
+    if not tasks or schedule is None:
+        return bool(tasks)
+    return any(is_group_boundary(cell, schedule) for _req, cell in tasks)
 
 
 def run_chunk_pipeline(
@@ -195,11 +307,10 @@ def run_chunk_pipeline(
     adapter: ChunkAdapter,
     max_slots: int | None = None,
 ) -> None:
-    """Drive inflight plans to completion on this rank.
+    """Run inflight plans on this rank (one cell per tick).
 
-    Each slot waits on two disjoint sets only: the handles this rank posted
-    (outbound not left dangling) and the inbound versions the *next* slot
-    consumes. Everything else keeps overlapping with the next forward.
+    Per tick: prepare → forward → publish → post act/KV → wait outbound.
+    Mid-group cells keep ``hidden`` locally; group-boundary cells P2P.
     """
     spec = ctx.spec
     kv = ctx.kv
@@ -216,44 +327,80 @@ def run_chunk_pipeline(
     slot = 0
     limit = max_slots if max_slots is not None else 10**9
     pending_hidden: Any | None = None
-    pipeline_started = time.perf_counter()
     try:
+        kv_stream = kv.uses_comm_stream
+        prev_slot_for_evict: int | None = None
+        act_device = getattr(adapter, "device", None)
+        if act_device is None and torch.cuda.is_available():
+            act_device = torch.device("cuda", torch.cuda.current_device())
+        elif act_device is None:
+            act_device = torch.device("cpu")
+        use_ws_act = (
+            pp is not None
+            and spec.topology.world > 1
+            and not activation_use_tensor_dict()
+            and adapter.activation_spec(batch=1, include_hidden=False) is not None
+        )
+        if use_ws_act:
+            _warmup_activation_p2p(pp, world=spec.topology.world, rank=spec.rank, device=act_device)
         while (ctx.inflight or ctx.pending) and slot < limit:
-            slot_started = time.perf_counter()
             ctx.admit_pending(slot)
             kv.set_inflight(tuple(ctx.inflight))
             tasks = rank_work(tuple(ctx.inflight), slot, spec.rank)
             _assert_i8(tasks)
-            contexts = kv.prepare(tasks) if tasks else []
+            schedule = ctx.inflight[0].plan.schedule if ctx.inflight else None
+            contexts: list[Any] = []
             output = None
             if tasks:
+                # Consume-time wait: covers prefetch that landed many ticks earlier.
+                kv.await_task_sources(tasks)
+                contexts = kv.prepare(tasks)
                 output = adapter.forward(tasks, contexts, hidden=pending_hidden)
                 kv.publish(tasks)
+                if schedule is not None and not _tasks_need_activation_send(tasks, schedule):
+                    pending_hidden = output
+                else:
+                    pending_hidden = None
+            if kv_stream and prev_slot_for_evict is not None:
+                kv.wait_sends()
+                kv.evict(prev_slot_for_evict)
+                prev_slot_for_evict = None
             comm_handles: list[Any] = []
-            world = spec.topology.world
-            if pp is not None and world > 1:
-                last_rank = world - 1
-                # S=1: last→0 is latent feedback for the next denoise step.
-                # S=T+1: the next step lives on the next ranks; rank 0 starts new chunks.
-                if spec.topology.stages == 1 and rank_work(tuple(ctx.inflight), slot, last_rank):
-                    if output is not None and spec.rank == last_rank:
-                        comm_handles.extend(pp.isend_tensor_dict(adapter.pack_activation(output), dst=0))
-                    elif spec.rank == 0:
-                        recv, recv_handles, _ = pp.irecv_tensor_dict(src=last_rank)
-                        comm_handles.extend(recv_handles)
-                        pending_hidden = adapter.unpack_activation(recv)
-                for src in range(last_rank):
-                    dst = src + 1
-                    if not rank_work(tuple(ctx.inflight), slot, src):
-                        continue
-                    if spec.rank == src and output is not None:
-                        comm_handles.extend(pp.isend_tensor_dict(adapter.pack_activation(output), dst=dst))
-                    elif spec.rank == dst:
-                        recv, recv_handles, _ = pp.irecv_tensor_dict(src=src)
-                        comm_handles.extend(recv_handles)
-                        pending_hidden = adapter.unpack_activation(recv)
-            comm_handles.extend(kv.exchange(slot))
-            # ① Outbound not left dangling: only this rank's own posted handles.
+            if pp is not None and spec.topology.world > 1 and schedule is not None:
+                edges = _activation_edges(
+                    topology=spec.topology,
+                    inflight=tuple(ctx.inflight),
+                    slot=slot,
+                    schedule=schedule,
+                )
+                if not use_ws_act:
+                    for src, dst, src_tasks in edges:
+                        if spec.rank == src and output is not None:
+                            handles = pp.isend_tensor_dict(adapter.pack_activation(output), dst=dst)
+                            comm_handles.extend(handles)
+                        elif spec.rank == dst:
+                            recv, recv_handles, _ = pp.irecv_tensor_dict(src=src)
+                            comm_handles.extend(recv_handles)
+                            adapter.stash_activation(
+                                recv,
+                                meta=_consumer_stash_meta(
+                                    src_tasks, topology=spec.topology, src=src
+                                ),
+                            )
+                elif edges:
+                    _post_activations_ws(
+                        pp,
+                        edges,
+                        rank=spec.rank,
+                        output=output,
+                        adapter=adapter,
+                        topology=spec.topology,
+                        device=act_device,
+                    )
+            kv_handles = kv.exchange(slot)
+            if not kv_stream:
+                comm_handles.extend(kv_handles)
+            # Outbound KV (+ legacy act). Fixed-shape act already waited in _post_activations_ws.
             _wait(comm_handles)
             still = []
             for item in ctx.inflight:
@@ -264,21 +411,18 @@ def run_chunk_pipeline(
                     kv.end_request(item.req)
             ctx.inflight = still
             kv.set_inflight(tuple(ctx.inflight))
-            # ② Next slot's sources: wait only the inbound versions slot+1 reads.
-            kv.evict(slot)
+            # End-of-slot wait for remotes first consumed at slot+1 (plan wait_ready).
             kv.await_ready(slot)
-            if spec.rank == 0 and tasks:
-                # Active slots only — idle bubbles would dominate SERIAL medians.
-                _cuda_sync()
-                _record_slot(time.perf_counter() - slot_started)
+            if kv_stream:
+                prev_slot_for_evict = slot
+            else:
+                kv.evict(slot)
             slot += 1
-        # Teardown: land anything the narrowed waits skipped.
+        if kv_stream and prev_slot_for_evict is not None:
+            kv.wait_sends()
+            kv.evict(prev_slot_for_evict)
         kv.drain()
-        if spec.rank == 0:
-            _cuda_sync()
-            _record_pipeline(time.perf_counter() - pipeline_started)
     except Exception:
-        # Fail-closed: release VersionPool slots so later requests are not stranded.
         for req in {item.req for item in ctx.inflight} | {item.req for item in ctx.pending}:
             ctx.drop(req)
         raise
