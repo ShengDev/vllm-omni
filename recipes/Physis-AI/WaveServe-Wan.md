@@ -119,7 +119,7 @@ python benchmarks/noisy_pp/waveserve_serial_vs_latest.py \
 # S=1 serial (single GPU)
 python benchmarks/noisy_pp/waveserve_serial_vs_latest.py \
   --model /data/models/waveserve-wan2.1-1.3b-diffusers-rf-dev \
-  --world-size 1 --denoise-steps 1 \
+  --world-size 1 --denoise-steps 4 \
   --chunks 1 --history 2 --repeat 1 --regimes serial
 
 # S=2 (T=1 denoise + clean), two GPUs
