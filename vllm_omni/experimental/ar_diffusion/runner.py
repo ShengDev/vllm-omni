@@ -221,8 +221,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             )
         if isinstance(self.pipeline, SupportsARDiffusionChunkPipeline):
             # Dual-path pipelines (e.g. DreamZero) opt into Noisy PP via
-            # ``ar_diffusion_use_chunk_pipeline``. Chunk-only pipelines
-            # (WaveServe) have no session capability and always use NoisyKV.
+            # ``ar_diffusion_use_chunk_pipeline``. Chunk-only pipelines have no
+            # session capability and always use NoisyKV.
             use_chunk = getattr(self.pipeline, "ar_diffusion_use_chunk_pipeline", None)
             if use_chunk is None:
                 use_chunk = not isinstance(self.pipeline, SupportsARDiffusionPipeline)

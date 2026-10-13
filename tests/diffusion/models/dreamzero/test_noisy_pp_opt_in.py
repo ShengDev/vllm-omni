@@ -86,7 +86,7 @@ def test_runner_chunk_selection_logic_dual_path():
     assert use_chunk is True
 
 
-def test_runner_chunk_selection_logic_waveserve_like():
+def test_runner_chunk_selection_logic_chunk_only():
     class ChunkOnly:
         def ar_diffusion_noisy_kv_spec(self):
             raise NotImplementedError
