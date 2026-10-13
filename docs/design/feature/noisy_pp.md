@@ -155,7 +155,7 @@ CPU: `tests/diffusion/ar_diffusion/test_chunk_{schedule,executor}.py`,
 `test_noisy_kv*.py`, model/config resolve tests under the same tree.
 
 GPU (record config): `S=1` serial; `S=2` (`T=1`); `S=T+1` Serial vs Latest
-(`benchmarks/noisy_pp/`).
+(DreamZero opt-in: `deploy/dreamzero_noisy_pp.yaml`).
 
 ## Open issues
 
