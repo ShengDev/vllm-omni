@@ -60,11 +60,22 @@ from vllm_omni.diffusion.offloader.config import (
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.models.dreamzero.chunk_noisy_pp import DreamZeroNoisyChunkAdapter
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
 )
+from vllm_omni.experimental.ar_diffusion.chunk_executor import (
+    ARDiffusionChunkContext,
+    run_chunk_pipeline,
+)
+from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
+    ChunkSchedule,
+    Ordering,
+    build_chunk_plan,
+)
+from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
 from vllm_omni.experimental.world_models.adapters.state_dreamzero_adapter import DreamZeroStateAdapter
 from vllm_omni.experimental.world_models.session_state import (
     SessionStateManager,
@@ -84,6 +95,32 @@ DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION = 603 * 1024 * 1024
 # The adapter mirrors ``DreamZeroState``'s surface, so every helper that reads or
 # writes session state accepts either.
 DreamZeroSessionState = DreamZeroState | DreamZeroStateAdapter
+
+
+def _resolve_enable_noisy_pp(od_config: OmniDiffusionConfig) -> bool:
+    """Deploy / model_config opt-in for DreamZero Chunk Noisy PP (default off)."""
+    stage = getattr(od_config, "ar_diffusion_stage_config", None)
+    if isinstance(stage, dict) and "enable_noisy_pp" in stage:
+        return bool(stage["enable_noisy_pp"])
+    model_config = getattr(od_config, "model_config", None) or {}
+    if isinstance(model_config, dict):
+        if "enable_noisy_pp" in model_config:
+            return bool(model_config["enable_noisy_pp"])
+        nested = model_config.get("ar_diffusion_stage_config")
+        if isinstance(nested, dict) and "enable_noisy_pp" in nested:
+            return bool(nested["enable_noisy_pp"])
+    return False
+
+
+def _stage_config_dict(od_config: OmniDiffusionConfig) -> dict:
+    stage = getattr(od_config, "ar_diffusion_stage_config", None)
+    out: dict = dict(stage) if isinstance(stage, dict) else {}
+    model_config = getattr(od_config, "model_config", None) or {}
+    if isinstance(model_config, dict):
+        nested = model_config.get("ar_diffusion_stage_config")
+        if isinstance(nested, dict):
+            out = {**out, **nested}
+    return out
 
 
 class VideoActionScheduler:
@@ -122,8 +159,13 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     Multi-output: predict_noise() returns (video_pred, action_pred).
     CFG: video gets standard CFG, action takes the positive KV branch only.
 
-    KV is managed by the AR-Diffusion engine through the explicit capability
-    methods below. The runner binds one session state only for ``forward()``.
+    Two AR-Diffusion paths (mutually exclusive at runner prealloc time):
+
+    * **Legacy Session** (default): paged-session KV via
+      ``ar_diffusion_kv_cache_spec`` / ``bind_ar_diffusion_state``.
+    * **Chunk Noisy PP** (opt-in ``enable_noisy_pp``): NoisyKV +
+      ``run_chunk_pipeline`` via ``ar_diffusion_noisy_kv_spec`` /
+      ``bind_ar_diffusion_chunk_context``.
     """
 
     # Generic warmup cannot synthesize robot observations. AR-Diffusion uses
@@ -134,6 +176,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     _NEGATIVE_BRANCH = "negative"
     _ar_diffusion_kv_state = None
     state: DreamZeroSessionState | None
+
+    @property
+    def ar_diffusion_use_chunk_pipeline(self) -> bool:
+        """Runner selects Noisy PP iff this is True (DreamZero default: False)."""
+        return bool(getattr(self, "_enable_noisy_pp", False))
 
     def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
         """Describe DreamZero's local KV geometry to the generic runner."""
@@ -184,6 +231,30 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     def close_ar_diffusion_session(self, session_id: str) -> None:
         """Drop DreamZero-owned state after close, eviction, or failed forward."""
         self._drop_ar_diffusion_session_state(session_id)
+
+    def ar_diffusion_noisy_kv_spec(self) -> ARDiffusionNoisyKVSpec:
+        """NoisyKV geometry for the opt-in Chunk Serial/Latest path."""
+        transformer = self.transformer
+        frame_tokens = int(transformer.frame_seqlen)
+        chunk_tokens = frame_tokens * int(transformer.num_frame_per_block)
+        return ARDiffusionNoisyKVSpec(
+            num_layers=int(transformer.num_layers),
+            num_kv_heads=int(transformer.blocks[0].self_attn.tp_num_heads),
+            head_size=int(transformer.dim // transformer.num_heads),
+            block_size=chunk_tokens,
+            max_chunk_tokens=chunk_tokens,
+            max_history_chunks=max(1, int(getattr(self, "max_history_chunks", 6) or 6)),
+        )
+
+    @contextmanager
+    def bind_ar_diffusion_chunk_context(self, ctx: ARDiffusionChunkContext):
+        """Bind Noisy PP chunk context for one runner invocation."""
+        prev = getattr(self, "_chunk_ctx", None)
+        self._chunk_ctx = ctx
+        try:
+            yield
+        finally:
+            self._chunk_ctx = prev
 
     def _drop_ar_diffusion_session_state(self, session_id: str) -> None:
         """Remove model state and clear the compatibility alias when it points there."""
@@ -462,6 +533,28 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         transformer_kwargs["max_state_dim"] = ah_config["max_state_dim"]
         transformer_kwargs["num_frame_per_block"] = ah_config["num_frame_per_block"]
         self.transformer = CausalWanModel(**transformer_kwargs)
+
+        # Opt-in Chunk / Noisy PP (coexists with Legacy Session; runner picks one).
+        stage_cfg = _stage_config_dict(od_config)
+        self._enable_noisy_pp = _resolve_enable_noisy_pp(od_config)
+        self.stage_parallel_size = int(stage_cfg.get("stage_parallel_size", 1) or 1)
+        pp_world = int(getattr(getattr(od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
+        self.layer_groups = max(1, pp_world // max(1, self.stage_parallel_size))
+        self.max_history_chunks = int(stage_cfg.get("max_history_chunks", 6) or 6)
+        self._chunk_ctx: ARDiffusionChunkContext | None = None
+        if self._enable_noisy_pp:
+            if self.layer_groups != 1:
+                raise ValueError(
+                    "DreamZero Noisy PP MVP requires layer_groups G=1 "
+                    f"(pipeline_parallel_size == stage_parallel_size); got G={self.layer_groups}"
+                )
+            logger.info(
+                "DreamZero Noisy PP enabled: S=%d G=%d layers=%d H=%d (Legacy Session disabled for this deploy)",
+                self.stage_parallel_size,
+                self.layer_groups,
+                self.transformer.num_layers,
+                self.max_history_chunks,
+            )
 
         self.scheduler = FlowUniPCMultistepScheduler(
             num_train_timesteps=1000,
@@ -1365,9 +1458,193 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         transform = get_transform(embodiment)
         return transform, transform.transform_input(robot_obs)
 
+    def _noisy_pp_plan(self, extra_args: dict, *, denoise_steps: int):
+        chunks = int(extra_args.get("num_chunks", extra_args.get("chunks", 1)))
+        history = int(extra_args.get("kv_history_chunks", 0) or 0)
+        if self.stage_parallel_size > 1 and history < 1:
+            history = self.max_history_chunks
+        schedule_name = str(extra_args.get("chunk_schedule", "serial")).strip().lower()
+        if schedule_name in ("", "serial"):
+            ordering = Ordering.SERIAL
+        elif schedule_name == "latest":
+            ordering = Ordering.INTERLEAVED
+        else:
+            raise ValueError(f"chunk_schedule must be 'serial' or 'latest', got {schedule_name!r}")
+        stages = self.stage_parallel_size
+        if stages not in (1, denoise_steps + 1):
+            raise ValueError(
+                f"DreamZero Noisy PP requires stage_parallel_size=1 or "
+                f"num_denoise_steps+1={denoise_steps + 1}, got {stages}"
+            )
+        num_blocks = int(self.transformer.num_layers)
+        schedule = ChunkSchedule(
+            chunks=chunks,
+            num_denoise_steps=denoise_steps,
+            stages=stages,
+            layer_groups=self.layer_groups,
+            ordering=ordering,
+            kv_history_chunks=history,
+            blocks=num_blocks,
+            blocks_per_rank=num_blocks if self.layer_groups == 1 else None,
+        )
+        return build_chunk_plan(schedule)
+
+    @torch.no_grad()
+    def _forward_noisy_pp(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:
+        """Chunk Serial/Latest path (NoisyKV). Video denoise only; actions are zeros."""
+        del kwargs
+        ctx = self._chunk_ctx
+        if ctx is None:
+            raise RuntimeError("DreamZero Noisy PP requires bind_ar_diffusion_chunk_context")
+        extra_args = req.sampling_params.extra_args or {}
+        robot_obs = extra_args.get("robot_obs")
+        if robot_obs is None:
+            raise KeyError("robot_obs")
+        session_id = str(extra_args.get("session_id") or "default")
+        state = self._get_or_create_state(session_id)
+        self.state = state
+        transform, unified_obs = self._transform_robot_obs(robot_obs)
+        device = get_local_device()
+
+        prompt_str = unified_obs["prompt"]
+        stitched = unified_obs["images"]
+        if not isinstance(stitched, np.ndarray):
+            stitched = np.asarray(stitched)
+        embodiment_name = unified_obs["embodiment_name"]
+
+        text_inputs = self.tokenizer(
+            prompt_str,
+            max_length=512,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+            add_special_tokens=True,
+        )
+        text_tokens = text_inputs["input_ids"].to(device)
+        attention_mask = text_inputs["attention_mask"].to(device)
+        reset_reason = state.reset_reason(text_tokens, 0, self.transformer.local_attn_size)
+        if reset_reason in ("session", "inference"):
+            # Noisy PP does not use session KV; only clear model-owned buffers.
+            state.reset(clear_video_latents=(reset_reason == "session"))
+        state.language = text_tokens
+
+        video_frames = state.accumulate_frames(stitched)
+        videos = torch.from_numpy(video_frames).unsqueeze(0).to(device)
+        videos = self._preprocess_video(videos)
+        _, _, num_frames_raw, height, width = videos.shape
+
+        if state.prompt_embeds is None:
+            state.prompt_embeds = self._encode_text(text_tokens, attention_mask)
+        prompt_embeds = state.prompt_embeds
+
+        if num_frames_raw == 4 or num_frames_raw == 9:
+            image = videos[:, :, -1:].transpose(1, 2)
+        else:
+            image = videos[:, :, :1].transpose(1, 2)
+
+        if state.current_start_frame == 0:
+            clip_feas, ys, image = self._encode_image(
+                image,
+                self.num_frames,
+                height,
+                width,
+                state=state,
+            )
+            state.clip_feas = clip_feas.to(dtype=image.dtype)
+            state.ys = ys.to(dtype=image.dtype)
+        if state.current_start_frame != 0:
+            latent_dtype = videos.dtype
+            with torch.no_grad():
+                image = self._encode_observation_latents(state, videos, latent_dtype=latent_dtype)
+
+        batch_size = image.shape[0]
+        generator = torch.Generator(device=device).manual_seed(self.seed)
+        noise_obs = torch.randn(
+            batch_size,
+            16,
+            self.num_frame_per_block,
+            height // 8,
+            width // 8,
+            device=device,
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        # DiT / Noisy adapter use B,C,T,H,W.
+        latent_shape = tuple(int(x) for x in noise_obs.shape)
+        chunk_tokens = int(self.transformer.frame_seqlen) * int(self.num_frame_per_block)
+        spec = ctx.kv.cache.spec
+        if chunk_tokens != spec.max_chunk_tokens:
+            raise ValueError(
+                f"DreamZero chunk token count {chunk_tokens} does not match NoisyKV "
+                f"max_chunk_tokens={spec.max_chunk_tokens}"
+            )
+
+        denoise = int(extra_args.get("num_denoise_steps") or extra_args.get("num_inference_steps") or self.num_inference_steps)
+        if denoise < 1:
+            raise ValueError(f"num_denoise_steps must be positive, got {denoise}")
+        plan = self._noisy_pp_plan(extra_args, denoise_steps=denoise)
+        req_id = str(getattr(req, "request_id", None) or extra_args.get("request_id") or session_id)
+        ctx.enqueue(req_id, plan, chunk_tokens=chunk_tokens)
+
+        sample_scheduler = copy.deepcopy(self.scheduler)
+        sample_scheduler.set_timesteps(denoise, device=device, shift=self.sigma_shift)
+
+        csf = state.current_start_frame
+        ys = state.ys
+        if ys is None:
+            raise RuntimeError("DreamZero Noisy PP requires state.ys from image encode")
+        if csf + self.num_frame_per_block <= ys.shape[2]:
+            y = ys[:, :, csf : csf + self.num_frame_per_block]
+        else:
+            y = ys[:, :, -self.num_frame_per_block :]
+
+        adapter = DreamZeroNoisyChunkAdapter(
+            self.transformer,
+            timesteps=sample_scheduler.timesteps,
+            prompt_embeds=prompt_embeds,
+            latent_shape=latent_shape,  # type: ignore[arg-type]
+            seed=self.seed,
+            device=device,
+            dtype=noise_obs.dtype,
+            video_scheduler=sample_scheduler,
+            current_start_frame=max(0, int(csf)),
+            y=y,
+            clip_feature=state.clip_feas,
+        )
+        # Seed chunk-0 live noise so the first cell does not re-draw.
+        adapter._live[req_id] = {0: noise_obs}
+        run_chunk_pipeline(ctx=ctx, adapter=adapter)
+
+        chunk_map = adapter.finished.get(req_id, {})
+        if not chunk_map:
+            raise RuntimeError("DreamZero Noisy PP finished without latents")
+        # Adapter latents are B,C,T,H,W; legacy diffuse uses B,T,C for append.
+        video_bct = torch.cat([chunk_map[c] for c in sorted(chunk_map)], dim=2)
+        video_btc = video_bct.transpose(1, 2)
+        if state.current_start_frame == 0:
+            state.current_start_frame = 1
+        state.current_start_frame += self.num_frame_per_block
+        state.append_video_latents(video_btc)
+
+        logger.warning(
+            "DreamZero Noisy PP MVP returns zero actions (video cell path only); "
+            "use enable_noisy_pp=false for full Legacy Session action policy."
+        )
+        actions_np = np.zeros((self.action_horizon, self.max_action_dim), dtype=np.float32)
+        actions_np = transform.transform_action_output(actions_np)
+        return DiffusionOutput(
+            output={
+                "actions": actions_np,
+                # Same as legacy: B,C,T after transpose from denoise B,T,C.
+                "video": video_btc.transpose(1, 2).cpu(),
+            },
+        )
+
     @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:
         """Full inference step. Called by DiffusionEngine.step_streaming()."""
+        if self.ar_diffusion_use_chunk_pipeline:
+            return self._forward_noisy_pp(req, **kwargs)
         extra_args = req.sampling_params.extra_args or {}
         robot_obs = extra_args.get("robot_obs")
         if robot_obs is None:

@@ -220,8 +220,15 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 "step_execution=True would bypass per-request AR session binding."
             )
         if isinstance(self.pipeline, SupportsARDiffusionChunkPipeline):
-            self._preallocate_noisy_kv(self.pipeline, available_bytes=available_bytes)
-            return
+            # Dual-path pipelines (e.g. DreamZero) opt into Noisy PP via
+            # ``ar_diffusion_use_chunk_pipeline``. Chunk-only pipelines
+            # (WaveServe) have no session capability and always use NoisyKV.
+            use_chunk = getattr(self.pipeline, "ar_diffusion_use_chunk_pipeline", None)
+            if use_chunk is None:
+                use_chunk = not isinstance(self.pipeline, SupportsARDiffusionPipeline)
+            if use_chunk:
+                self._preallocate_noisy_kv(self.pipeline, available_bytes=available_bytes)
+                return
         max_num_seqs = int(getattr(self.od_config, "max_num_seqs", 1) or 1)
         if max_num_seqs > 1:
             raise ValueError(

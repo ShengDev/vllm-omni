@@ -1,0 +1,49 @@
+# DreamZero opt-in Noisy PP (Serial / Latest-KV).
+#
+# Coexists with the default Legacy Session deploy (`dreamzero.yaml`):
+# set ``enable_noisy_pp: true`` to select Chunk / NoisyKV instead of
+# paged-session KV. Same ``DreamZeroPipeline`` + ``ARDiffusionEngine``.
+#
+# Prefer S=1 (layer PP via G = pipeline_parallel_size). Vertical S=T+1 is
+# optional but heavy for 14B. Request ``extra_args.chunk_schedule``:
+# serial | latest.
+#
+# MVP: video cell denoise only (actions returned as zeros). Use
+# ``dreamzero.yaml`` for full robot action policy.
+# Design: docs/design/feature/noisy_pp.md
+
+pipeline: dreamzero
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: DreamZeroPipeline
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    parallel_config:
+      pipeline_parallel_size: 1
+    default_sampling_params:
+      extra_args:
+        num_chunks: 1
+        chunk_schedule: serial
+        kv_history_chunks: 2
+        reset: true
+    model_config:
+      enable_noisy_pp: true
+      default_robot_embodiment: roboarena
+      ar_diffusion_stage_config:
+        enable_noisy_pp: true
+        stage_parallel_size: 1
+        max_batch_size: 1
+        max_history_chunks: 2
+      policy_server_config:
+        image_resolution: [180, 320]
+        n_external_cameras: 2
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: true
+        action_space: joint_position
