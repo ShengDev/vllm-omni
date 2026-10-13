@@ -4,9 +4,9 @@
 # set ``enable_noisy_pp: true`` to select Chunk / NoisyKV instead of
 # paged-session KV. Same ``DreamZeroPipeline`` + ``ARDiffusionEngine``.
 #
-# Prefer S=1 (layer PP via G = pipeline_parallel_size). Vertical S=T+1 is
-# optional but heavy for 14B. Request ``extra_args.chunk_schedule``:
-# serial | latest.
+# Vertical topology for T=4 denoise: S=T+1=5, G=1 → pipeline_parallel_size=5.
+# (S∈{1,T+1}; S=1 is also valid but not this recipe.)
+# Request ``extra_args.chunk_schedule``: serial | latest.
 #
 # MVP: video cell denoise only (actions returned as zeros). Use
 # ``dreamzero.yaml`` for full robot action policy.
@@ -19,25 +19,27 @@ dtype: bfloat16
 
 stages:
   - stage_id: 0
-    devices: "0"
+    devices: "0,1,2,3,4"
     max_num_seqs: 1
     enforce_eager: true
     model_class_name: DreamZeroPipeline
     engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
     parallel_config:
-      pipeline_parallel_size: 1
+      pipeline_parallel_size: 5
     default_sampling_params:
       extra_args:
         num_chunks: 1
+        num_denoise_steps: 4
         chunk_schedule: serial
         kv_history_chunks: 2
         reset: true
     model_config:
       enable_noisy_pp: true
+      num_inference_steps: 4
       default_robot_embodiment: roboarena
       ar_diffusion_stage_config:
         enable_noisy_pp: true
-        stage_parallel_size: 1
+        stage_parallel_size: 5
         max_batch_size: 1
         max_history_chunks: 2
       policy_server_config:
