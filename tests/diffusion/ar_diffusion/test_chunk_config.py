@@ -11,6 +11,7 @@ import pytest
 from vllm_omni.experimental.ar_diffusion.chunk_config import (
     build_plan_from_extra_args,
     parse_chunk_ordering,
+    resolve_enable_noisy_kv,
     resolve_enable_noisy_pp,
     resolve_stage_config,
 )
@@ -19,24 +20,42 @@ from vllm_omni.experimental.ar_diffusion.chunk_schedule import Ordering
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_resolve_enable_noisy_pp_defaults_off():
+def test_resolve_enable_noisy_kv_defaults_off():
     od = SimpleNamespace(ar_diffusion_stage_config=None, model_config={})
+    assert resolve_enable_noisy_kv(od) is False
     assert resolve_enable_noisy_pp(od) is False
 
 
-def test_resolve_enable_noisy_pp_sources():
-    assert resolve_enable_noisy_pp(
+def test_resolve_enable_noisy_kv_preferred_key():
+    assert resolve_enable_noisy_kv(
+        SimpleNamespace(ar_diffusion_stage_config={"enable_noisy_kv": True}, model_config={})
+    )
+    assert resolve_enable_noisy_kv(
+        SimpleNamespace(ar_diffusion_stage_config=None, model_config={"enable_noisy_kv": True})
+    )
+    assert resolve_enable_noisy_kv(
+        SimpleNamespace(
+            ar_diffusion_stage_config=None,
+            model_config={"ar_diffusion_stage_config": {"enable_noisy_kv": True}},
+        )
+    )
+
+
+def test_resolve_enable_noisy_kv_legacy_alias():
+    assert resolve_enable_noisy_kv(
         SimpleNamespace(ar_diffusion_stage_config={"enable_noisy_pp": True}, model_config={})
     )
     assert resolve_enable_noisy_pp(
         SimpleNamespace(ar_diffusion_stage_config=None, model_config={"enable_noisy_pp": True})
     )
-    assert resolve_enable_noisy_pp(
-        SimpleNamespace(
-            ar_diffusion_stage_config=None,
-            model_config={"ar_diffusion_stage_config": {"enable_noisy_pp": True}},
-        )
+
+
+def test_enable_noisy_kv_wins_over_legacy_alias():
+    od = SimpleNamespace(
+        ar_diffusion_stage_config={"enable_noisy_kv": False, "enable_noisy_pp": True},
+        model_config={},
     )
+    assert resolve_enable_noisy_kv(od) is False
 
 
 def test_resolve_stage_config_merges_nested():

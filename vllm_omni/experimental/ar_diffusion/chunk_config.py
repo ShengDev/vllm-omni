@@ -27,23 +27,43 @@ def resolve_stage_config(od_config: Any) -> dict:
     return out
 
 
-def resolve_enable_noisy_pp(od_config: Any) -> bool:
-    """Opt-in flag for Chunk Noisy PP (default off).
+def _read_noisy_kv_flag(mapping: Mapping[str, Any] | None) -> bool | None:
+    """Return explicit flag value if present; ``enable_noisy_kv`` wins over legacy alias."""
+    if not isinstance(mapping, dict):
+        return None
+    if "enable_noisy_kv" in mapping:
+        return bool(mapping["enable_noisy_kv"])
+    if "enable_noisy_pp" in mapping:
+        return bool(mapping["enable_noisy_pp"])
+    return None
 
-    Checks ``ar_diffusion_stage_config.enable_noisy_pp``, then top-level
-    ``model_config.enable_noisy_pp``, then nested stage config under model_config.
+
+def resolve_enable_noisy_kv(od_config: Any) -> bool:
+    """Opt-in for the NoisyKV / Chunk path (default off).
+
+    Preferred key: ``enable_noisy_kv``. Legacy alias ``enable_noisy_pp`` is still
+    accepted. Lookup order: ``ar_diffusion_stage_config``, top-level
+    ``model_config``, then nested ``model_config.ar_diffusion_stage_config``.
     """
     stage = getattr(od_config, "ar_diffusion_stage_config", None)
-    if isinstance(stage, dict) and "enable_noisy_pp" in stage:
-        return bool(stage["enable_noisy_pp"])
+    hit = _read_noisy_kv_flag(stage if isinstance(stage, dict) else None)
+    if hit is not None:
+        return hit
     model_config = getattr(od_config, "model_config", None) or {}
     if isinstance(model_config, dict):
-        if "enable_noisy_pp" in model_config:
-            return bool(model_config["enable_noisy_pp"])
+        hit = _read_noisy_kv_flag(model_config)
+        if hit is not None:
+            return hit
         nested = model_config.get("ar_diffusion_stage_config")
-        if isinstance(nested, dict) and "enable_noisy_pp" in nested:
-            return bool(nested["enable_noisy_pp"])
+        hit = _read_noisy_kv_flag(nested if isinstance(nested, dict) else None)
+        if hit is not None:
+            return hit
     return False
+
+
+def resolve_enable_noisy_pp(od_config: Any) -> bool:
+    """Alias of :func:`resolve_enable_noisy_kv` (legacy name)."""
+    return resolve_enable_noisy_kv(od_config)
 
 
 def parse_chunk_ordering(name: Any) -> Ordering:

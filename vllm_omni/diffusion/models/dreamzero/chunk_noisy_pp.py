@@ -3,8 +3,9 @@
 """DreamZero DiT cell adapter for opt-in Noisy PP.
 
 Default DreamZero stays on the Legacy Session path. When
-``enable_noisy_pp=True``, the pipeline binds this adapter and runs
-``run_chunk_pipeline`` with NoisyKV instead of paged-session KV.
+``enable_noisy_kv=True`` (legacy alias ``enable_noisy_pp``), the pipeline
+binds this adapter and runs ``run_chunk_pipeline`` with NoisyKV instead of
+paged-session KV.
 
 MVP scope: video DiT cells + UniPC step advance. Action registers / CFG are
 disabled on this path (zeros / positive-only); full parity is follow-up work.

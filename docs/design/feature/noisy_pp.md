@@ -146,9 +146,10 @@ Backend: `ARDiffusionEngine` + mp executor from deploy YAML. For `S > 1`,
 `S = num_denoise_steps + 1`.
 
 DreamZero coexistence: default `deploy/dreamzero.yaml` stays on Legacy
-Session. Set `enable_noisy_pp: true` (see `deploy/dreamzero_noisy_pp.yaml`)
-so the same `DreamZeroPipeline` exposes NoisyKV + `run_chunk_pipeline`;
-the runner selects via `ar_diffusion_use_chunk_pipeline`.
+Session. Set `enable_noisy_kv: true` (see `deploy/dreamzero_noisy_pp.yaml`;
+legacy alias `enable_noisy_pp`) so the same `DreamZeroPipeline` exposes
+NoisyKV + `run_chunk_pipeline`; the runner selects via
+`ar_diffusion_use_chunk_pipeline`.
 
 ## Testing
 

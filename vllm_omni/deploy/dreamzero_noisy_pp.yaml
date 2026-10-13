@@ -1,8 +1,9 @@
 # DreamZero opt-in Noisy PP (Serial / Latest-KV).
 #
 # Coexists with the default Legacy Session deploy (`dreamzero.yaml`):
-# set ``enable_noisy_pp: true`` to select Chunk / NoisyKV instead of
-# paged-session KV. Same ``DreamZeroPipeline`` + ``ARDiffusionEngine``.
+# set ``enable_noisy_kv: true`` to select Chunk / NoisyKV instead of
+# paged-session KV (legacy alias: ``enable_noisy_pp``).
+# Same ``DreamZeroPipeline`` + ``ARDiffusionEngine``.
 #
 # Vertical topology for T=4 denoise: S=T+1=5, G=1 → pipeline_parallel_size=5.
 # (S∈{1,T+1}; S=1 is also valid but not this recipe.)
@@ -34,11 +35,11 @@ stages:
         kv_history_chunks: 2
         reset: true
     model_config:
-      enable_noisy_pp: true
+      enable_noisy_kv: true
       num_inference_steps: 4
       default_robot_embodiment: roboarena
       ar_diffusion_stage_config:
-        enable_noisy_pp: true
+        enable_noisy_kv: true
         stage_parallel_size: 5
         max_batch_size: 1
         max_history_chunks: 2

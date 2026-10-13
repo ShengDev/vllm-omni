@@ -68,6 +68,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
 )
 from vllm_omni.experimental.ar_diffusion.chunk_config import (
     build_plan_from_extra_args,
+    resolve_enable_noisy_kv,
     resolve_enable_noisy_pp,
     resolve_stage_config,
 )
@@ -99,6 +100,7 @@ DreamZeroSessionState = DreamZeroState | DreamZeroStateAdapter
 
 
 # Re-export for older call sites / tests.
+_resolve_enable_noisy_kv = resolve_enable_noisy_kv
 _resolve_enable_noisy_pp = resolve_enable_noisy_pp
 _stage_config_dict = resolve_stage_config
 
@@ -143,9 +145,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     * **Legacy Session** (default): paged-session KV via
       ``ar_diffusion_kv_cache_spec`` / ``bind_ar_diffusion_state``.
-    * **Chunk Noisy PP** (opt-in ``enable_noisy_pp``): NoisyKV +
-      ``run_chunk_pipeline`` via ``ar_diffusion_noisy_kv_spec`` /
-      ``bind_ar_diffusion_chunk_context``.
+    * **Chunk Noisy PP** (opt-in ``enable_noisy_kv``; legacy alias
+      ``enable_noisy_pp``): NoisyKV + ``run_chunk_pipeline`` via
+      ``ar_diffusion_noisy_kv_spec`` / ``bind_ar_diffusion_chunk_context``.
     """
 
     # Generic warmup cannot synthesize robot observations. AR-Diffusion uses
@@ -159,8 +161,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     @property
     def ar_diffusion_use_chunk_pipeline(self) -> bool:
-        """Runner selects Noisy PP iff this is True (DreamZero default: False)."""
-        return bool(getattr(self, "_enable_noisy_pp", False))
+        """Runner selects NoisyKV / Chunk path iff True (DreamZero default: False)."""
+        return bool(getattr(self, "_enable_noisy_kv", getattr(self, "_enable_noisy_pp", False)))
 
     def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
         """Describe DreamZero's local KV geometry to the generic runner."""
@@ -508,21 +510,22 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         transformer_kwargs["num_frame_per_block"] = ah_config["num_frame_per_block"]
         self.transformer = CausalWanModel(**transformer_kwargs)
 
-        # Opt-in Chunk / Noisy PP (coexists with Legacy Session; runner picks one).
+        # Opt-in NoisyKV / Chunk path (coexists with Legacy Session; runner picks one).
         stage_cfg = resolve_stage_config(od_config)
-        self._enable_noisy_pp = resolve_enable_noisy_pp(od_config)
+        self._enable_noisy_kv = resolve_enable_noisy_kv(od_config)
+        self._enable_noisy_pp = self._enable_noisy_kv  # legacy alias
         self.stage_parallel_size = int(stage_cfg.get("stage_parallel_size", 1) or 1)
         pp_world = int(getattr(getattr(od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
         self.layer_groups = max(1, pp_world // max(1, self.stage_parallel_size))
         self.max_history_chunks = int(stage_cfg.get("max_history_chunks", 6) or 6)
-        if self._enable_noisy_pp:
+        if self._enable_noisy_kv:
             if self.layer_groups != 1:
                 raise ValueError(
-                    "DreamZero Noisy PP MVP requires layer_groups G=1 "
+                    "DreamZero NoisyKV MVP requires layer_groups G=1 "
                     f"(pipeline_parallel_size == stage_parallel_size); got G={self.layer_groups}"
                 )
             logger.info(
-                "DreamZero Noisy PP enabled: S=%d G=%d layers=%d H=%d (Legacy Session disabled for this deploy)",
+                "DreamZero NoisyKV enabled: S=%d G=%d layers=%d H=%d (Legacy Session disabled for this deploy)",
                 self.stage_parallel_size,
                 self.layer_groups,
                 self.transformer.num_layers,
@@ -1580,7 +1583,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
         logger.warning(
             "DreamZero Noisy PP MVP returns zero actions (video cell path only); "
-            "use enable_noisy_pp=false for full Legacy Session action policy."
+            "use enable_noisy_kv=false for full Legacy Session action policy."
         )
         actions_np = np.zeros((self.action_horizon, self.max_action_dim), dtype=np.float32)
         actions_np = transform.transform_action_output(actions_np)
