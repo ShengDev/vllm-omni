@@ -119,7 +119,7 @@ python benchmarks/noisy_pp/waveserve_serial_vs_latest.py \
 # S=1 serial (single GPU)
 python benchmarks/noisy_pp/waveserve_serial_vs_latest.py \
   --model /data/models/waveserve-wan2.1-1.3b-diffusers-rf-dev \
-  --world-size 1 --denoise-steps 0 \
+  --world-size 1 --denoise-steps 4 \
   --chunks 1 --history 2 --repeat 1 --regimes serial
 
 # S=2 (T=1 denoise + clean), two GPUs
@@ -136,11 +136,9 @@ python benchmarks/noisy_pp/waveserve_serial_vs_latest.py \
 test -f outputs/omni_s5_c7.json && python -c 'import json; print(sorted(json.load(open("outputs/omni_s5_c7.json"))))'
 ```
 
-Note: `denoise-steps` must satisfy `world-size == (denoise-steps + 1) * gpus-per-stage`.
-For a pure S=1 smoke the bench currently requires `denoise-steps + 1 == world-size`;
-use a one-off deploy YAML with `pipeline_parallel_size: 1` / `stage_parallel_size: 1`
-and `num_denoise_steps: 1` if you need S=1 with T≥1 on a single card (Omni allows
-`S ∈ {1, T+1}`).
+`denoise-steps` must be positive. Use `world-size == gpus-per-stage` for `S=1`,
+or `world-size == (denoise-steps + 1) * gpus-per-stage` for `S=T+1`.
+The bench sets PP and stage count together in its generated deploy YAML.
 
 ## Notes
 
@@ -149,6 +147,9 @@ and `num_denoise_steps: 1` if you need S=1 with T≥1 on a single card (Omni all
   splits layers within each stage (`forward_latent_step` + activation pack
   `{latent[, hidden_states]}`).
 - Do **not** wrap Omni in `torchrun`; use the mp executor from deploy YAML.
+- The vLLM 0.29 IR-op schema workaround is CUDA-only. ROCm/XPU retain their
+  existing IR-op configuration, which requires `gelu_and_mul_sparse` in the
+  installed vLLM schema.
 - The test checkpoint was distilled with timestep **shift 5.0**.
 - FPS / speedup / realtime SLA are out of scope for this phase (#102).
 

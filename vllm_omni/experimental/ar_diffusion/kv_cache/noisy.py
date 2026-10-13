@@ -217,9 +217,7 @@ class NoisyLayerContext:
 
 
 def _payload_bytes(payload: dict[str, torch.Tensor]) -> int:
-    return sum(
-        tensor.numel() * tensor.element_size() for key, tensor in payload.items() if key in ("k", "v")
-    )
+    return sum(tensor.numel() * tensor.element_size() for key, tensor in payload.items() if key in ("k", "v"))
 
 
 def _wait_handles(handles: list[Any] | None) -> None:
@@ -490,9 +488,12 @@ class NoisyKVCache:
                     f"NoisyKV budget too small for one per-layer version slot: "
                     f"budget={budget} bytes_all_layers={bytes_all_layers}"
                 )
-            self.capacity = min(desired, max_by_budget)
-        else:
-            self.capacity = desired
+            if max_by_budget < desired:
+                raise RuntimeError(
+                    f"NoisyKV budget fits {max_by_budget} versions but configured schedule requires {desired}: "
+                    f"budget={budget} required_bytes={desired * bytes_all_layers}"
+                )
+        self.capacity = desired
         self.pool = VersionPool(
             capacity=self.capacity,
             chunk_blocks=chunk_blocks,
