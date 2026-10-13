@@ -65,7 +65,8 @@ ARDiffusionModelRunner
   ├─ Legacy → paged KV (DreamZero / LingBot)
   └─ Chunk  → NoisyKV + ChunkPlan
         │
-   chunk_schedule │ chunk_executor (tick loop, PP P2P)
+   chunk_config (deploy / request) │ chunk_schedule │ chunk_executor
+   BaseChunkAdapter (stash / pack) │ model DiT adapter (e.g. DreamZero)
         └────► kv_cache/noisy.py
 ```
 

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""DreamZero opt-in Noisy PP adapter (Serial / Latest cell ticks).
+"""DreamZero DiT cell adapter for opt-in Noisy PP.
 
 Default DreamZero stays on the Legacy Session path. When
 ``enable_noisy_pp=True``, the pipeline binds this adapter and runs
@@ -8,6 +8,9 @@ Default DreamZero stays on the Legacy Session path. When
 
 MVP scope: video DiT cells + UniPC step advance. Action registers / CFG are
 disabled on this path (zeros / positive-only); full parity is follow-up work.
+
+Activation stash / pack / live-latent bookkeeping live in
+``experimental.ar_diffusion.chunk_executor.BaseChunkAdapter``.
 """
 
 from __future__ import annotations
@@ -16,19 +19,15 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
-from vllm.logger import init_logger
-from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.models.dreamzero.causal_wan_model import (
     CausalWanModel,
     sinusoidal_embedding_1d,
 )
-from vllm_omni.experimental.ar_diffusion.chunk_executor import ChunkAdapter
-
-logger = init_logger(__name__)
+from vllm_omni.experimental.ar_diffusion.chunk_executor import BaseChunkAdapter
 
 
-class DreamZeroNoisyChunkAdapter(ChunkAdapter):
+class DreamZeroNoisyChunkAdapter(BaseChunkAdapter):
     """Per-cell ``embed → block → unembed`` over :class:`CausalWanModel` + NoisyKV."""
 
     def __init__(
@@ -47,6 +46,7 @@ class DreamZeroNoisyChunkAdapter(ChunkAdapter):
         clip_feature: torch.Tensor | None = None,
         on_finished: Callable[[int, torch.Tensor], None] | None = None,
     ) -> None:
+        super().__init__()
         self.transformer = transformer
         self.prompt_embeds = prompt_embeds
         self.latent_shape = latent_shape
@@ -60,11 +60,7 @@ class DreamZeroNoisyChunkAdapter(ChunkAdapter):
         self.on_finished = on_finished
         self.num_denoise_steps = int(timesteps.numel())
         self._timesteps = [timesteps[i].detach() for i in range(self.num_denoise_steps)]
-        self.finished: dict[str, dict[int, torch.Tensor]] = {}
-        self._live: dict[str, dict[int, torch.Tensor]] = {}
-        self._stash: dict[tuple[str, int, int], dict[str, torch.Tensor]] = {}
         self._cond: dict[tuple[str, int, int], dict[str, Any]] = {}
-        self._last_meta: tuple[str, int, int] | None = None
         self.num_layers = int(transformer.num_layers)
         self.dim = int(transformer.dim)
         self.patch_size = tuple(transformer.patch_size)
@@ -83,46 +79,6 @@ class DreamZeroNoisyChunkAdapter(ChunkAdapter):
         gen = torch.Generator(device=self.device)
         gen.manual_seed(self.seed * 1_000_003 + chunk * 4096)
         return torch.randn(self.latent_shape, generator=gen, device=self.device, dtype=self.dtype)
-
-    @staticmethod
-    def _slice_batch(tensor: torch.Tensor, index: int, n_tasks: int) -> torch.Tensor:
-        return tensor[index : index + 1] if tensor.shape[0] == n_tasks else tensor
-
-    def stash_activation(
-        self,
-        payload: dict,
-        *,
-        handles: list | None = None,
-        meta: tuple[str, int, int] | None = None,
-    ) -> None:
-        del handles
-        tensors = {k: v for k, v in payload.items() if isinstance(v, torch.Tensor) and k not in ("chunk", "step")}
-        key = meta or self._last_meta
-        if key is None:
-            raise RuntimeError("stash_activation needs meta")
-        self._stash[key] = tensors
-
-    def take_stashed_activation(self, req: str, chunk: int, step: int):
-        return self._stash.pop((req, chunk, step), None) or self._stash.pop(("", chunk, step), None)
-
-    def _resolve_latent_hidden(
-        self, *, req: str, chunk: int, step: int, index: int, n_tasks: int, hidden: Any, live: dict[int, torch.Tensor]
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        latent: torch.Tensor | None = None
-        tokens: torch.Tensor | None = None
-        src = hidden if isinstance(hidden, dict) else None
-        if src is None or "hidden_states" not in src:
-            src = self.take_stashed_activation(req, chunk, step)
-        if isinstance(src, dict):
-            if "latent" in src:
-                latent = self._slice_batch(src["latent"], index, n_tasks)
-            if "hidden_states" in src:
-                tokens = self._slice_batch(src["hidden_states"], index, n_tasks)
-        elif isinstance(hidden, torch.Tensor):
-            latent = self._slice_batch(hidden, index, n_tasks)
-        if latent is None:
-            latent = live.get(chunk) or self._init_noise(chunk)
-        return latent, tokens
 
     def _prepare_condition(
         self, *, req: str, chunk: int, step: int, latent: torch.Tensor
@@ -244,15 +200,6 @@ class DreamZeroNoisyChunkAdapter(ChunkAdapter):
         keys = outs[0].keys()
         return {k: torch.cat([o[k] for o in outs], dim=0) for k in keys}
 
-    def pack_activation(self, output):
-        if isinstance(output, dict):
-            return {k: v.contiguous() for k, v in output.items() if isinstance(v, torch.Tensor)}
-        if isinstance(output, IntermediateTensors):
-            return {k: v.contiguous() for k, v in output.tensors.items()}
-        if isinstance(output, torch.Tensor):
-            return {"latent": output.contiguous()}
-        raise TypeError(f"pack expects dict/tensor, got {type(output)}")
-
     def activation_spec(self, *, batch: int, include_hidden: bool):
         batch = max(1, int(batch))
         _b, c, t, h, w = self.latent_shape
@@ -262,6 +209,3 @@ class DreamZeroNoisyChunkAdapter(ChunkAdapter):
         if include_hidden:
             spec.append(("hidden_states", (batch, int(self._seq_len), int(self.dim)), self.dtype))
         return spec
-
-    def unpack_activation(self, payload: dict):
-        return payload

@@ -66,14 +66,15 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
 )
+from vllm_omni.experimental.ar_diffusion.chunk_config import (
+    build_plan_from_extra_args,
+    resolve_enable_noisy_pp,
+    resolve_stage_config,
+)
 from vllm_omni.experimental.ar_diffusion.chunk_executor import (
     ARDiffusionChunkContext,
+    bind_ar_diffusion_chunk_context as bind_chunk_context,
     run_chunk_pipeline,
-)
-from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
-    ChunkSchedule,
-    Ordering,
-    build_chunk_plan,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
 from vllm_omni.experimental.world_models.adapters.state_dreamzero_adapter import DreamZeroStateAdapter
@@ -97,30 +98,9 @@ DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION = 603 * 1024 * 1024
 DreamZeroSessionState = DreamZeroState | DreamZeroStateAdapter
 
 
-def _resolve_enable_noisy_pp(od_config: OmniDiffusionConfig) -> bool:
-    """Deploy / model_config opt-in for DreamZero Chunk Noisy PP (default off)."""
-    stage = getattr(od_config, "ar_diffusion_stage_config", None)
-    if isinstance(stage, dict) and "enable_noisy_pp" in stage:
-        return bool(stage["enable_noisy_pp"])
-    model_config = getattr(od_config, "model_config", None) or {}
-    if isinstance(model_config, dict):
-        if "enable_noisy_pp" in model_config:
-            return bool(model_config["enable_noisy_pp"])
-        nested = model_config.get("ar_diffusion_stage_config")
-        if isinstance(nested, dict) and "enable_noisy_pp" in nested:
-            return bool(nested["enable_noisy_pp"])
-    return False
-
-
-def _stage_config_dict(od_config: OmniDiffusionConfig) -> dict:
-    stage = getattr(od_config, "ar_diffusion_stage_config", None)
-    out: dict = dict(stage) if isinstance(stage, dict) else {}
-    model_config = getattr(od_config, "model_config", None) or {}
-    if isinstance(model_config, dict):
-        nested = model_config.get("ar_diffusion_stage_config")
-        if isinstance(nested, dict):
-            out = {**out, **nested}
-    return out
+# Re-export for older call sites / tests.
+_resolve_enable_noisy_pp = resolve_enable_noisy_pp
+_stage_config_dict = resolve_stage_config
 
 
 class VideoActionScheduler:
@@ -246,15 +226,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             max_history_chunks=max(1, int(getattr(self, "max_history_chunks", 6) or 6)),
         )
 
-    @contextmanager
     def bind_ar_diffusion_chunk_context(self, ctx: ARDiffusionChunkContext):
         """Bind Noisy PP chunk context for one runner invocation."""
-        prev = getattr(self, "_chunk_ctx", None)
-        self._chunk_ctx = ctx
-        try:
-            yield
-        finally:
-            self._chunk_ctx = prev
+        return bind_chunk_context(self, ctx)
 
     def _drop_ar_diffusion_session_state(self, session_id: str) -> None:
         """Remove model state and clear the compatibility alias when it points there."""
@@ -535,13 +509,12 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         self.transformer = CausalWanModel(**transformer_kwargs)
 
         # Opt-in Chunk / Noisy PP (coexists with Legacy Session; runner picks one).
-        stage_cfg = _stage_config_dict(od_config)
-        self._enable_noisy_pp = _resolve_enable_noisy_pp(od_config)
+        stage_cfg = resolve_stage_config(od_config)
+        self._enable_noisy_pp = resolve_enable_noisy_pp(od_config)
         self.stage_parallel_size = int(stage_cfg.get("stage_parallel_size", 1) or 1)
         pp_world = int(getattr(getattr(od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
         self.layer_groups = max(1, pp_world // max(1, self.stage_parallel_size))
         self.max_history_chunks = int(stage_cfg.get("max_history_chunks", 6) or 6)
-        self._chunk_ctx: ARDiffusionChunkContext | None = None
         if self._enable_noisy_pp:
             if self.layer_groups != 1:
                 raise ValueError(
@@ -1459,41 +1432,20 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         return transform, transform.transform_input(robot_obs)
 
     def _noisy_pp_plan(self, extra_args: dict, *, denoise_steps: int):
-        chunks = int(extra_args.get("num_chunks", extra_args.get("chunks", 1)))
-        history = int(extra_args.get("kv_history_chunks", 0) or 0)
-        if self.stage_parallel_size > 1 and history < 1:
-            history = self.max_history_chunks
-        schedule_name = str(extra_args.get("chunk_schedule", "serial")).strip().lower()
-        if schedule_name in ("", "serial"):
-            ordering = Ordering.SERIAL
-        elif schedule_name == "latest":
-            ordering = Ordering.INTERLEAVED
-        else:
-            raise ValueError(f"chunk_schedule must be 'serial' or 'latest', got {schedule_name!r}")
-        stages = self.stage_parallel_size
-        if stages not in (1, denoise_steps + 1):
-            raise ValueError(
-                f"DreamZero Noisy PP requires stage_parallel_size=1 or "
-                f"num_denoise_steps+1={denoise_steps + 1}, got {stages}"
-            )
-        num_blocks = int(self.transformer.num_layers)
-        schedule = ChunkSchedule(
-            chunks=chunks,
-            num_denoise_steps=denoise_steps,
-            stages=stages,
+        return build_plan_from_extra_args(
+            extra_args,
+            denoise_steps=denoise_steps,
+            stages=self.stage_parallel_size,
             layer_groups=self.layer_groups,
-            ordering=ordering,
-            kv_history_chunks=history,
-            blocks=num_blocks,
-            blocks_per_rank=num_blocks if self.layer_groups == 1 else None,
+            blocks=int(self.transformer.num_layers),
+            max_history_chunks=self.max_history_chunks,
         )
-        return build_chunk_plan(schedule)
 
     @torch.no_grad()
     def _forward_noisy_pp(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:
         """Chunk Serial/Latest path (NoisyKV). Video denoise only; actions are zeros."""
         del kwargs
-        ctx = self._chunk_ctx
+        ctx = getattr(self, "_ar_diffusion_chunk_context", None)
         if ctx is None:
             raise RuntimeError("DreamZero Noisy PP requires bind_ar_diffusion_chunk_context")
         extra_args = req.sampling_params.extra_args or {}

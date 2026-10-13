@@ -8,21 +8,19 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import (
-    DreamZeroPipeline,
-    _resolve_enable_noisy_pp,
-)
+from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import DreamZeroPipeline
 from vllm_omni.experimental.ar_diffusion.capability import (
     SupportsARDiffusionChunkPipeline,
     SupportsARDiffusionPipeline,
 )
+from vllm_omni.experimental.ar_diffusion.chunk_config import resolve_enable_noisy_pp
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_enable_noisy_pp_defaults_off():
     od = SimpleNamespace(ar_diffusion_stage_config=None, model_config={})
-    assert _resolve_enable_noisy_pp(od) is False
+    assert resolve_enable_noisy_pp(od) is False
 
 
 def test_enable_noisy_pp_from_model_config():
@@ -30,7 +28,7 @@ def test_enable_noisy_pp_from_model_config():
         ar_diffusion_stage_config=None,
         model_config={"enable_noisy_pp": True},
     )
-    assert _resolve_enable_noisy_pp(od) is True
+    assert resolve_enable_noisy_pp(od) is True
 
 
 def test_enable_noisy_pp_from_stage_config():
@@ -38,7 +36,7 @@ def test_enable_noisy_pp_from_stage_config():
         ar_diffusion_stage_config={"enable_noisy_pp": True},
         model_config={},
     )
-    assert _resolve_enable_noisy_pp(od) is True
+    assert resolve_enable_noisy_pp(od) is True
 
 
 def test_dreamzero_chunk_flag_defaults_false_without_init():

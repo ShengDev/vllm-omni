@@ -13,6 +13,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from vllm.logger import init_logger
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
     Cell,
@@ -277,6 +278,85 @@ class ChunkAdapter:
     def take_stashed_activation(self, req: str, chunk: int, step: int) -> Any | None:
         del req, chunk, step
         return None
+
+
+class BaseChunkAdapter(ChunkAdapter):
+    """Shared activation stash / pack / live-latent bookkeeping for Noisy PP.
+
+    Model adapters subclass this and implement ``forward`` (+ optional
+    ``activation_spec`` / ``_init_noise``). Latent and token tensors are carried
+    as dict payloads: ``{"latent": ..., "hidden_states": ...}``.
+    """
+
+    def __init__(self) -> None:
+        self.finished: dict[str, dict[int, torch.Tensor]] = {}
+        self._live: dict[str, dict[int, torch.Tensor]] = {}
+        self._stash: dict[tuple[str, int, int], dict[str, torch.Tensor]] = {}
+        self._last_meta: tuple[str, int, int] | None = None
+
+    @staticmethod
+    def _slice_batch(tensor: torch.Tensor, index: int, n_tasks: int) -> torch.Tensor:
+        return tensor[index : index + 1] if tensor.shape[0] == n_tasks else tensor
+
+    def stash_activation(
+        self,
+        payload: dict,
+        *,
+        handles: list | None = None,
+        meta: tuple[str, int, int] | None = None,
+    ) -> None:
+        del handles
+        tensors = {k: v for k, v in payload.items() if isinstance(v, torch.Tensor) and k not in ("chunk", "step")}
+        key = meta or self._last_meta
+        if key is None:
+            raise RuntimeError("stash_activation needs meta")
+        self._stash[key] = tensors
+
+    def take_stashed_activation(self, req: str, chunk: int, step: int):
+        return self._stash.pop((req, chunk, step), None) or self._stash.pop(("", chunk, step), None)
+
+    def pack_activation(self, output):
+        if isinstance(output, dict):
+            return {k: v.contiguous() for k, v in output.items() if isinstance(v, torch.Tensor)}
+        if isinstance(output, IntermediateTensors):
+            return {k: v.contiguous() for k, v in output.tensors.items()}
+        if isinstance(output, torch.Tensor):
+            return {"latent": output.contiguous()}
+        raise TypeError(f"pack expects dict/tensor, got {type(output)}")
+
+    def unpack_activation(self, payload: dict):
+        return payload
+
+    def _init_noise(self, chunk: int) -> torch.Tensor:
+        """Override when the adapter draws per-chunk Gaussian noise."""
+        raise NotImplementedError
+
+    def _resolve_latent_hidden(
+        self,
+        *,
+        req: str,
+        chunk: int,
+        step: int,
+        index: int,
+        n_tasks: int,
+        hidden: Any,
+        live: dict[int, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        latent: torch.Tensor | None = None
+        tokens: torch.Tensor | None = None
+        src = hidden if isinstance(hidden, dict) else None
+        if src is None or "hidden_states" not in src:
+            src = self.take_stashed_activation(req, chunk, step)
+        if isinstance(src, dict):
+            if "latent" in src:
+                latent = self._slice_batch(src["latent"], index, n_tasks)
+            if "hidden_states" in src:
+                tokens = self._slice_batch(src["hidden_states"], index, n_tasks)
+        elif isinstance(hidden, torch.Tensor):
+            latent = self._slice_batch(hidden, index, n_tasks)
+        if latent is None:
+            latent = live.get(chunk) or self._init_noise(chunk)
+        return latent, tokens
 
 
 def _wait(handles: list[Any]) -> None:
