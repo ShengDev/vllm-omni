@@ -94,7 +94,8 @@ def _execute(runner, requests, *, batch):
 def _assert_released(runner):
     cache = runner.noisy_kv_cache
     assert cache is not None
-    assert not cache.pool.keys and len(cache.pool.free) == cache.capacity
+    assert not cache.pool.keys
+    assert all(len(stack) == cache.capacity for stack in cache.pool.free)
     assert runner.pipeline._chunk_ctx is None
 
 
@@ -115,7 +116,7 @@ def test_real_waveserve_runner_success_and_failure_release_kv(waveserve_runner, 
     for output in outputs:
         assert output is not None and torch.isfinite(output.output).all()
     _assert_released(runner)
-    # 保持 token 数不变，用真实 patch_embedding 的通道错误触发 KV 分配后的失败。
+    # Keep the token count unchanged; a real patch-embedding channel error fails after KV allocation.
     before = len(runner._perf_e2e_times)
     with pytest.raises(RuntimeError):
         _execute(runner, [_request("bad", channels=1)], batch=batch)

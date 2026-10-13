@@ -266,7 +266,7 @@ class StageConfigFactory:
                     ):
                         matches.append(pipeline_cfg)
                 if matches:
-                    # 共用 Diffusers class 时复用目录名匹配；普通 Wan 保留原默认。
+                    # Disambiguate a shared Diffusers class by basename; keep the default for ordinary Wan.
                     matched_key = _match_pipeline_key(model, (cfg.model_type for cfg in matches))
                     pipeline_cfg = next((cfg for cfg in matches if cfg.model_type == matched_key), matches[0])
                     logger.info(

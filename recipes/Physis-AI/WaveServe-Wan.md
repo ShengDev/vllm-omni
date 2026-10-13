@@ -147,6 +147,9 @@ The bench sets PP and stage count together in its generated deploy YAML.
   splits layers within each stage (`forward_latent_step` + activation pack
   `{latent[, hidden_states]}`).
 - Do **not** wrap Omni in `torchrun`; use the mp executor from deploy YAML.
+- The vLLM 0.29 IR-op schema workaround is CUDA-only. ROCm/XPU retain their
+  existing IR-op configuration, which requires `gelu_and_mul_sparse` in the
+  installed vLLM schema.
 - The test checkpoint was distilled with timestep **shift 5.0**.
 - FPS / speedup / realtime SLA are out of scope for this phase (#102).
 
