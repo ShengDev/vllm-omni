@@ -578,7 +578,7 @@ class WaveServeWanPipeline(nn.Module):
             shift = float(extra.get("shift", _DEFAULT_SHIFT))
             seed = int(extra.get("seed", getattr(item.sampling_params, "seed", 0) or 0))
             chunk_tokens = self.transformer.seq_len_for_latent(shape)
-            # KV pool 在加载时定型；请求不能通过改 pipeline 字段扩容。
+            # The KV pool is fixed at load time; requests cannot resize it by changing pipeline fields.
             spec = ctx.kv.cache.spec
             if chunk_tokens != spec.max_chunk_tokens:
                 raise ValueError(

@@ -53,7 +53,7 @@ def test_capacity_uses_k1():
 
 def test_capacity_covers_latest_stage_frontier():
     cache = _cache(layer_groups=1, stages=5)
-    # H=6, S=5 的 Latest 计划在单 rank 上峰值需要 10 个 live versions。
+    # A Latest plan with H=6 and S=5 needs up to 10 live versions on one rank.
     assert cache.capacity == 11
 
 
@@ -238,7 +238,7 @@ def test_attention_reads_only_valid_version_pages(stages, chunk, chunk_tokens):
     sources = plan.sources(task, 0)
     assert len(sources) == chunk
     source_slots = [cache.pool.alloc(("A", *src.version)) for src in sources]
-    # 同一 chunk 的未选版本也驻留，读取仍只能遵守计划。
+    # Keep an unselected version of the same chunk resident; reads must still follow the plan.
     first_chunk, first_step, first_block = sources[0].version
     cache.pool.alloc(("A", first_chunk, (first_step + 1) % 3, first_block))
     contexts = state.prepare((("A", task),))[0]
@@ -273,7 +273,7 @@ def test_attention_reads_only_valid_version_pages(stages, chunk, chunk_tokens):
         actual = paged_write_attn(inputs, query, current_key, current_value, None, None, cache.spec.head_size**-0.5)
         torch.testing.assert_close(actual, expected)
 
-        # 修改预留页和未选版本后，attention 输出不应变化。
+        # Changing a reserved page or an unselected version must not change the attention output.
         context.key_pool[unused] = 50
         context.value_pool[unused] = -100
         after = paged_write_attn(inputs, query, current_key, current_value, None, None, cache.spec.head_size**-0.5)
