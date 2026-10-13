@@ -33,7 +33,7 @@ def _parse_args() -> argparse.Namespace:
         "--world-size",
         type=int,
         default=None,
-        help="Override PP (= S*G). Default: value from deploy YAML (or denoise_steps+1).",
+        help="PP (= S*G). Default: (denoise_steps+1)*G. Use world-size=G for S=1.",
     )
     parser.add_argument("--chunks", type=int, default=7)
     parser.add_argument("--denoise-steps", type=int, default=3)
@@ -60,7 +60,22 @@ def _dit_ms(output: Any) -> float | None:
     return ms if ms > 0 else None
 
 
-def _resolve_deploy(args: argparse.Namespace, world: int) -> Path:
+def _resolve_topology(args: argparse.Namespace) -> tuple[int, int, int]:
+    if args.denoise_steps < 1:
+        raise SystemExit("denoise-steps must be positive")
+    layer_groups = args.gpus_per_stage
+    if layer_groups < 1:
+        raise SystemExit("gpus-per-stage must be positive")
+    world = (args.denoise_steps + 1) * layer_groups if args.world_size is None else args.world_size
+    stages = 1 if world == layer_groups else args.denoise_steps + 1
+    if stages * layer_groups != world:
+        raise SystemExit(
+            f"world-size must be G or (T+1)*G; got T={args.denoise_steps}, G={layer_groups}, world={world}"
+        )
+    return world, stages, layer_groups
+
+
+def _resolve_deploy(args: argparse.Namespace, world: int, stages: int) -> Path:
     """Return deploy path; rewrite PP/stage size only when overriding world-size."""
     base = Path(args.deploy_config).expanduser().resolve()
     if not base.is_file():
@@ -74,11 +89,6 @@ def _resolve_deploy(args: argparse.Namespace, world: int) -> Path:
     current_s = int(
         OmegaConf.select(stage0, "model_config.ar_diffusion_stage_config.stage_parallel_size") or current_pp
     )
-    stages = args.denoise_steps + 1
-    layer_groups = args.gpus_per_stage
-    if stages * layer_groups != world:
-        raise SystemExit(f"need stages*layer_groups == world; got {stages}*{layer_groups} != {world}")
-
     current_history = int(
         OmegaConf.select(stage0, "model_config.ar_diffusion_stage_config.max_history_chunks") or args.history
     )
@@ -179,11 +189,9 @@ def _run_regime(omni: Any, args: argparse.Namespace, regime: str, stages: int, l
 
 def main() -> None:
     args = _parse_args()
-    stages = args.denoise_steps + 1
-    layer_groups = args.gpus_per_stage
-    world = args.world_size or (stages * layer_groups)
+    world, stages, layer_groups = _resolve_topology(args)
     regimes = [item.strip() for item in args.regimes.split(",") if item.strip()]
-    deploy_path = _resolve_deploy(args, world)
+    deploy_path = _resolve_deploy(args, world, stages)
 
     from vllm_omni import Omni
 
