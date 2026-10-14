@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""WaveServe model unit checks (layer split + FlowEuler + latent adapter).
-
-Omni / diffusion registry wiring lives in
-``tests/entrypoints/test_resolve_waveserve_wan_config.py``.
-"""
+"""ChunkWan / CausVid unit checks (layer split + FlowEuler + WanCell)."""
 
 from __future__ import annotations
 
@@ -13,12 +9,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.waveserve_wan.pipeline_waveserve_wan import (
-    FlowEuler,
-    WaveServeWanPipeline,
-    _LatentChunkAdapter,
-)
-from vllm_omni.diffusion.models.waveserve_wan.transformer import StageWanTransformer, stage_layer_range
+from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline
+from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer, stage_layer_range
+from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
+from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.experimental.ar_diffusion.chunk_executor import ARDiffusionChunkContext, ChunkRunSpec, ChunkTopology
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec, NoisyKVCache, NoisyKVState
@@ -53,10 +47,10 @@ def test_flow_euler_matches_diffusers_shifted_endpoint():
     assert last_delta > 0.01
 
 
-def test_waveserve_chunk_noise_matches_reference_seed():
+def test_chunk_wan_chunk_noise_matches_reference_seed():
     shape = (1, 16, 1, 2, 2)
     seed, chunk = 7, 2
-    adapter = _LatentChunkAdapter(
+    adapter = WanCell(
         SimpleNamespace(prepare_cell=lambda *_a, **_k: None),  # type: ignore[arg-type]
         sampler=FlowEuler(3, shift=5.0),
         prompt_embeds=torch.empty(1, 1, 32),
@@ -71,7 +65,7 @@ def test_waveserve_chunk_noise_matches_reference_seed():
 
 
 def test_chunk_schedule_rejects_unknown_values():
-    pipeline = WaveServeWanPipeline.__new__(WaveServeWanPipeline)
+    pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
     pipeline.stage_parallel_size = 1
     pipeline.layer_groups = 1
     pipeline.max_history_chunks = 1
@@ -88,7 +82,7 @@ def test_chunk_schedule_rejects_unknown_values():
 @pytest.mark.parametrize("source", ["num_inference_steps", "num_denoise_steps", "sampling_params"])
 @pytest.mark.parametrize("steps", [0, -1])
 def test_chunk_schedule_rejects_nonpositive_steps(source, steps):
-    pipeline = WaveServeWanPipeline.__new__(WaveServeWanPipeline)
+    pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
     pipeline.stage_parallel_size = 1
     pipeline.layer_groups = 1
     pipeline.max_history_chunks = 1
@@ -107,7 +101,7 @@ def test_chunk_schedule_rejects_nonpositive_steps(source, steps):
 
 @pytest.mark.parametrize(("stages", "expected_steps"), [(1, 4), (4, 3), (5, 4)])
 def test_chunk_schedule_unset_steps_keep_topology_default(stages, expected_steps):
-    pipeline = WaveServeWanPipeline.__new__(WaveServeWanPipeline)
+    pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
     pipeline.stage_parallel_size = stages
     pipeline.layer_groups = 1
     pipeline.max_history_chunks = 6
@@ -119,7 +113,7 @@ def test_chunk_schedule_unset_steps_keep_topology_default(stages, expected_steps
 
 @pytest.mark.parametrize("shape", [(1, 16, 1, 4, 8), (1, 16, 1, 8, 16)])
 def test_pipeline_rejects_token_count_change_before_admission(shape):
-    pipeline = WaveServeWanPipeline.__new__(WaveServeWanPipeline)
+    pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
     torch.nn.Module.__init__(pipeline)
     transformer = StageWanTransformer.__new__(StageWanTransformer)
     torch.nn.Module.__init__(transformer)
@@ -180,7 +174,7 @@ def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
             return torch.zeros_like(latent)
 
     sampler = FlowEuler(2, shift=1.0)
-    mid = _LatentChunkAdapter(
+    mid = WanCell(
         _FakeTransformer(is_stage_first=True, is_stage_last=False),  # type: ignore[arg-type]
         sampler=sampler,
         prompt_embeds=prompt,
@@ -189,7 +183,7 @@ def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
         device=device,
         dtype=dtype,
     )
-    last = _LatentChunkAdapter(
+    last = WanCell(
         _FakeTransformer(is_stage_first=False, is_stage_last=True),  # type: ignore[arg-type]
         sampler=sampler,
         prompt_embeds=prompt,

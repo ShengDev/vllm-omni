@@ -385,10 +385,15 @@ _DIFFUSION_MODELS = {
         "pipeline_anima",
         "AnimaPipeline",
     ),
-    "WaveServeWanPipeline": (
-        "waveserve_wan",
-        "pipeline_waveserve_wan",
-        "WaveServeWanPipeline",
+    "CausVidWanPipeline": (
+        "causvid_wan",
+        "pipeline_causvid_wan",
+        "CausVidWanPipeline",
+    ),
+    "ChunkWanPipeline": (
+        "causvid_wan",
+        "pipeline_causvid_wan",
+        "ChunkWanPipeline",
     ),
     "StableDiffusionXLPipeline": (
         "sdxl",
@@ -425,7 +430,8 @@ _NO_CACHE_ACCELERATION = {
     "Pi0Pipeline",
     "Pi05Pipeline",
     "LingBotWorldCausalDMDPipeline",
-    "WaveServeWanPipeline",
+    "CausVidWanPipeline",
+    "ChunkWanPipeline",
 }
 
 

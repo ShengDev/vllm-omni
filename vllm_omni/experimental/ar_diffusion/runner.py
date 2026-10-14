@@ -499,7 +499,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         scheduler_output: DiffusionSchedulerOutput,
         od_config: OmniDiffusionConfig,
     ) -> BatchRunnerOutput:
-        """Noisy PP chunk path may micro-batch requests; paged timeline KV stays single-seq."""
+        """Noisy KV chunk path may micro-batch requests; paged timeline KV stays single-seq."""
         if self.noisy_kv_cache is not None and self._ar_diffusion_chunk_capability is not None:
             ctx = self._make_chunk_context()
             try:

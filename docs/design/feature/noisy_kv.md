@@ -1,4 +1,4 @@
-# Noisy PP
+# Noisy KV
 
 > **Status:** experimental (`vllm_omni.experimental.ar_diffusion`). Not a public
 > HTTP schema.
@@ -71,7 +71,7 @@ ARDiffusionModelRunner
 
 Architecture diagrams (two stacks, call chain, KV peers, target layout) live under
 [`figs/`](figs/) and are embedded in the Chinese design note
-[`noisy_pp.zh.md`](noisy_pp.zh.md) (§2.3).
+[`noisy_kv.zh.md`](noisy_kv.zh.md) (§2.3).
 
 ### Tick loop
 
@@ -150,12 +150,12 @@ CPU: `tests/diffusion/ar_diffusion/test_chunk_{schedule,executor}.py`,
 `test_noisy_kv*.py`, model/config resolve tests under the same tree.
 
 GPU (record config): `S=1` serial; `S=2` (`T=1`); `S=T+1` Serial vs Latest
-(`benchmarks/noisy_pp/`).
+(`benchmarks/` / recipe smoke).
 
 ## Open issues
 
-- Paged session vs NoisyKV still separate prealloc; no TP × Noisy PP yet.
-- Noisy PP not wired to session.
+- Paged session vs NoisyKV still separate prealloc; no TP × Noisy KV yet.
+- Noisy KV not wired to session.
 - Micro-batch packing (`R`): varlen vs pad.
 - Cell schedule with `K>1` multiplies ticks; activation inbox is keyed by
   `(chunk, step)` (R=1 friendly).

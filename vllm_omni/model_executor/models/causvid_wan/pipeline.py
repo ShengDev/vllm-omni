@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""WaveServe Wan single-stage diffusion topology.
+"""CausVid Wan single-stage diffusion topology (Noisy KV).
 
-The diffusion implementation lives under
-``vllm_omni.diffusion.models.waveserve_wan``; this module only registers the
-Omni pipeline name and default deploy recipe, matching DreamZero / LingBot.
+Diffusion implementation: ``vllm_omni.diffusion.models.causvid_wan``.
 """
 
 from vllm_omni.config.stage_config import (
@@ -13,11 +11,11 @@ from vllm_omni.config.stage_config import (
     StagePipelineConfig,
 )
 
-WAVESERVE_WAN_PIPELINE = PipelineConfig(
-    model_type="waveserve_wan",
-    default_deploy_config_name="waveserve_wan.yaml",
-    model_arch="WaveServeWanPipeline",
-    diffusers_class_name="WaveServeWanPipeline",
+CAUSVID_WAN_PIPELINE = PipelineConfig(
+    model_type="causvid_wan",
+    default_deploy_config_name="causvid_wan.yaml",
+    model_arch="CausVidWanPipeline",
+    diffusers_class_name="CausVidWanPipeline",
     diffusers_class_aliases=("WanPipeline",),
     stages=(
         StagePipelineConfig(
@@ -27,7 +25,7 @@ WAVESERVE_WAN_PIPELINE = PipelineConfig(
             input_sources=(),
             final_output=True,
             final_output_type="video",
-            model_arch="WaveServeWanPipeline",
+            model_arch="CausVidWanPipeline",
         ),
     ),
 )

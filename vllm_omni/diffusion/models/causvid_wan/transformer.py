@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage-local Wan DiT: cell tick = ``embed`` → ``block`` → ``unembed``.
 
-Layer split uses WaveServe ``G`` via ``layer_pp_rank`` / ``layer_pp_world``.
+Layer split uses stage group ``G`` via ``layer_pp_rank`` / ``layer_pp_world``.
 """
 
 from __future__ import annotations
