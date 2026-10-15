@@ -89,7 +89,8 @@ class WanCell(CellAdapter):
         elif isinstance(hidden, torch.Tensor):
             latent = self._slice_batch(hidden, index, n_tasks)
         if latent is None:
-            latent = live.get(chunk) or self._init_noise(chunk)
+            stored = live.get(chunk)
+            latent = self._init_noise(chunk) if stored is None else stored
         return latent, tokens
 
     def forward(self, tasks, kv_contexts, *, hidden):

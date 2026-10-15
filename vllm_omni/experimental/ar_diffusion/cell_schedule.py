@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 
 # (chunk, step, block) — schedule task and KV version.
 Cell = tuple[int, int, int]
@@ -159,8 +160,16 @@ def stage_of(step: int, schedule: CellSchedule) -> int:
     return 0 if schedule.stages == 1 else step
 
 
+@lru_cache(maxsize=128)
 def _block_range(num_blocks: int, group: int, groups: int) -> tuple[int, int]:
-    return (num_blocks * group) // groups, (num_blocks * (group + 1)) // groups
+    """Layer partition; must match Wan ``get_pp_indices`` / ``stage_layer_range``."""
+    from vllm.distributed.utils import get_pp_indices
+
+    if groups < 1:
+        raise ValueError("groups must be positive")
+    if not 0 <= group < groups:
+        raise ValueError(f"group {group} out of range for {groups}")
+    return get_pp_indices(num_blocks, group, groups)
 
 
 def group_of_block(block: int, schedule: CellSchedule) -> int:

@@ -279,6 +279,18 @@ class CausVidWanPipeline(nn.Module):
             result,
         )
 
+    @staticmethod
+    def _prompt_text(prompt: object) -> str:
+        """Extract text from a plain string or serving ``OmniTextPrompt`` dict."""
+        if isinstance(prompt, str):
+            return prompt
+        if isinstance(prompt, dict):
+            text = prompt.get("prompt")
+            if isinstance(text, str):
+                return text
+            raise ValueError("Prompt dict must include a string 'prompt' field.")
+        raise TypeError(f"Unsupported prompt type: {type(prompt)!r}")
+
     def _encode_prompt(self, prompt: str, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         assert self.tokenizer is not None and self.text_encoder is not None
         from diffusers.pipelines.wan.pipeline_wan import prompt_clean
@@ -481,7 +493,7 @@ class CausVidWanPipeline(nn.Module):
                 )
             ctx.enqueue(req_id, plan, chunk_tokens=chunk_tokens)
 
-            prompt = item.prompt if isinstance(item.prompt, str) else str(item.prompt or "")
+            prompt = self._prompt_text(item.prompt)
             prompt_embeds = self._encode_prompt(prompt, device, dtype)
             sampler = FlowEuler(denoise, shift=shift)
             stream_decode = bool(extra.get("stream_decode", False))

@@ -37,11 +37,14 @@ _WAN21_1_3B_CONFIG: dict[str, Any] = {
 
 
 def stage_layer_range(num_layers: int, group: int, groups: int) -> tuple[int, int]:
+    """Match Wan ``layer_pp_*`` / vLLM ``get_pp_indices`` boundaries."""
+    from vllm.distributed.utils import get_pp_indices
+
     if groups < 1:
         raise ValueError("groups must be positive")
     if not 0 <= group < groups:
         raise ValueError(f"group {group} out of range for {groups}")
-    return (num_layers * group) // groups, (num_layers * (group + 1)) // groups
+    return get_pp_indices(num_layers, group, groups)
 
 
 def _wan_self_attn_with_kv(
@@ -253,12 +256,55 @@ class StageWanTransformer(nn.Module):
         self._embeddings[step] = out
         return out
 
+    def _rope_with_temporal_offset(
+        self, latent: torch.Tensor, *, start_frame: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Wan 3D RoPE with absolute temporal positions (CausVid ``current_start``)."""
+        assert self._wan is not None
+        rope = self._wan.rope
+        _, _, num_frames, height, width = latent.shape
+        p_t, p_h, p_w = rope.patch_size
+        ppf, pph, ppw = num_frames // p_t, height // p_h, width // p_w
+        if start_frame % p_t:
+            raise ValueError(f"start_frame={start_frame} must align to temporal patch {p_t}")
+        t0 = start_frame // p_t
+        if t0 + ppf > rope.max_seq_len:
+            raise ValueError(
+                f"temporal RoPE range [{t0}, {t0 + ppf}) exceeds rope_max_seq_len={rope.max_seq_len}"
+            )
+
+        split_sizes = [
+            rope.attention_head_dim - 2 * (rope.attention_head_dim // 3),
+            rope.attention_head_dim // 3,
+            rope.attention_head_dim // 3,
+        ]
+        freqs_cos = rope.freqs_cos.split(split_sizes, dim=1)
+        freqs_sin = rope.freqs_sin.split(split_sizes, dim=1)
+
+        freqs_cos_f = freqs_cos[0][t0 : t0 + ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_cos_h = freqs_cos[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_cos_w = freqs_cos[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
+        freqs_sin_f = freqs_sin[0][t0 : t0 + ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_sin_h = freqs_sin[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_sin_w = freqs_sin[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
+
+        freqs_cos_out = torch.cat([freqs_cos_f, freqs_cos_h, freqs_cos_w], dim=-1).reshape(
+            1, ppf * pph * ppw, 1, -1
+        )
+        freqs_sin_out = torch.cat([freqs_sin_f, freqs_sin_h, freqs_sin_w], dim=-1).reshape(
+            1, ppf * pph * ppw, 1, -1
+        )
+        return freqs_cos_out.to(latent.device), freqs_sin_out.to(latent.device)
+
     def _rotary_emb(self, chunk: int, latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         assert self._wan is not None
         hit = self._rotary.get(chunk)
         if hit is not None:
             return hit
-        freqs_cos, freqs_sin = self._wan.rope(latent)
+        # Absolute temporal offset so history KV and the current chunk do not share
+        # the same frame indices (official CausVid ``current_start``).
+        start_frame = int(chunk) * int(latent.shape[2])
+        freqs_cos, freqs_sin = self._rope_with_temporal_offset(latent, start_frame=start_frame)
         rotary = (freqs_cos[..., 0::2].to(latent.dtype), freqs_sin[..., 1::2].to(latent.dtype))
         self._rotary = {chunk: rotary}
         return rotary

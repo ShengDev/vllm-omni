@@ -10,6 +10,7 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     CellSchedule,
     Ordering,
     build_cell_plan,
+    group_of_block,
     is_group_boundary,
     max_local_blocks,
 )
@@ -26,6 +27,28 @@ def _s1(chunks, world, ordering, *, kv=False, steps=3) -> CellSchedule:
         ordering=ordering,
         kv_history_chunks=6 if kv else 0,
     )
+
+
+def test_layer_groups_match_vllm_pp_indices():
+    """Schedule block ownership must match Wan/vLLM ``get_pp_indices`` (not floor)."""
+    from vllm.distributed.utils import get_pp_indices
+
+    schedule = CellSchedule(
+        chunks=2,
+        num_denoise_steps=1,
+        stages=1,
+        layer_groups=4,
+        ordering=Ordering.LATEST_KV,
+        kv_history_chunks=0,
+        blocks=30,
+    )
+    for g in range(4):
+        start, end = get_pp_indices(30, g, 4)
+        for block in range(start, end):
+            assert group_of_block(block, schedule) == g
+    # Floor split would put block 22 on group 3; get_pp_indices keeps it on 2.
+    assert group_of_block(22, schedule) == 2
+    assert get_pp_indices(30, 3, 4) == (23, 30)
 
 
 @pytest.mark.parametrize("world", [1, 2, 3, 4])

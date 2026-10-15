@@ -38,6 +38,8 @@ def _bare_pipeline(*, stages: int = 1, history: int = 1) -> CausVidWanPipeline:
 
 
 def test_stage_layer_range_covers_all_layers():
+    from vllm.distributed.utils import get_pp_indices
+
     covered: list[int] = []
     for g in range(2):
         start, end = stage_layer_range(30, g, 2)
@@ -45,6 +47,10 @@ def test_stage_layer_range_covers_all_layers():
     assert covered == list(range(30))
     assert stage_layer_range(30, 0, 2) == (0, 15)
     assert stage_layer_range(30, 1, 2) == (15, 30)
+    # G=4 must match Wan/vLLM get_pp_indices (not the floor split).
+    for g in range(4):
+        assert stage_layer_range(30, g, 4) == get_pp_indices(30, g, 4)
+    assert stage_layer_range(30, 3, 4) == (23, 30)
 
 
 def test_flow_euler_matches_diffusers_shifted_endpoint():
@@ -78,6 +84,62 @@ def test_causvid_wan_chunk_noise_matches_reference_seed():
     reference = torch.randn(shape, generator=torch.Generator().manual_seed(seed * 1_000_003 + chunk * 4096))
     torch.testing.assert_close(adapter._init_noise(chunk), reference)
     torch.testing.assert_close(adapter._init_noise(chunk), reference)
+
+
+def test_resolve_latent_reuses_live_tensor_without_bool_check():
+    """S=1 path clears pending_hidden; live latent must use ``is None``, not ``or``."""
+    shape = (1, 4, 2, 2, 2)
+    adapter = WanCell(
+        SimpleNamespace(prepare_cell=lambda *_a, **_k: None),  # type: ignore[arg-type]
+        sampler=FlowEuler(2, shift=1.0),
+        prompt_embeds=torch.empty(1, 1, 8),
+        latent_shape=shape,
+        seed=0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    live = {0: torch.ones(shape)}
+    latent, tokens = adapter._resolve_latent_hidden(
+        req="r0", chunk=0, step=1, index=0, n_tasks=1, hidden=None, live=live
+    )
+    assert tokens is None
+    assert latent is live[0]
+    torch.testing.assert_close(latent, torch.ones(shape))
+
+
+def test_prompt_text_extracts_omni_text_prompt_dict():
+    assert CausVidWanPipeline._prompt_text("hello") == "hello"
+    assert CausVidWanPipeline._prompt_text({"prompt": "from dict", "negative_prompt": "x"}) == "from dict"
+    with pytest.raises(ValueError, match="prompt"):
+        CausVidWanPipeline._prompt_text({"negative_prompt": "x"})
+    with pytest.raises(TypeError, match="Unsupported prompt"):
+        CausVidWanPipeline._prompt_text(123)  # type: ignore[arg-type]
+
+
+def test_rotary_emb_applies_chunk_temporal_offset():
+    """Chunk k must use absolute temporal positions ``k * T``, not restart at 0."""
+    head_dim = 24  # divisible for t/h/w split used by WanRotaryPosEmbed
+    max_seq = 16
+    # Fake freqs: identity encoding of position index on even dims.
+    freqs = torch.arange(max_seq, dtype=torch.float32).unsqueeze(1).expand(max_seq, head_dim).contiguous()
+    rope = SimpleNamespace(
+        patch_size=(1, 1, 1),
+        max_seq_len=max_seq,
+        attention_head_dim=head_dim,
+        freqs_cos=freqs,
+        freqs_sin=freqs,
+    )
+    tf = StageWanTransformer.__new__(StageWanTransformer)
+    torch.nn.Module.__init__(tf)
+    tf._wan = SimpleNamespace(rope=rope)
+    tf._rotary = {}
+    latent = torch.zeros(1, 4, 3, 2, 2)  # T=3
+    cos0, _ = tf._rotary_emb(0, latent)
+    cos1, _ = tf._rotary_emb(1, latent)
+    assert cos0.shape == cos1.shape
+    assert not torch.equal(cos0, cos1)
+    # After even-dim slice (Wan rotary packs cos[..., 0::2]), temporal axis still differs.
+    assert cos1.mean().item() > cos0.mean().item()
 
 
 def test_cell_schedule_rejects_unknown_values():
