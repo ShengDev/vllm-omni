@@ -131,6 +131,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
         submitted: asyncio.Future[None] | None = None,
+        entry_stage_id: int = 0,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -157,6 +158,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 Must have the same length as the number of stages.
                 If *None*, uses default sampling params for each stage.
             output_modalities: Optional list of output modalities.
+            entry_stage_id: Stage the request is submitted to; > 0 bypasses
+                stage 0 and leaves the prompt raw for that stage. Streaming
+                prompts always enter at stage 0.
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.
@@ -292,6 +296,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
+                    entry_stage_id=entry_stage_id,
                     **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                 )
             submit_ts = time.time()
@@ -959,6 +964,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         engines have no EngineCore pause to hold, so ``wake_up`` restores
         admission and ``sleep → wake → generate`` keeps working.
         """
+        # Validate before touching admission state. Raising after
+        # ``_paused = True`` would wedge generate() for good: nothing was
+        # slept, so wake_up() has no tags to restore and never reaches the
+        # block that clears ``_paused``.
+        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+
         # Block admission before any sleep RPC so generate() waits on
         # _pause_cond during the drain/offload window. Wait until generate()
         # coroutines that already passed the pause check have submitted (or
@@ -966,8 +977,6 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         async with self._pause_cond:
             self._paused = True
             await self._pause_cond.wait_for(lambda: getattr(self, "_admitting", 0) == 0)
-
-        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
         # EngineCore.sleep resets receiver caches itself; only clear P0 here.
         if 0 in ar_stage_ids:
             await self._clear_frontend_mm_cache()

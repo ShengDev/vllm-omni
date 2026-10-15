@@ -99,6 +99,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # policy counterpart lives on PrefixCacheRunnerMixin.
         self._pooler_payload_include_hidden_flag = True
 
+    def shutdown(self) -> None:
+        # Also inherited by OmniNPUModelRunner. GPU AR stops the cache
+        # earlier in its teardown; the shared helper is idempotent.
+        self._shutdown_omni_prefix_cache()
+        super().shutdown()
+
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         override_fn = self._sampled_token_ids_cpu_override
         if callable(override_fn):
@@ -281,6 +287,25 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             device=self.device,
             dtype=self.dtype,
             capture_sizes=capture_sizes,
+        )
+
+    @torch.inference_mode()
+    def _create_encoder_cudagraph_manager(self):
+        raw_model = self.get_model()
+        if not getattr(raw_model, "encoder_cudagraph_single_replay", False):
+            return super()._create_encoder_cudagraph_manager()
+        from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
+
+        from vllm_omni.worker.encoder_cudagraph import SingleReplayEncoderCudaGraphManager
+
+        if not (
+            self.compilation_config.cudagraph_mm_encoder
+            and self.supports_mm_inputs
+            and supports_encoder_cudagraph(raw_model)
+        ):
+            return None
+        return SingleReplayEncoderCudaGraphManager(
+            vllm_config=self.vllm_config, device=self.device, dtype=self.dtype, model=raw_model
         )
 
     def _maybe_attach_attention_metadata_extensions(
