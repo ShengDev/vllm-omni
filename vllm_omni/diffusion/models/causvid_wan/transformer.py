@@ -269,9 +269,7 @@ class StageWanTransformer(nn.Module):
             raise ValueError(f"start_frame={start_frame} must align to temporal patch {p_t}")
         t0 = start_frame // p_t
         if t0 + ppf > rope.max_seq_len:
-            raise ValueError(
-                f"temporal RoPE range [{t0}, {t0 + ppf}) exceeds rope_max_seq_len={rope.max_seq_len}"
-            )
+            raise ValueError(f"temporal RoPE range [{t0}, {t0 + ppf}) exceeds rope_max_seq_len={rope.max_seq_len}")
 
         split_sizes = [
             rope.attention_head_dim - 2 * (rope.attention_head_dim // 3),
@@ -288,12 +286,8 @@ class StageWanTransformer(nn.Module):
         freqs_sin_h = freqs_sin[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_sin_w = freqs_sin[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
 
-        freqs_cos_out = torch.cat([freqs_cos_f, freqs_cos_h, freqs_cos_w], dim=-1).reshape(
-            1, ppf * pph * ppw, 1, -1
-        )
-        freqs_sin_out = torch.cat([freqs_sin_f, freqs_sin_h, freqs_sin_w], dim=-1).reshape(
-            1, ppf * pph * ppw, 1, -1
-        )
+        freqs_cos_out = torch.cat([freqs_cos_f, freqs_cos_h, freqs_cos_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
+        freqs_sin_out = torch.cat([freqs_sin_f, freqs_sin_h, freqs_sin_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
         return freqs_cos_out.to(latent.device), freqs_sin_out.to(latent.device)
 
     def _rotary_emb(self, chunk: int, latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
