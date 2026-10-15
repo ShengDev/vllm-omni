@@ -152,6 +152,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "bagel_single_stage": BAGEL_SINGLE_STAGE_PIPELINE,
     "bagel_think": BAGEL_THINK_PIPELINE,
     "breeze": BREEZE_TTS_2_PIPELINE,
+    "causvid_wan": CAUSVID_WAN_PIPELINE,
     # Cosmos3 policy / omni-deploy topologies share HF metadata with video
     # Cosmos3 checkpoints (which stay on the single-stage diffusion fallback),
     # so these entries are only reachable through a deploy yaml's ``pipeline:``
@@ -225,7 +226,6 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "wan2_2_eg": WAN2_2_EG_PIPELINE,
     "wan2_2_egd": WAN2_2_EGD_PIPELINE,
     "wan2_2_ti2v": WAN2_2_TI2V_PIPELINE,
-    "causvid_wan": CAUSVID_WAN_PIPELINE,
     "yue2": YUE2_PIPELINE,
 }
 
