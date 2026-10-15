@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.distributed.group_coordinator import GroupCoordinator
-from vllm_omni.experimental.ar_diffusion.chunk_schedule import ChunkSchedule, Inflight, Ordering, build_chunk_plan
+from vllm_omni.experimental.ar_diffusion.cell_schedule import CellSchedule, Inflight, Ordering, build_cell_plan
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     ARDiffusionNoisyKVSpec,
     NoisyKVCache,
@@ -42,13 +42,13 @@ def _transfer_worker(rank: int, chunk_tokens: int, init_method: str, device_kind
     cache = NoisyKVCache(spec, dtype=torch.float32, device=device, layer_groups=1, max_batch_size=1)
     state = NoisyKVState(cache)
     state.bind_rank(rank, pp_group)
-    plan = build_chunk_plan(
-        ChunkSchedule(
+    plan = build_cell_plan(
+        CellSchedule(
             chunks=3,
             num_denoise_steps=1,
             stages=2,
             layer_groups=1,
-            ordering=Ordering.INTERLEAVED,
+            ordering=Ordering.LATEST_KV,
             kv_history_chunks=2,
         )
     )

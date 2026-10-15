@@ -4,10 +4,7 @@
 import pytest
 
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
-from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import (
-    CausVidWanPipeline,
-    ChunkWanPipeline,
-)
+from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline
 from vllm_omni.diffusion.registry import DiffusionModelRegistry
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -21,6 +18,3 @@ def test_causvid_wan_registered_in_pipeline_registry():
     assert pipeline.default_deploy_config_name == "causvid_wan.yaml"
     cls = DiffusionModelRegistry._try_load_model_cls("CausVidWanPipeline")
     assert cls is CausVidWanPipeline
-    chunk = DiffusionModelRegistry._try_load_model_cls("ChunkWanPipeline")
-    assert chunk is ChunkWanPipeline
-    assert chunk is CausVidWanPipeline

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CausVid Wan 2.1 1.3B on the Chunk / Noisy KV path.
+"""CausVid Wan 2.1 1.3B on the Cell / Noisy KV path.
 
 Wires Wan codec + ``StageWanTransformer`` onto ``ARDiffusionEngine``, with
 CausVid defaults (shift=8, T=3) and optional student ``model.pt`` overlay.
@@ -40,15 +40,15 @@ from vllm_omni.diffusion.models.causvid_wan.weights import (
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-from vllm_omni.experimental.ar_diffusion.chunk_executor import (
-    ARDiffusionChunkContext,
+from vllm_omni.experimental.ar_diffusion.cell_executor import (
+    ARDiffusionCellContext,
     resolve_pp_rank_and_group,
-    run_chunk_pipeline,
+    run_cell_pipeline,
 )
-from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
-    ChunkSchedule,
+from vllm_omni.experimental.ar_diffusion.cell_schedule import (
+    CellSchedule,
     Ordering,
-    build_chunk_plan,
+    build_cell_plan,
 )
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
@@ -79,7 +79,6 @@ __all__ = [
     "FlowEuler",
     "WanCell",
     "CausVidWanPipeline",
-    "ChunkWanPipeline",
 ]
 
 
@@ -90,7 +89,7 @@ def _as_request_list(req: OmniDiffusionRequest | DiffusionRequestBatch) -> list[
 
 
 class CausVidWanPipeline(nn.Module):
-    """CausVid Wan on Chunk SERIAL/Latest (AR-Diffusion + noisy KV)."""
+    """CausVid Wan on Cell Self-Forcing/Latest-KV (AR-Diffusion + noisy KV)."""
 
     supports_request_batch = True
     # Skip engine dummy: num_inference_steps=2 breaks vertical S=T+1.
@@ -163,7 +162,7 @@ class CausVidWanPipeline(nn.Module):
         default_tokens = self.transformer.seq_len_for_latent(_DEFAULT_LATENT_SHAPE)
         self.block_size = default_tokens
         self.max_chunk_tokens = default_tokens
-        self._chunk_ctx: ARDiffusionChunkContext | None = None
+        self._chunk_ctx: ARDiffusionCellContext | None = None
         self._stream_decode_group = None
         self._streaming_decoder: WanStreamingDecoder | None = None
         logger.info(
@@ -248,7 +247,7 @@ class CausVidWanPipeline(nn.Module):
         )
 
     @contextmanager
-    def bind_ar_diffusion_chunk_context(self, ctx: ARDiffusionChunkContext) -> Iterator[None]:
+    def bind_ar_diffusion_cell_context(self, ctx: ARDiffusionCellContext) -> Iterator[None]:
         prev = self._chunk_ctx
         self._chunk_ctx = ctx
         try:
@@ -304,15 +303,10 @@ class CausVidWanPipeline(nn.Module):
     def _plan_for(self, req: OmniDiffusionRequest):
         sp = req.sampling_params
         extra = dict(sp.extra_args or {}) if sp is not None else {}
-        # CausVid defaults when the request omits denoise / shift.
-        if extra.get("num_denoise_steps") is None and extra.get("num_inference_steps") is None:
-            if sp is None or getattr(sp, "num_inference_steps", None) is None:
-                extra["num_denoise_steps"] = self._default_denoise
         if "shift" not in extra:
             extra["shift"] = self._default_shift
-        if sp is not None:
-            sp.extra_args = extra
         chunks = int(extra.get("num_chunks", extra.get("chunks", 2)))
+        # User-provided steps only (do not treat model defaults as explicit).
         explicit_denoise = extra.get("num_inference_steps")
         if explicit_denoise is None:
             explicit_denoise = extra.get("num_denoise_steps")
@@ -324,21 +318,28 @@ class CausVidWanPipeline(nn.Module):
         history = int(extra.get("kv_history_chunks", 0) or 0)
         if self.stage_parallel_size > 1 and history < 1:
             history = self.max_history_chunks
-        schedule_name = str(extra.get("chunk_schedule", "serial")).strip().lower()
-        if schedule_name in ("", "serial"):
-            ordering = Ordering.SERIAL
-        elif schedule_name == "latest":
-            ordering = Ordering.INTERLEAVED
+        schedule_name = str(extra.get("cell_schedule", "self_forcing")).strip().lower().replace("-", "_")
+        if schedule_name in ("", "self_forcing", "serial"):
+            ordering = Ordering.SELF_FORCING
+        elif schedule_name in ("latest_kv", "latest", "interleaved"):
+            ordering = Ordering.LATEST_KV
         else:
-            raise ValueError(f"chunk_schedule must be 'serial' or 'latest', got {schedule_name!r}")
+            raise ValueError(
+                "cell_schedule must be 'self_forcing' or 'latest_kv' "
+                "(aliases: serial, latest, interleaved), "
+                f"got {schedule_name!r}"
+            )
         stages = self.stage_parallel_size
         if stages not in (1, denoise + 1):
             if explicit_denoise is not None:
                 raise ValueError(f"CausVidWan stages must be 1 or num_denoise_steps+1 ({denoise + 1}), got {stages}")
             denoise = stages - 1
+        extra["num_denoise_steps"] = denoise
+        if sp is not None:
+            sp.extra_args = extra
         num_blocks = int(getattr(self.transformer, "num_layers", 0) or 0)
         local_blocks = int(getattr(self.transformer, "local_num_layers", 0) or 0)
-        schedule = ChunkSchedule(
+        schedule = CellSchedule(
             chunks=chunks,
             num_denoise_steps=denoise,
             stages=stages,
@@ -348,7 +349,7 @@ class CausVidWanPipeline(nn.Module):
             blocks=num_blocks if num_blocks > 0 else None,
             blocks_per_rank=local_blocks if local_blocks > 0 else None,
         )
-        return build_chunk_plan(schedule), extra, denoise
+        return build_cell_plan(schedule), extra, denoise
 
     def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
         assert self.vae is not None
@@ -453,7 +454,7 @@ class CausVidWanPipeline(nn.Module):
     def forward(self, req: OmniDiffusionRequest | DiffusionRequestBatch) -> list[DiffusionOutput]:
         ctx = self._chunk_ctx
         if ctx is None:
-            raise RuntimeError("CausVidWanPipeline requires bind_ar_diffusion_chunk_context")
+            raise RuntimeError("CausVidWanPipeline requires bind_ar_diffusion_cell_context")
         requests = _as_request_list(req)
         pp_rank, pp_group = resolve_pp_rank_and_group()
 
@@ -519,7 +520,7 @@ class CausVidWanPipeline(nn.Module):
                 on_finished=on_finished,
             )
             # DiT tick loop; stream_job decode/send threads overlap on the side.
-            run_chunk_pipeline(ctx=ctx, adapter=adapter)
+            run_cell_pipeline(ctx=ctx, adapter=adapter)
             if stream_job is not None:
                 video = stream_job.join()
                 if video is not None:
@@ -537,7 +538,3 @@ class CausVidWanPipeline(nn.Module):
             else:
                 outputs.append(self._placeholder_output(device, dtype))
         return outputs
-
-
-# Back-compat registry / test alias (same class).
-ChunkWanPipeline = CausVidWanPipeline

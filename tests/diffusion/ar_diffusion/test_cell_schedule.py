@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import pytest
 
-from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
-    ChunkSchedule,
+from vllm_omni.experimental.ar_diffusion.cell_schedule import (
+    CellSchedule,
     Ordering,
-    build_chunk_plan,
+    build_cell_plan,
     is_group_boundary,
     max_local_blocks,
 )
@@ -17,8 +17,8 @@ from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _s1(chunks, world, ordering, *, kv=False, steps=3) -> ChunkSchedule:
-    return ChunkSchedule(
+def _s1(chunks, world, ordering, *, kv=False, steps=3) -> CellSchedule:
+    return CellSchedule(
         chunks=chunks,
         num_denoise_steps=steps,
         stages=1,
@@ -30,10 +30,10 @@ def _s1(chunks, world, ordering, *, kv=False, steps=3) -> ChunkSchedule:
 
 @pytest.mark.parametrize("world", [1, 2, 3, 4])
 @pytest.mark.parametrize("chunks", [1, 2, 3, 6])
-@pytest.mark.parametrize("schedule", ["serial", "stepwise"])
+@pytest.mark.parametrize("schedule", ["self_forcing", "stepwise"])
 def test_s1_builds_without_idle_slot(world, chunks, schedule):
-    ordering = Ordering.SERIAL if schedule == "serial" else Ordering.INTERLEAVED
-    plan = build_chunk_plan(_s1(chunks, world, ordering))
+    ordering = Ordering.SELF_FORCING if schedule == "self_forcing" else Ordering.LATEST_KV
+    plan = build_cell_plan(_s1(chunks, world, ordering))
     assert plan.num_slots >= chunks
     for t in range(plan.num_slots):
         assert any(plan.task(t, rank) is not None for rank in range(world))
@@ -42,7 +42,7 @@ def test_s1_builds_without_idle_slot(world, chunks, schedule):
 @pytest.mark.parametrize("world", [1, 2, 3, 4])
 @pytest.mark.parametrize("chunks", [1, 2, 3, 6])
 def test_s1_serial_kv_sources_are_clean(world, chunks):
-    plan = build_chunk_plan(_s1(chunks, world, Ordering.SERIAL, kv=True))
+    plan = build_cell_plan(_s1(chunks, world, Ordering.SELF_FORCING, kv=True))
     for t in range(plan.num_slots):
         for rank in range(world):
             task = plan.task(t, rank)
@@ -56,8 +56,8 @@ def test_s1_serial_kv_sources_are_clean(world, chunks):
 
 @pytest.mark.parametrize("world", [1, 2])
 @pytest.mark.parametrize("chunks", [1, 2, 4])
-def test_s1_interleaved_kv_uses_latest_completed(world, chunks):
-    plan = build_chunk_plan(_s1(chunks, world, Ordering.INTERLEAVED, kv=True))
+def test_s1_latest_kv_uses_latest_completed(world, chunks):
+    plan = build_cell_plan(_s1(chunks, world, Ordering.LATEST_KV, kv=True))
     for t in range(plan.num_slots):
         for rank in range(world):
             task = plan.task(t, rank)
@@ -70,21 +70,21 @@ def test_s1_interleaved_kv_uses_latest_completed(world, chunks):
 
 
 def test_s1_kv_transfers_empty():
-    plan = build_chunk_plan(_s1(4, 2, Ordering.INTERLEAVED, kv=True))
+    plan = build_cell_plan(_s1(4, 2, Ordering.LATEST_KV, kv=True))
     for t in range(plan.num_slots):
         assert plan.transfers(t) == ()
 
 
 def test_vertical_diagonal_example():
-    schedule = ChunkSchedule(
+    schedule = CellSchedule(
         chunks=4,
         num_denoise_steps=2,
         stages=3,
         layer_groups=2,
-        ordering=Ordering.INTERLEAVED,
+        ordering=Ordering.LATEST_KV,
         kv_history_chunks=6,
     )
-    plan = build_chunk_plan(schedule)
+    plan = build_cell_plan(schedule)
     # K=1 default: cell = (chunk, step, block=g)
     assert plan.task(0, 0) == (0, 0, 0)
     assert plan.task(3, 0) == (3, 0, 0)
@@ -105,8 +105,8 @@ def test_vertical_diagonal_example():
 
 def test_vertical_serial_same_topology_no_chunk_overlap():
     common = dict(chunks=3, num_denoise_steps=2, stages=3, layer_groups=1, kv_history_chunks=6)
-    serial = build_chunk_plan(ChunkSchedule(**common, ordering=Ordering.SERIAL))
-    latest = build_chunk_plan(ChunkSchedule(**common, ordering=Ordering.INTERLEAVED))
+    serial = build_cell_plan(CellSchedule(**common, ordering=Ordering.SELF_FORCING))
+    latest = build_cell_plan(CellSchedule(**common, ordering=Ordering.LATEST_KV))
     world = 3
     assert serial.num_slots == 3 * world
     assert latest.num_slots == 3 + world - 1
@@ -120,17 +120,17 @@ def test_vertical_serial_same_topology_no_chunk_overlap():
 
 
 def test_block_expand_multiplies_ticks():
-    schedule = ChunkSchedule(
+    schedule = CellSchedule(
         chunks=2,
         num_denoise_steps=1,
         stages=2,
         layer_groups=1,
-        ordering=Ordering.INTERLEAVED,
+        ordering=Ordering.LATEST_KV,
         kv_history_chunks=2,
         blocks=4,
         blocks_per_rank=4,
     )
-    plan = build_chunk_plan(schedule)
+    plan = build_cell_plan(schedule)
     coarse_latest = 2 + 2 - 1
     assert max_local_blocks(schedule) == 4
     assert plan.num_slots == coarse_latest * 4
@@ -146,24 +146,24 @@ def test_block_expand_multiplies_ticks():
 
 def test_rejects_intermediate_s():
     with pytest.raises(ValueError, match="stages must be 1"):
-        ChunkSchedule(
+        CellSchedule(
             chunks=4,
             num_denoise_steps=4,
             stages=2,
             layer_groups=1,
-            ordering=Ordering.SERIAL,
+            ordering=Ordering.SELF_FORCING,
             kv_history_chunks=4,
         )
 
 
 def test_i2_sources_strictly_earlier():
-    plan = build_chunk_plan(
-        ChunkSchedule(
+    plan = build_cell_plan(
+        CellSchedule(
             chunks=4,
             num_denoise_steps=2,
             stages=3,
             layer_groups=2,
-            ordering=Ordering.INTERLEAVED,
+            ordering=Ordering.LATEST_KV,
             kv_history_chunks=6,
         )
     )
@@ -178,13 +178,13 @@ def test_i2_sources_strictly_earlier():
 
 def test_wait_ready_nonempty_after_cell_expand():
     """Remote history first-consume must produce wait_ready entries (REPORT regression)."""
-    plan = build_chunk_plan(
-        ChunkSchedule(
+    plan = build_cell_plan(
+        CellSchedule(
             chunks=8,
             num_denoise_steps=4,
             stages=5,
             layer_groups=1,
-            ordering=Ordering.INTERLEAVED,
+            ordering=Ordering.LATEST_KV,
             kv_history_chunks=6,
             blocks=30,
             blocks_per_rank=30,

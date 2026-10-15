@@ -1,14 +1,14 @@
 # CausVid Wan 2.1 1.3B (Noisy KV)
 
 > Experimental: run [CausVid](https://github.com/tianweiy/CausVid) Wan 2.1 T2V
-> 1.3B student weights on Omni's Chunk / Noisy KV path (Serial / Latest).
+> 1.3B student weights on Omni's Cell / Noisy KV path (Self-Forcing / Latest-KV).
 
 ## Summary
 
 - Student DiT: `tianweiy/CausVid` → `autoregressive_checkpoint/model.pt`
 - Codec (T5 / VAE): official `Wan-AI/Wan2.1-T2V-1.3B` via Diffusers layout
   `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` (Omni needs Diffusers; same Wan-AI weights)
-- Engine: `ARDiffusionEngine` + `CausVidWanPipeline` (Chunk / Noisy KV stack)
+- Engine: `ARDiffusionEngine` + `CausVidWanPipeline` (Cell / Noisy KV stack)
 - Default schedule: `num_denoise_steps=3`, `shift=8.0`, `S=T+1=4`
 
 CausVid trains causal few-step DMD on Wan 2.1 1.3B. Official README uses native
@@ -36,7 +36,7 @@ huggingface-cli download tianweiy/CausVid \
   --local-dir /data/models/CausVid
 ```
 
-## Offline smoke (4 GPUs, Serial)
+## Offline smoke (4 GPUs, Self-Forcing)
 
 ```python
 from pathlib import Path
@@ -63,7 +63,7 @@ out = omni.generate(
         extra_args={
             "num_chunks": 7,
             "num_denoise_steps": 3,
-            "chunk_schedule": "serial",  # or "latest"
+            "cell_schedule": "self_forcing",  # or "latest_kv" (aliases: serial, latest, interleaved)
             "shift": 8.0,
             "reset": True,
         },
@@ -73,8 +73,8 @@ out = omni.generate(
 
 ## Notes
 
-- **Serial** matches CausVid / Self-Forcing clean-history semantics; **Latest**
-  is schedule-only and not how CausVid was trained.
+- **Self-Forcing** (`Ordering.SELF_FORCING`) matches CausVid clean-history
+  semantics; **Latest-KV** is schedule-only and not how CausVid was trained.
 - Exact official DMD timestep table parity (`1000/757/522`) vs the shared
   FlowEuler grid is still converging; defaults use CausVid **shift=8** and
   **T=3** on the Euler cell path.

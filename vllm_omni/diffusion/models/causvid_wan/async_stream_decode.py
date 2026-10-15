@@ -53,7 +53,7 @@ def _async_host_copy(latent: torch.Tensor, *, shape: tuple[int, ...] | None, dty
 
 @dataclass
 class AsyncStreamDecodeJob:
-    """One request's async decode side path (start before ``run_chunk_pipeline``)."""
+    """One request's async decode side path (start before ``run_cell_pipeline``)."""
 
     on_finished: Callable[[int, torch.Tensor], None] | None
     join: Callable[[], torch.Tensor | None]

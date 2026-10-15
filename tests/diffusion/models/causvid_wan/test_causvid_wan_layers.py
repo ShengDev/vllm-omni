@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""ChunkWan / CausVid unit checks (layer split + FlowEuler + WanCell)."""
+"""CausVid Wan unit checks (layer split + FlowEuler + WanCell)."""
 
 from __future__ import annotations
 
@@ -9,16 +9,32 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline
+from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import (
+    CAUSVID_DEFAULT_DENOISE_STEPS,
+    CAUSVID_DEFAULT_SHIFT,
+    CausVidWanPipeline,
+)
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer, stage_layer_range
 from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.experimental.ar_diffusion.chunk_executor import ARDiffusionChunkContext, ChunkRunSpec, ChunkTopology
+from vllm_omni.experimental.ar_diffusion.cell_executor import ARDiffusionCellContext, CellRunSpec, CellTopology
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec, NoisyKVCache, NoisyKVState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _bare_pipeline(*, stages: int = 1, history: int = 1) -> CausVidWanPipeline:
+    """``__new__`` stub with the fields ``_plan_for`` reads."""
+    pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
+    pipeline.stage_parallel_size = stages
+    pipeline.layer_groups = 1
+    pipeline.max_history_chunks = history
+    pipeline.transformer = SimpleNamespace(num_layers=1, local_num_layers=1)
+    pipeline._default_shift = CAUSVID_DEFAULT_SHIFT
+    pipeline._default_denoise = CAUSVID_DEFAULT_DENOISE_STEPS
+    return pipeline
 
 
 def test_stage_layer_range_covers_all_layers():
@@ -47,7 +63,7 @@ def test_flow_euler_matches_diffusers_shifted_endpoint():
     assert last_delta > 0.01
 
 
-def test_chunk_wan_chunk_noise_matches_reference_seed():
+def test_causvid_wan_chunk_noise_matches_reference_seed():
     shape = (1, 16, 1, 2, 2)
     seed, chunk = 7, 2
     adapter = WanCell(
@@ -64,29 +80,21 @@ def test_chunk_wan_chunk_noise_matches_reference_seed():
     torch.testing.assert_close(adapter._init_noise(chunk), reference)
 
 
-def test_chunk_schedule_rejects_unknown_values():
-    pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
-    pipeline.stage_parallel_size = 1
-    pipeline.layer_groups = 1
-    pipeline.max_history_chunks = 1
-    pipeline.transformer = SimpleNamespace(num_layers=1, local_num_layers=1)
+def test_cell_schedule_rejects_unknown_values():
+    pipeline = _bare_pipeline()
     req = OmniDiffusionRequest(
         prompt="x",
         request_id="sched-0",
-        sampling_params=OmniDiffusionSamplingParams(extra_args={"chunk_schedule": "unsupported"}),
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"cell_schedule": "unsupported"}),
     )
-    with pytest.raises(ValueError, match="chunk_schedule"):
+    with pytest.raises(ValueError, match="cell_schedule"):
         pipeline._plan_for(req)
 
 
 @pytest.mark.parametrize("source", ["num_inference_steps", "num_denoise_steps", "sampling_params"])
 @pytest.mark.parametrize("steps", [0, -1])
-def test_chunk_schedule_rejects_nonpositive_steps(source, steps):
-    pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
-    pipeline.stage_parallel_size = 1
-    pipeline.layer_groups = 1
-    pipeline.max_history_chunks = 1
-    pipeline.transformer = SimpleNamespace(num_layers=1, local_num_layers=1)
+def test_cell_schedule_rejects_nonpositive_steps(source, steps):
+    pipeline = _bare_pipeline()
     extra = {} if source == "sampling_params" else {source: steps}
     req = OmniDiffusionRequest(
         prompt="x",
@@ -99,13 +107,16 @@ def test_chunk_schedule_rejects_nonpositive_steps(source, steps):
         pipeline._plan_for(req)
 
 
-@pytest.mark.parametrize(("stages", "expected_steps"), [(1, 4), (4, 3), (5, 4)])
-def test_chunk_schedule_unset_steps_keep_topology_default(stages, expected_steps):
-    pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
-    pipeline.stage_parallel_size = stages
-    pipeline.layer_groups = 1
-    pipeline.max_history_chunks = 6
-    pipeline.transformer = SimpleNamespace(num_layers=1, local_num_layers=1)
+@pytest.mark.parametrize(
+    ("stages", "expected_steps"),
+    [
+        (1, CAUSVID_DEFAULT_DENOISE_STEPS),  # S=1 keeps model default
+        (4, 3),  # S=T+1 with T=default
+        (5, 4),  # S≠1 and S≠T+1 → derive T=S-1
+    ],
+)
+def test_cell_schedule_unset_steps_keep_topology_default(stages, expected_steps):
+    pipeline = _bare_pipeline(stages=stages, history=6)
     req = OmniDiffusionRequest(prompt="x", request_id="default-steps", sampling_params=OmniDiffusionSamplingParams())
     plan, _, steps = pipeline._plan_for(req)
     assert steps == plan.schedule.num_denoise_steps == expected_steps
@@ -113,7 +124,7 @@ def test_chunk_schedule_unset_steps_keep_topology_default(stages, expected_steps
 
 @pytest.mark.parametrize("shape", [(1, 16, 1, 4, 8), (1, 16, 1, 8, 16)])
 def test_pipeline_rejects_token_count_change_before_admission(shape):
-    pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
+    pipeline = _bare_pipeline()
     torch.nn.Module.__init__(pipeline)
     transformer = StageWanTransformer.__new__(StageWanTransformer)
     torch.nn.Module.__init__(transformer)
@@ -123,6 +134,8 @@ def test_pipeline_rejects_token_count_change_before_admission(shape):
     pipeline.stage_parallel_size = pipeline.layer_groups = pipeline.max_history_chunks = 1
     pipeline.block_size = pipeline.max_chunk_tokens = 16
     pipeline._chunk_ctx = None
+    pipeline._default_shift = CAUSVID_DEFAULT_SHIFT
+    pipeline._default_denoise = CAUSVID_DEFAULT_DENOISE_STEPS
     cache = NoisyKVCache(
         ARDiffusionNoisyKVSpec(1, 1, 1, 16, 16, 1),
         dtype=torch.float32,
@@ -130,13 +143,13 @@ def test_pipeline_rejects_token_count_change_before_admission(shape):
         layer_groups=1,
         max_batch_size=1,
     )
-    ctx = ARDiffusionChunkContext(ChunkRunSpec(ChunkTopology(1, 1)), NoisyKVState(cache))
+    ctx = ARDiffusionCellContext(CellRunSpec(CellTopology(1, 1)), NoisyKVState(cache))
     req = OmniDiffusionRequest(
         prompt="x",
         request_id="different-shape",
         sampling_params=OmniDiffusionSamplingParams(extra_args={"latent_shape": shape, "num_denoise_steps": 1}),
     )
-    with pipeline.bind_ar_diffusion_chunk_context(ctx):
+    with pipeline.bind_ar_diffusion_cell_context(ctx):
         with pytest.raises(ValueError, match="does not match preallocated NoisyKV"):
             pipeline.forward(req)
     assert pipeline.block_size == pipeline.max_chunk_tokens == cache.spec.max_chunk_tokens == 16

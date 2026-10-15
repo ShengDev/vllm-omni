@@ -411,11 +411,6 @@ _DIFFUSION_MODELS = {
         "pipeline_causvid_wan",
         "CausVidWanPipeline",
     ),
-    "ChunkWanPipeline": (
-        "causvid_wan",
-        "pipeline_causvid_wan",
-        "ChunkWanPipeline",
-    ),
     "StableDiffusionXLPipeline": (
         "sdxl",
         "pipeline_sdxl",
@@ -457,7 +452,6 @@ _NO_CACHE_ACCELERATION = {
     "Pi05Pipeline",
     "LingBotWorldCausalDMDPipeline",
     "CausVidWanPipeline",
-    "ChunkWanPipeline",
     "ABotWorldCausalPipeline",
     # Qwen-Image 2.1's transformer carries its own prefix KV cache (keyed by CFG
     # branch) across denoising steps, which conflicts with cache_dit / tea_cache

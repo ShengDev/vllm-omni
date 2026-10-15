@@ -193,7 +193,7 @@ def make_runner(
     runner.kv_cache = None
     runner.noisy_kv_cache = None
     runner._ar_diffusion_capability = None
-    runner._ar_diffusion_chunk_capability = None
+    runner._ar_diffusion_cell_capability = None
     runner._ar_diffusion_kv_cache_spec = None
     runner._sessions = OrderedDict()
     runner._session_capacity = 0

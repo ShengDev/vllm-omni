@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Pure-function chunk timetable, Latest-KV visibility, and transfer plan.
+"""Pure-function cell timetable, Latest-KV visibility, and transfer plan.
 
 No torch. ``S ∈ {1, T+1}``. Schedule/KV unit is cell ``(chunk, step, block)``.
 
 * Weight split: PP layer-groups ``G``; each coarse ``(c,s)`` expands to local blocks.
 * ``S = 1``: layer PP. ``S = T+1``: one replica per denoise/clean step.
-* ``SERIAL``: one chunk in flight; ``INTERLEAVED``: diagonal Latest-KV.
+* ``SELF_FORCING``: one chunk in flight (Self-Forcing / clean history);
+  ``LATEST_KV``: diagonal Latest-KV.
 """
 
 from __future__ import annotations
@@ -16,13 +17,14 @@ from enum import Enum
 
 # (chunk, step, block) — schedule task and KV version.
 Cell = tuple[int, int, int]
-# Backward-compatible name used by older call sites / tests.
-ChunkStep = Cell
 
 
 class Ordering(str, Enum):
-    SERIAL = "serial"
-    INTERLEAVED = "interleaved"
+    SELF_FORCING = "self_forcing"
+    LATEST_KV = "latest_kv"
+    # Accepted string aliases for request / deploy configs.
+    SERIAL = "self_forcing"
+    INTERLEAVED = "latest_kv"
 
 
 @dataclass(frozen=True)
@@ -47,7 +49,7 @@ class RequestKVTransfer:
 
 
 @dataclass(frozen=True)
-class ChunkSchedule:
+class CellSchedule:
     chunks: int
     num_denoise_steps: int
     stages: int
@@ -97,15 +99,15 @@ class ChunkSchedule:
 class Inflight:
     req: str
     t0: int
-    plan: ChunkPlan
+    plan: CellPlan
 
 
-class ChunkPlan:
+class CellPlan:
     """Immutable per-request timetable plus derived Latest-KV tables."""
 
     def __init__(
         self,
-        schedule: ChunkSchedule,
+        schedule: CellSchedule,
         slots: tuple[tuple[Cell | None, ...], ...],
         completions: dict[Cell, int],
         sources: dict[tuple[int, Cell], tuple[KVSource, ...]],
@@ -153,7 +155,7 @@ class ChunkPlan:
         return self._wait_ready.get(rank, {}).get(slot, frozenset())
 
 
-def stage_of(step: int, schedule: ChunkSchedule) -> int:
+def stage_of(step: int, schedule: CellSchedule) -> int:
     return 0 if schedule.stages == 1 else step
 
 
@@ -161,7 +163,7 @@ def _block_range(num_blocks: int, group: int, groups: int) -> tuple[int, int]:
     return (num_blocks * group) // groups, (num_blocks * (group + 1)) // groups
 
 
-def group_of_block(block: int, schedule: ChunkSchedule) -> int:
+def group_of_block(block: int, schedule: CellSchedule) -> int:
     for g in range(schedule.layer_groups):
         start, end = _block_range(schedule.num_blocks, g, schedule.layer_groups)
         if start <= block < end:
@@ -169,17 +171,17 @@ def group_of_block(block: int, schedule: ChunkSchedule) -> int:
     raise ValueError(f"block {block} out of range for blocks={schedule.num_blocks}")
 
 
-def rank_of(step: int, layer_group: int, schedule: ChunkSchedule) -> int:
+def rank_of(step: int, layer_group: int, schedule: CellSchedule) -> int:
     if schedule.stages == 1:
         return layer_group
     return step * schedule.layer_groups + layer_group
 
 
-def rank_of_block(step: int, block: int, schedule: ChunkSchedule) -> int:
+def rank_of_block(step: int, block: int, schedule: CellSchedule) -> int:
     return rank_of(step, group_of_block(block, schedule), schedule)
 
 
-def is_group_boundary(cell: Cell, schedule: ChunkSchedule) -> bool:
+def is_group_boundary(cell: Cell, schedule: CellSchedule) -> bool:
     """True when ``cell`` is the last local block of its layer group (activation edge)."""
     _chunk, _step, block = cell
     g = group_of_block(block, schedule)
@@ -187,7 +189,7 @@ def is_group_boundary(cell: Cell, schedule: ChunkSchedule) -> bool:
     return block == end - 1
 
 
-def max_local_blocks(schedule: ChunkSchedule) -> int:
+def max_local_blocks(schedule: CellSchedule) -> int:
     return max(
         _block_range(schedule.num_blocks, g, schedule.layer_groups)[1]
         - _block_range(schedule.num_blocks, g, schedule.layer_groups)[0]
@@ -195,12 +197,12 @@ def max_local_blocks(schedule: ChunkSchedule) -> int:
     )
 
 
-def _s1_jobs(schedule: ChunkSchedule) -> list[tuple[int, int]]:
+def _s1_jobs(schedule: CellSchedule) -> list[tuple[int, int]]:
     steps = schedule.num_denoise_steps + (1 if schedule.kv_history_chunks > 0 else 0)
     chunks = schedule.chunks
-    if schedule.ordering is Ordering.SERIAL:
+    if schedule.ordering is Ordering.SELF_FORCING:
         return [(chunk, step) for chunk in range(chunks) for step in range(steps)]
-    if schedule.ordering is Ordering.INTERLEAVED:
+    if schedule.ordering is Ordering.LATEST_KV:
         world = schedule.layer_groups
         return [
             (chunk, step)
@@ -211,10 +213,10 @@ def _s1_jobs(schedule: ChunkSchedule) -> list[tuple[int, int]]:
     raise ValueError(f"unsupported ordering {schedule.ordering}")
 
 
-def _plan_s1_coarse(schedule: ChunkSchedule) -> tuple[tuple[tuple[int, int] | None, ...], ...]:
+def _plan_s1_coarse(schedule: CellSchedule) -> tuple[tuple[tuple[int, int] | None, ...], ...]:
     world = schedule.layer_groups
     jobs = _s1_jobs(schedule)
-    serial = schedule.ordering is Ordering.SERIAL
+    serial = schedule.ordering is Ordering.SELF_FORCING
     slots: list[tuple[tuple[int, int] | None, ...]] = []
     completed: set[tuple[int, int]] = set()
     carry: list[tuple[int, int] | None] = [None] * (world - 1)
@@ -237,7 +239,7 @@ def _plan_s1_coarse(schedule: ChunkSchedule) -> tuple[tuple[tuple[int, int] | No
     return tuple(slots)
 
 
-def _plan_vertical_coarse(schedule: ChunkSchedule) -> tuple[tuple[tuple[int, int] | None, ...], ...]:
+def _plan_vertical_coarse(schedule: CellSchedule) -> tuple[tuple[tuple[int, int] | None, ...], ...]:
     """Diagonal Latest-KV at layer-group granularity (before block expand)."""
     n = schedule.chunks
     s = schedule.stages
@@ -255,14 +257,14 @@ def _plan_vertical_coarse(schedule: ChunkSchedule) -> tuple[tuple[tuple[int, int
     return tuple(slots)
 
 
-def _plan_vertical_serial_coarse(schedule: ChunkSchedule) -> tuple[tuple[tuple[int, int] | None, ...], ...]:
+def _plan_vertical_serial_coarse(schedule: CellSchedule) -> tuple[tuple[tuple[int, int] | None, ...], ...]:
     unit = _plan_vertical_coarse(
-        ChunkSchedule(
+        CellSchedule(
             chunks=1,
             num_denoise_steps=schedule.num_denoise_steps,
             stages=schedule.stages,
             layer_groups=schedule.layer_groups,
-            ordering=Ordering.INTERLEAVED,
+            ordering=Ordering.LATEST_KV,
             kv_history_chunks=schedule.kv_history_chunks,
             blocks=schedule.num_blocks,
             blocks_per_rank=schedule.blocks_per_rank,
@@ -277,7 +279,7 @@ def _plan_vertical_serial_coarse(schedule: ChunkSchedule) -> tuple[tuple[tuple[i
 
 def _expand_to_cells(
     coarse: tuple[tuple[tuple[int, int] | None, ...], ...],
-    schedule: ChunkSchedule,
+    schedule: CellSchedule,
 ) -> tuple[tuple[Cell | None, ...], ...]:
     """Expand each coarse ``(c,s)`` on a rank into consecutive local-block ticks."""
     g_size = schedule.layer_groups
@@ -314,7 +316,7 @@ def _completions(slots: tuple[tuple[Cell | None, ...], ...]) -> dict[Cell, int]:
 def _sources_and_transfers(
     slots: tuple[tuple[Cell | None, ...], ...],
     completions: dict[Cell, int],
-    schedule: ChunkSchedule,
+    schedule: CellSchedule,
 ) -> tuple[dict[tuple[int, Cell], tuple[KVSource, ...]], dict[int, tuple[KVTransfer, ...]]]:
     h = schedule.kv_history_chunks
     t_clean = schedule.num_denoise_steps
@@ -387,7 +389,7 @@ def _last_use(
     slots: tuple[tuple[Cell | None, ...], ...],
     sources: dict[tuple[int, Cell], tuple[KVSource, ...]],
     transfers: dict[int, tuple[KVTransfer, ...]],
-    schedule: ChunkSchedule,
+    schedule: CellSchedule,
 ) -> dict[int, dict[Cell, int]]:
     world = schedule.stages * schedule.layer_groups
     last: dict[int, dict[Cell, int]] = {rank: {} for rank in range(world)}
@@ -404,7 +406,7 @@ def _last_use(
     return last
 
 
-def _assert_invariants(plan: ChunkPlan) -> None:
+def _assert_invariants(plan: CellPlan) -> None:
     schedule = plan.schedule
     h = schedule.kv_history_chunks
     for t in range(plan.num_slots):
@@ -430,10 +432,10 @@ def _assert_invariants(plan: ChunkPlan) -> None:
             posted.add(key)
 
 
-def build_chunk_plan(schedule: ChunkSchedule) -> ChunkPlan:
+def build_cell_plan(schedule: CellSchedule) -> CellPlan:
     if schedule.stages == 1:
         coarse = _plan_s1_coarse(schedule)
-    elif schedule.ordering is Ordering.SERIAL:
+    elif schedule.ordering is Ordering.SELF_FORCING:
         coarse = _plan_vertical_serial_coarse(schedule)
     else:
         coarse = _plan_vertical_coarse(schedule)
@@ -464,7 +466,7 @@ def build_chunk_plan(schedule: ChunkSchedule) -> ChunkPlan:
             by_wait.setdefault(wait_slot, set()).add(version)
         for wait_slot, versions in by_wait.items():
             wait_ready[rank][wait_slot] = frozenset(versions)
-    plan = ChunkPlan(schedule, slots, completions, sources, transfers, last_use, wait_ready)
+    plan = CellPlan(schedule, slots, completions, sources, transfers, last_use, wait_ready)
     _assert_invariants(plan)
     return plan
 
@@ -505,7 +507,7 @@ def union_wait_ready(
 def can_admit(
     inflight: tuple[Inflight, ...],
     slot: int,
-    plan: ChunkPlan,
+    plan: CellPlan,
     *,
     max_batch_size: int,
 ) -> bool:

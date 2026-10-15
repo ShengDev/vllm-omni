@@ -7,12 +7,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
-    ChunkPlan,
-    ChunkSchedule,
+from vllm_omni.experimental.ar_diffusion.cell_schedule import (
+    CellPlan,
+    CellSchedule,
     Inflight,
     Ordering,
-    build_chunk_plan,
+    build_cell_plan,
     union_wait_ready,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
@@ -53,7 +53,7 @@ def test_capacity_uses_k1():
 
 def test_capacity_covers_latest_stage_frontier():
     cache = _cache(layer_groups=1, stages=5)
-    # A Latest plan with H=6 and S=5 needs up to 10 live versions on one rank.
+    # A Latest-KV plan with H=6 and S=5 needs up to 10 live versions on one rank.
     assert cache.capacity == 11
 
 
@@ -133,13 +133,13 @@ def test_cached_write_slots_match_compute_slot_mapping(chunk_tokens, write_slot)
 
 
 def test_prepare_evict_releases_last_use():
-    plan = build_chunk_plan(
-        ChunkSchedule(
+    plan = build_cell_plan(
+        CellSchedule(
             chunks=4,
             num_denoise_steps=2,
             stages=3,
             layer_groups=2,
-            ordering=Ordering.INTERLEAVED,
+            ordering=Ordering.LATEST_KV,
             kv_history_chunks=6,
         )
     )
@@ -165,14 +165,14 @@ def test_prepare_evict_releases_last_use():
     ]
 
 
-def _vertical_plan() -> ChunkPlan:
-    return build_chunk_plan(
-        ChunkSchedule(
+def _vertical_plan() -> CellPlan:
+    return build_cell_plan(
+        CellSchedule(
             chunks=4,
             num_denoise_steps=2,
             stages=3,
             layer_groups=2,
-            ordering=Ordering.INTERLEAVED,
+            ordering=Ordering.LATEST_KV,
             kv_history_chunks=6,
         )
     )
@@ -201,13 +201,13 @@ def test_wait_ready_covers_first_remote_consume():
 
 
 def test_wait_ready_is_empty_without_kv_history():
-    plan = build_chunk_plan(
-        ChunkSchedule(
+    plan = build_cell_plan(
+        CellSchedule(
             chunks=2,
             num_denoise_steps=1,
             stages=1,
             layer_groups=2,
-            ordering=Ordering.INTERLEAVED,
+            ordering=Ordering.LATEST_KV,
             kv_history_chunks=0,
         )
     )
@@ -220,13 +220,13 @@ def test_wait_ready_is_empty_without_kv_history():
 @pytest.mark.parametrize("chunk", [1, 3])
 @pytest.mark.parametrize("chunk_tokens", [4, 8, 12])
 def test_attention_reads_only_valid_version_pages(stages, chunk, chunk_tokens):
-    plan = build_chunk_plan(
-        ChunkSchedule(
+    plan = build_cell_plan(
+        CellSchedule(
             chunks=4,
             num_denoise_steps=2,
             stages=stages,
             layer_groups=2,
-            ordering=Ordering.SERIAL,
+            ordering=Ordering.SELF_FORCING,
             kv_history_chunks=6,
         )
     )

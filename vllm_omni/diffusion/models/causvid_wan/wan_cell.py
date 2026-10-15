@@ -11,11 +11,11 @@ import torch
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
-from vllm_omni.experimental.ar_diffusion.chunk_executor import ChunkAdapter
+from vllm_omni.experimental.ar_diffusion.cell_executor import CellAdapter
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 
 
-class WanCell(ChunkAdapter):
+class WanCell(CellAdapter):
     """Run one ``(chunk, step, block)`` cell; last stage applies FlowEuler and records latents."""
 
     def __init__(

@@ -12,7 +12,6 @@ from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import (
     HF_CAUSVID_REPO,
     HF_MODEL_ID,
     CausVidWanPipeline,
-    ChunkWanPipeline,
 )
 from vllm_omni.diffusion.models.causvid_wan.transformer import (
     StageWanTransformer,
@@ -31,7 +30,6 @@ __all__ = [
     "HF_CAUSVID_REPO",
     "HF_MODEL_ID",
     "CausVidWanPipeline",
-    "ChunkWanPipeline",
     "StageWanTransformer",
     "causvid_pt_to_diffusers_state",
     "iter_causvid_diffusers_weights",

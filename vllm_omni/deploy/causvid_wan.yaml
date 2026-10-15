@@ -1,4 +1,4 @@
-# CausVid Wan 2.1 1.3B on Noisy KV (Serial / Latest).
+# CausVid Wan 2.1 1.3B on Noisy KV (Self-Forcing / Latest-KV).
 #
 # Topology: pipeline_parallel_size = S * G with S = num_denoise_steps + 1
 # (CausVid default T=3 noisy + clean → S=4, G=1).
@@ -29,7 +29,7 @@ stages:
         num_chunks: 7
         num_denoise_steps: 3
         kv_history_chunks: 6
-        chunk_schedule: serial
+        cell_schedule: self_forcing
         shift: 8.0
         reset: true
     model_config:

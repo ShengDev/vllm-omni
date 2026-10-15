@@ -12,9 +12,9 @@ from typing import Any, ClassVar
 import torch
 import torch.distributed as dist
 
-from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
+from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     Cell,
-    ChunkPlan,
+    CellPlan,
     Inflight,
     RequestKVTransfer,
     union_transfers,
@@ -516,7 +516,7 @@ class NoisyKVState:
 
     def __init__(self, cache: NoisyKVCache) -> None:
         self.cache = cache
-        self._plans: dict[str, ChunkPlan] = {}
+        self._plans: dict[str, CellPlan] = {}
         self._chunk_tokens: dict[str, int] = {}
         self._last_use_global: dict[str, dict[Cell, int]] = {}
         self.bytes_sent = 0
@@ -548,7 +548,7 @@ class NoisyKVState:
     def wait_sends(self) -> None:
         self.cache.transport.wait_sends()
 
-    def begin_request(self, req: str, plan: ChunkPlan, *, chunk_tokens: int, t0: int = 0) -> None:
+    def begin_request(self, req: str, plan: CellPlan, *, chunk_tokens: int, t0: int = 0) -> None:
         if chunk_tokens <= 0 or chunk_tokens % self.cache.spec.block_size != 0:
             raise ValueError("chunk_tokens must be a positive multiple of block_size")
         if chunk_tokens > self.cache.spec.max_chunk_tokens:

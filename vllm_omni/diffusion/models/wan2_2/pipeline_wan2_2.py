@@ -242,7 +242,7 @@ def create_transformer_from_config(
     """Create WanTransformer3DModel from config dict.
 
     ``layer_pp_rank`` / ``layer_pp_world`` optionally override Omni's live PP
-    group when slicing DiT blocks (Chunk / Noisy KV layer groups ``G``).
+    group when slicing DiT blocks (Cell / Noisy KV layer groups ``G``).
     """
     kwargs: dict = {}
 

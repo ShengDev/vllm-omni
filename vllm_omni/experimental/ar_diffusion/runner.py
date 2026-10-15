@@ -21,7 +21,7 @@ from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunn
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVCacheSpec,
-    SupportsARDiffusionChunkPipeline,
+    SupportsARDiffusionCellPipeline,
     SupportsARDiffusionPipeline,
     SupportsARDiffusionWarmup,
     supports_chunk_step_grouping,
@@ -121,7 +121,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self.kv_cache: ARDiffusionKVCache | None = None
         self.noisy_kv_cache: NoisyKVCache | None = None
         self._ar_diffusion_capability: SupportsARDiffusionPipeline | None = None
-        self._ar_diffusion_chunk_capability: SupportsARDiffusionChunkPipeline | None = None
+        self._ar_diffusion_cell_capability: SupportsARDiffusionCellPipeline | None = None
         self._ar_diffusion_kv_cache_spec: ARDiffusionKVCacheSpec | None = None
         self._sessions: OrderedDict[str, ARDiffusionKVState] = OrderedDict()
         self._session_capacity = 0
@@ -174,7 +174,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         return dict(raw) if isinstance(raw, dict) else {}
 
     def _preallocate_noisy_kv(
-        self, capability: SupportsARDiffusionChunkPipeline, *, available_bytes: int | None = None
+        self, capability: SupportsARDiffusionCellPipeline, *, available_bytes: int | None = None
     ) -> None:
         spec = capability.ar_diffusion_noisy_kv_spec()
         stage_cfg = self._stage_config()
@@ -184,7 +184,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             raise ValueError(f"pipeline_parallel_size={pp_world} must be divisible by stage_parallel_size={stages}")
         layer_groups = pp_world // stages
         max_batch_size = int(stage_cfg.get("max_batch_size", 1) or 1)
-        self._ar_diffusion_chunk_capability = capability
+        self._ar_diffusion_cell_capability = capability
         avail = self._available_memory_bytes() if available_bytes is None else available_bytes
         layer_offset = int(getattr(getattr(self.pipeline, "transformer", None), "start_layer", 0) or 0)
         blocks_per_rank = max(1, int(spec.num_layers))
@@ -219,7 +219,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 "ARDiffusionModelRunner currently supports request-mode execution only; "
                 "step_execution=True would bypass per-request AR session binding."
             )
-        if isinstance(self.pipeline, SupportsARDiffusionChunkPipeline):
+        if isinstance(self.pipeline, SupportsARDiffusionCellPipeline):
             self._preallocate_noisy_kv(self.pipeline, available_bytes=available_bytes)
             return
         max_num_seqs = int(getattr(self.od_config, "max_num_seqs", 1) or 1)
@@ -428,10 +428,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 )
 
     def _make_chunk_context(self):
-        from vllm_omni.experimental.ar_diffusion.chunk_executor import (
-            ARDiffusionChunkContext,
-            ChunkRunSpec,
-            ChunkTopology,
+        from vllm_omni.experimental.ar_diffusion.cell_executor import (
+            ARDiffusionCellContext,
+            CellRunSpec,
+            CellTopology,
             resolve_pp_rank_and_group,
         )
 
@@ -440,10 +440,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         stage_cfg = self._stage_config()
         stages = int(stage_cfg.get("stage_parallel_size", 1) or 1)
         pp_world = int(getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
-        topology = ChunkTopology(stages=stages, layer_groups=max(1, pp_world // max(1, stages)))
+        topology = CellTopology(stages=stages, layer_groups=max(1, pp_world // max(1, stages)))
         rank, pp_group = resolve_pp_rank_and_group()
-        return ARDiffusionChunkContext(
-            spec=ChunkRunSpec(
+        return ARDiffusionCellContext(
+            spec=CellRunSpec(
                 topology=topology,
                 max_batch_size=int(stage_cfg.get("max_batch_size", 1) or 1),
                 rank=rank,
@@ -458,11 +458,11 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         kv_prefetch_job: KVPrefetchJob | None = None,
         diffusion_kv_metadata: DiffusionKVMetadata | None = None,
     ) -> DiffusionOutput:
-        if self.noisy_kv_cache is not None and self._ar_diffusion_chunk_capability is not None:
+        if self.noisy_kv_cache is not None and self._ar_diffusion_cell_capability is not None:
             started = time.perf_counter()
             ctx = self._make_chunk_context()
             try:
-                with self._ar_diffusion_chunk_capability.bind_ar_diffusion_chunk_context(ctx):
+                with self._ar_diffusion_cell_capability.bind_ar_diffusion_cell_context(ctx):
                     output = super().execute_model(
                         req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
                     )
@@ -500,10 +500,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         od_config: OmniDiffusionConfig,
     ) -> BatchRunnerOutput:
         """Noisy KV chunk path may micro-batch requests; paged timeline KV stays single-seq."""
-        if self.noisy_kv_cache is not None and self._ar_diffusion_chunk_capability is not None:
+        if self.noisy_kv_cache is not None and self._ar_diffusion_cell_capability is not None:
             ctx = self._make_chunk_context()
             try:
-                with self._ar_diffusion_chunk_capability.bind_ar_diffusion_chunk_context(ctx):
+                with self._ar_diffusion_cell_capability.bind_ar_diffusion_cell_context(ctx):
                     return super().execute_model_batch(scheduler_output, od_config)
             except Exception:
                 ctx.kv.reset_all()

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Chunk pipeline slot loop: microbatch, chain P2P, noisy KV exchange."""
+"""Cell pipeline slot loop: microbatch, chain P2P, noisy KV exchange."""
 
 from __future__ import annotations
 
@@ -14,9 +14,9 @@ import torch
 import torch.distributed as dist
 from vllm.logger import init_logger
 
-from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
+from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     Cell,
-    ChunkPlan,
+    CellPlan,
     Inflight,
     can_admit,
     is_group_boundary,
@@ -26,9 +26,6 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVState
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
-
-# Backward-compatible alias.
-ChunkStep = Cell
 
 
 def activation_use_tensor_dict() -> bool:
@@ -48,7 +45,7 @@ def _pp_global_rank(pp_group: Any, group_rank: int) -> int:
 def _consumer_stash_meta(
     src_tasks: tuple[tuple[str, Cell], ...],
     *,
-    topology: ChunkTopology,
+    topology: CellTopology,
     src: int,
 ) -> tuple[str, int, int]:
     """Stash under the consumer's ``(chunk, step)`` (what ``take_stashed_activation`` looks up).
@@ -65,7 +62,7 @@ def _consumer_stash_meta(
 
 def _activation_edges(
     *,
-    topology: ChunkTopology,
+    topology: CellTopology,
     inflight: tuple[Any, ...],
     slot: int,
     schedule: Any,
@@ -108,8 +105,8 @@ def _post_activations_ws(
     *,
     rank: int,
     output: Any | None,
-    adapter: ChunkAdapter,
-    topology: ChunkTopology,
+    adapter: CellAdapter,
+    topology: CellTopology,
     device: torch.device,
 ) -> None:
     """Fixed-shape activation P2P: one ``batch_isend_irecv``, wait before return."""
@@ -159,7 +156,7 @@ def resolve_pp_rank_and_group() -> tuple[int, Any | None]:
 
 
 @dataclass(frozen=True)
-class ChunkTopology:
+class CellTopology:
     stages: int
     layer_groups: int
 
@@ -182,8 +179,8 @@ class ChunkTopology:
 
 
 @dataclass
-class ChunkRunSpec:
-    topology: ChunkTopology
+class CellRunSpec:
+    topology: CellTopology
     max_batch_size: int = 1
     rank: int = 0
     pp_group: Any | None = None
@@ -192,21 +189,21 @@ class ChunkRunSpec:
 @dataclass(frozen=True)
 class PendingAdmit:
     req: str
-    plan: ChunkPlan
+    plan: CellPlan
     chunk_tokens: int
 
 
 @dataclass
-class ARDiffusionChunkContext:
-    spec: ChunkRunSpec
+class ARDiffusionCellContext:
+    spec: CellRunSpec
     kv: NoisyKVState
     inflight: list[Inflight] = field(default_factory=list)
     pending: list[PendingAdmit] = field(default_factory=list)
 
-    def enqueue(self, req: str, plan: ChunkPlan, *, chunk_tokens: int) -> None:
+    def enqueue(self, req: str, plan: CellPlan, *, chunk_tokens: int) -> None:
         self.pending.append(PendingAdmit(req=req, plan=plan, chunk_tokens=chunk_tokens))
 
-    def admit(self, req: str, plan: ChunkPlan, *, chunk_tokens: int, slot: int) -> bool:
+    def admit(self, req: str, plan: CellPlan, *, chunk_tokens: int, slot: int) -> bool:
         pending = tuple(self.inflight)
         if not can_admit(pending, slot, plan, max_batch_size=self.spec.max_batch_size):
             return False
@@ -236,7 +233,7 @@ class ARDiffusionChunkContext:
         self.pending = still
 
 
-class ChunkAdapter:
+class CellAdapter:
     """Model-side cell step: one block per request on this rank."""
 
     def forward(
@@ -298,10 +295,10 @@ def _tasks_need_activation_send(
     return any(is_group_boundary(cell, schedule) for _req, cell in tasks)
 
 
-def run_chunk_pipeline(
+def run_cell_pipeline(
     *,
-    ctx: ARDiffusionChunkContext,
-    adapter: ChunkAdapter,
+    ctx: ARDiffusionCellContext,
+    adapter: CellAdapter,
     max_slots: int | None = None,
 ) -> None:
     """Run inflight plans on this rank (one cell per tick).
@@ -426,10 +423,10 @@ def run_chunk_pipeline(
 
 
 @contextmanager
-def bind_ar_diffusion_chunk_context(owner: Any, ctx: ARDiffusionChunkContext) -> Iterator[ARDiffusionChunkContext]:
-    prev = getattr(owner, "_ar_diffusion_chunk_context", None)
-    owner._ar_diffusion_chunk_context = ctx
+def bind_ar_diffusion_cell_context(owner: Any, ctx: ARDiffusionCellContext) -> Iterator[ARDiffusionCellContext]:
+    prev = getattr(owner, "_ar_diffusion_cell_context", None)
+    owner._ar_diffusion_cell_context = ctx
     try:
         yield ctx
     finally:
-        owner._ar_diffusion_chunk_context = prev
+        owner._ar_diffusion_cell_context = prev
