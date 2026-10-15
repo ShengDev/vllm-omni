@@ -334,9 +334,7 @@ class CausVidWanPipeline(nn.Module):
         stages = self.stage_parallel_size
         if stages not in (1, denoise + 1):
             if explicit_denoise is not None:
-                raise ValueError(
-                    f"CausVidWan stages must be 1 or num_denoise_steps+1 ({denoise + 1}), got {stages}"
-                )
+                raise ValueError(f"CausVidWan stages must be 1 or num_denoise_steps+1 ({denoise + 1}), got {stages}")
             denoise = stages - 1
         num_blocks = int(getattr(self.transformer, "num_layers", 0) or 0)
         local_blocks = int(getattr(self.transformer, "local_num_layers", 0) or 0)
@@ -543,4 +541,3 @@ class CausVidWanPipeline(nn.Module):
 
 # Back-compat registry / test alias (same class).
 ChunkWanPipeline = CausVidWanPipeline
-

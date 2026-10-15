@@ -50,6 +50,7 @@ from vllm_omni.model_executor.models.bagel.pipeline import (
     BAGEL_THINK_PIPELINE,
 )
 from vllm_omni.model_executor.models.breeze_tts_2.pipeline import BREEZE_TTS_2_PIPELINE
+from vllm_omni.model_executor.models.causvid_wan.pipeline import CAUSVID_WAN_PIPELINE
 from vllm_omni.model_executor.models.cosmos3.pipeline import (
     COSMOS3_OMNI_DEPLOY_PIPELINE,
     COSMOS3_POLICY_PIPELINE,
@@ -126,7 +127,6 @@ from vllm_omni.model_executor.models.step_audio2.pipeline import (
 )
 from vllm_omni.model_executor.models.voxcpm2.pipeline import VOXCPM2_PIPELINE
 from vllm_omni.model_executor.models.voxtral_tts.pipeline import VOXTRAL_TTS_PIPELINE
-from vllm_omni.model_executor.models.causvid_wan.pipeline import CAUSVID_WAN_PIPELINE
 from vllm_omni.model_executor.models.wan2_2.pipeline import (
     WAN2_2_EG_PIPELINE,
     WAN2_2_EGD_PIPELINE,

@@ -128,9 +128,7 @@ def start_async_stream_decode(
     if pp_rank == 0:
         if vae is None or decoder is None:
             raise ValueError("VAE owner requires VAE + WanStreamingDecoder for stream_decode")
-        buffers = [
-            torch.empty(latent_shape, device="cpu", dtype=dtype, pin_memory=True) for _ in range(n_chunks)
-        ]
+        buffers = [torch.empty(latent_shape, device="cpu", dtype=dtype, pin_memory=True) for _ in range(n_chunks)]
         recv_works = [dist.irecv(buf, src=source, group=stream_group) for buf in buffers]
         pixels_out: list[torch.Tensor] = []
         error: list[BaseException] = []

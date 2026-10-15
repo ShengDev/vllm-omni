@@ -10,12 +10,6 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.distributed.group_coordinator import GroupCoordinator
-
-
-def get_open_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 from vllm_omni.experimental.ar_diffusion.chunk_schedule import ChunkSchedule, Inflight, Ordering, build_chunk_plan
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     ARDiffusionNoisyKVSpec,
@@ -25,6 +19,12 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+def get_open_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def _transfer_worker(rank: int, chunk_tokens: int, init_method: str, device_kind: str, mode: str) -> None:

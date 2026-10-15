@@ -23,6 +23,7 @@ from vllm_omni.experimental.ar_diffusion.chunk_schedule import (
     rank_work,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVState
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -133,14 +134,10 @@ def _post_activations_ws(
                 ops.append(dist.P2POp(dist.isend, tensor, peer, group))
         elif rank == dst:
             peer = _pp_global_rank(pp_group, src)
-            payload = {
-                key: torch.empty(shape, dtype=dtype, device=device) for key, shape, dtype in spec_list
-            }
+            payload = {key: torch.empty(shape, dtype=dtype, device=device) for key, shape, dtype in spec_list}
             for key, _shape, _dtype in spec_list:
                 ops.append(dist.P2POp(dist.irecv, payload[key], peer, group))
-            recv_jobs.append(
-                (payload, _consumer_stash_meta(src_tasks, topology=topology, src=src))
-            )
+            recv_jobs.append((payload, _consumer_stash_meta(src_tasks, topology=topology, src=src)))
 
     if ops:
         _wait(list(dist.batch_isend_irecv(ops)))
@@ -331,10 +328,12 @@ def run_chunk_pipeline(
         kv_stream = kv.uses_comm_stream
         prev_slot_for_evict: int | None = None
         act_device = getattr(adapter, "device", None)
-        if act_device is None and torch.cuda.is_available():
-            act_device = torch.device("cuda", torch.cuda.current_device())
-        elif act_device is None:
-            act_device = torch.device("cpu")
+        if act_device is None:
+            act_device = (
+                current_omni_platform.get_torch_device()
+                if current_omni_platform.get_device_count() > 0
+                else torch.device("cpu")
+            )
         use_ws_act = (
             pp is not None
             and spec.topology.world > 1
@@ -383,9 +382,7 @@ def run_chunk_pipeline(
                             comm_handles.extend(recv_handles)
                             adapter.stash_activation(
                                 recv,
-                                meta=_consumer_stash_meta(
-                                    src_tasks, topology=spec.topology, src=src
-                                ),
+                                meta=_consumer_stash_meta(src_tasks, topology=spec.topology, src=src),
                             )
                 elif edges:
                     _post_activations_ws(

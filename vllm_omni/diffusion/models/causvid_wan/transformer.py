@@ -71,8 +71,7 @@ def _wan_self_attn_with_kv(
             hidden_states = out.unsqueeze(0).flatten(2, 3).type_as(query)
         else:
             outs = [
-                paged_write_attn(inputs, query[i], key[i], value[i], None, None, scale)
-                for i in range(query.shape[0])
+                paged_write_attn(inputs, query[i], key[i], value[i], None, None, scale) for i in range(query.shape[0])
             ]
             hidden_states = torch.stack(outs, dim=0).flatten(2, 3).type_as(query)
     else:
@@ -143,9 +142,7 @@ class StageWanTransformer(nn.Module):
                     "num_layers": int(fallback_geo["num_layers"]),
                 }
             )
-        wan = create_transformer_from_config(
-            cfg, layer_pp_rank=self.group, layer_pp_world=self.layer_groups
-        )
+        wan = create_transformer_from_config(cfg, layer_pp_rank=self.group, layer_pp_world=self.layer_groups)
         self._wan = wan
         self.num_layers = int(cfg["num_layers"])
         self.num_heads = int(cfg["num_attention_heads"])
@@ -305,9 +302,7 @@ class StageWanTransformer(nn.Module):
         batch_size, _c, num_frames, height, width = latent.shape
         p_t, p_h, p_w = self.patch_size
         post_t, post_h, post_w = num_frames // p_t, height // p_h, width // p_w
-        temb, _, _ = self._embedding(
-            step, timestep, batch_size=batch_size, device=latent.device, dtype=latent.dtype
-        )
+        temb, _, _ = self._embedding(step, timestep, batch_size=batch_size, device=latent.device, dtype=latent.dtype)
         shift, scale = wan.output_scale_shift_prepare(temb)
         shift, scale = shift.to(hidden.device), scale.to(hidden.device)
         if shift.ndim == 2:
@@ -332,11 +327,7 @@ class StageWanTransformer(nn.Module):
         """Compose cell APIs (multi-layer or ``only_block``)."""
         if self._text is None:
             self.prepare_cell(encoder_hidden_states)
-        layer_ids = (
-            [only_block]
-            if only_block is not None
-            else list(range(self.start_layer, self.end_layer))
-        )
+        layer_ids = [only_block] if only_block is not None else list(range(self.start_layer, self.end_layer))
         first_local = layer_ids[0] == self.start_layer
         last_local = layer_ids[-1] == self.end_layer - 1
         if first_local and self.is_stage_first:
@@ -349,9 +340,7 @@ class StageWanTransformer(nn.Module):
             ctx = None
             if kv_contexts is not None:
                 ctx = kv_contexts[0] if len(kv_contexts) == 1 else kv_contexts[idx - self.start_layer]
-            hidden = self.block(
-                idx, hidden, chunk=chunk, step=step, latent=latent, timestep=timestep, kv_ctx=ctx
-            )
+            hidden = self.block(idx, hidden, chunk=chunk, step=step, latent=latent, timestep=timestep, kv_ctx=ctx)
         if not (last_local and self.is_stage_last):
             return IntermediateTensors({"hidden_states": hidden})
         return self.unembed(hidden, chunk=chunk, step=step, latent=latent, timestep=timestep)

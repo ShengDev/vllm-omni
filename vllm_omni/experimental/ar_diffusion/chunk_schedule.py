@@ -332,9 +332,7 @@ def _sources_and_transfers(
             found: list[KVSource] = []
             for prev in range(max(0, chunk - h), chunk):
                 candidates = [
-                    s_prime
-                    for s_prime in range(t_clean + 1)
-                    if completions.get((prev, s_prime, block), 10**9) < t
+                    s_prime for s_prime in range(t_clean + 1) if completions.get((prev, s_prime, block), 10**9) < t
                 ]
                 if not candidates:
                     continue
@@ -347,9 +345,7 @@ def _sources_and_transfers(
                     if key not in seen:
                         seen.add(key)
                         prod = completions[version]
-                        transfer_acc.setdefault(prod, []).append(
-                            KVTransfer(version=version, src=owner, dst=rank)
-                        )
+                        transfer_acc.setdefault(prod, []).append(KVTransfer(version=version, src=owner, dst=rank))
             sources[(rank, task)] = tuple(found)
 
     transfers = {

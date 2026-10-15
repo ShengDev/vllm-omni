@@ -121,9 +121,7 @@ def load_causvid_generator_state(path: str | Path) -> dict[str, torch.Tensor]:
     elif isinstance(ckpt, dict) and all(isinstance(v, torch.Tensor) for v in ckpt.values()):
         raw = ckpt
     else:
-        raise ValueError(
-            f"CausVid checkpoint {path} must be a state dict or contain a 'generator' entry"
-        )
+        raise ValueError(f"CausVid checkpoint {path} must be a state dict or contain a 'generator' entry")
     if not isinstance(raw, dict):
         raise TypeError(f"CausVid generator must be a dict, got {type(raw)}")
     return {k: v for k, v in raw.items() if isinstance(v, torch.Tensor)}

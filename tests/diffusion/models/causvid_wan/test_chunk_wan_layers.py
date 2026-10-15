@@ -12,9 +12,9 @@ import torch
 from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer, stage_layer_range
 from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
-from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.experimental.ar_diffusion.chunk_executor import ARDiffusionChunkContext, ChunkRunSpec, ChunkTopology
+from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec, NoisyKVCache, NoisyKVState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 

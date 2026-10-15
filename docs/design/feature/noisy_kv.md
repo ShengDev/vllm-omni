@@ -69,9 +69,8 @@ ARDiffusionModelRunner
         └────► kv_cache/noisy.py
 ```
 
-Architecture diagrams (two stacks, call chain, KV peers, target layout) live under
-[`figs/`](figs/) and are embedded in the Chinese design note
-[`noisy_kv.zh.md`](noisy_kv.zh.md) (§2.3).
+Architecture diagrams (two stacks, call chain, KV peers, target layout) are
+kept with the local design notes (not published in this doc tree).
 
 ### Tick loop
 
