@@ -595,6 +595,9 @@ def _ring_flash(
     slots_ptr,
     lengths_ptr,
     out_ptr,
+    tok_starts_ptr,
+    entry_seg_ptr,
+    entry_blk_ptr,
     qs0: tl.constexpr,
     qs1: tl.constexpr,
     qs2: tl.constexpr,
@@ -624,6 +627,7 @@ def _ring_flash(
     row_starts: tl.constexpr,
     skip_interior_mask: tl.constexpr,
     fma_scale: tl.constexpr,
+    packed: tl.constexpr,
     USE_PDL: tl.constexpr = False,  # noqa: N803
 ):
     """Ring write + attention in one pass, without redundant work.
@@ -649,26 +653,44 @@ def _ring_flash(
     different MMA/reduction layout for multi-warpgroup tiles; the launcher
     enables them only for the single-warpgroup 64-row tile.
 
+    ``packed``: q/k/v/out hold one (1, H, N, D) sequence of segments, one per
+    stream. Program ``(e, head)`` takes query block ``entry_blk[e]`` of
+    segment ``entry_seg[e]``, whose tokens start at ``tok_starts[segment]``;
+    per-row arithmetic is that of the batched launch with the same tile.
     """
     if USE_PDL:
         _gdc_wait()
         _gdc_launch()
     pid_m = tl.program_id(0)
     bh = tl.program_id(1)
-    batch, head = bh // num_heads, bh % num_heads
+    if packed:
+        head = bh
+        batch = tl.load(entry_seg_ptr + pid_m).to(tl.int32)
+        pid_m = tl.load(entry_blk_ptr + pid_m).to(tl.int32)
+        tok0 = tl.load(tok_starts_ptr + batch).to(tl.int64)
+    else:
+        batch, head = bh // num_heads, bh % num_heads
+        tok0 = 0
     slot = tl.load(slots_ptr + batch * slot_stride)
     length = tl.load(lengths_ptr + batch * length_stride).to(tl.int32)
     start = tl.load(starts_ptr + (batch if row_starts else slot) * start_stride)
     end = start + length
-    row_limit = num_frames
+    # Rows past the segment belong to the next stream in packed mode.
+    row_limit = length if packed else num_frames
     rows = pid_m * block_m + tl.arange(0, block_m)
     dims = tl.arange(0, head_dim)
     base = (slot * num_heads + head) * ring_capacity * head_dim
     v_base = state_capacity * num_heads * ring_capacity * head_dim + base
-    q_ptr += batch * qs0 + head * qs1
-    out_ptr += batch * os0 + head * os1
-    k_row = k_ptr + batch * ks0 + head * ks1
-    v_row = v_ptr + batch * vs0 + head * vs1
+    if packed:
+        q_ptr += head * qs1 + tok0 * qs2
+        out_ptr += head * os1 + tok0 * os2
+        k_row = k_ptr + head * ks1 + tok0 * ks2
+        v_row = v_ptr + head * vs1 + tok0 * vs2
+    else:
+        q_ptr += batch * qs0 + head * qs1
+        out_ptr += batch * os0 + head * os1
+        k_row = k_ptr + batch * ks0 + head * ks1
+        v_row = v_ptr + batch * vs0 + head * vs1
     scale: tl.constexpr = head_dim**-0.5
 
     # Ring write of this block's rows. Chunks longer than the ring keep only
@@ -795,6 +817,9 @@ def _launch_flash(q, k, v, cache, starts, slot_ids, valid_lengths, context, row_
         slot_ids,
         valid_lengths,
         out,
+        slot_ids,  # packed-only pointers, unused
+        slot_ids,
+        slot_ids,
         *q.stride(),
         *k.stride(),
         *v.stride(),
@@ -813,12 +838,155 @@ def _launch_flash(q, k, v, cache, starts, slot_ids, valid_lengths, context, row_
         row_starts,
         one_warpgroup,
         one_warpgroup and d == 64,
+        False,
         USE_PDL=_USE_PDL,
         launch_pdl=_USE_PDL,
         num_warps=nw,
         num_stages=ns,
     )
     return out
+
+
+def packed_block_entries(lengths: torch.Tensor, block_m: int, capacity: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(entry_seg, entry_blk)`` of ``capacity`` program entries for packed segments.
+
+    Segment ``s`` owns ``cdiv(lengths[s], block_m)`` query blocks, listed in
+    segment order; spare entries get block index ``capacity`` (no valid row).
+    ``capacity`` must be at least the number of blocks: ``N // block_m + S``
+    for ``N`` packed tokens in ``S`` segments always is.
+    """
+    blocks = (lengths + block_m - 1) // block_m
+    ends = torch.cumsum(blocks, 0)
+    entry = torch.arange(capacity, device=lengths.device, dtype=ends.dtype)
+    seg = torch.searchsorted(ends, entry, right=True).clamp_(max=lengths.shape[0] - 1)
+    blk = entry - (ends[seg] - blocks[seg])
+    blk = torch.where(entry < ends[-1], blk, capacity)
+    return seg.to(torch.int32), blk.to(torch.int32)
+
+
+def _launch_flash_packed(
+    q, k, v, cache, starts, slot_ids, lengths, tok_starts, entry_seg, entry_blk, context, block_m, launch
+):
+    _, h, _, d = q.shape
+    s, c = cache.shape[1], cache.shape[3]
+    out = _bthd_out(q)
+    block_n, nw, ns = launch
+    nw = nw or (8 if c <= 256 else 4)
+    one_warpgroup = block_m == 64 and nw == 4
+    # Strides and sizes are constexpr: drop the N-dependent ones (the batch
+    # stride and the frame count, unused when packed) so every packed size
+    # shares one compiled kernel per stage. Token-major q/k/v keep the rest fixed.
+    _ring_flash[(entry_seg.shape[0], h)](
+        q,
+        k,
+        v,
+        cache,
+        starts,
+        slot_ids,
+        lengths,
+        out,
+        tok_starts,
+        entry_seg,
+        entry_blk,
+        0,
+        *q.stride()[1:],
+        0,
+        *k.stride()[1:],
+        0,
+        *v.stride()[1:],
+        0,
+        *out.stride()[1:3],
+        starts.stride(0),
+        slot_ids.stride(0),
+        lengths.stride(0),
+        s,
+        h,
+        1,
+        c,
+        d,
+        context,
+        block_m,
+        block_n or 64,
+        True,
+        one_warpgroup,
+        one_warpgroup and d == 64,
+        True,
+        USE_PDL=_USE_PDL,
+        launch_pdl=_USE_PDL,
+        num_warps=nw,
+        num_stages=ns or 2,
+    )
+    return out
+
+
+@torch.library.custom_op("vllm_omni::moss_slot_ring_flash_attention_packed", mutates_args=("cache",))
+def slot_ring_flash_attention_packed(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cache: torch.Tensor,
+    starts: torch.Tensor,
+    slot_ids: torch.Tensor,
+    lengths: torch.Tensor,
+    tok_starts: torch.Tensor,
+    entry_seg: torch.Tensor,
+    entry_blk: torch.Tensor,
+    context: int,
+    block_m: int,
+    block_n: int = 0,
+    num_warps: int = 0,
+    num_stages: int = 0,
+) -> torch.Tensor:
+    """Ring write + attention for streams packed along time.
+
+    q/k/v are (1, H, N, D): segment ``s`` is tokens ``[tok_starts[s],
+    tok_starts[s] + lengths[s])`` of state slot ``slot_ids[s]``, whose
+    pre-call position is ``starts[s]``. Rows of a segment get the arithmetic
+    of a batched ``slot_ring_flash_attention_rows`` launch with tile
+    ``block_m``. Slots must be unique; the caller advances the offsets.
+    Output rows outside every segment are left unwritten. ``block_n``,
+    ``num_warps`` and ``num_stages`` (0: the batched launch's) retile the
+    key loop: same math, rounding-level differences.
+    """
+    _check_inputs(q, k, v, cache, (starts, slot_ids, lengths, tok_starts, entry_seg, entry_blk), context)
+    if q.shape[0] != 1 or block_m not in (16, 32, 64, 128):
+        raise ValueError("packed attention takes one (1, H, N, D) sequence and block_m 16/32/64/128")
+    return _launch_flash_packed(
+        q,
+        k,
+        v,
+        cache,
+        starts,
+        slot_ids,
+        lengths,
+        tok_starts,
+        entry_seg,
+        entry_blk,
+        context,
+        block_m,
+        (block_n, num_warps, num_stages),
+    )
+
+
+@slot_ring_flash_attention_packed.register_fake
+def _(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cache: torch.Tensor,
+    starts: torch.Tensor,
+    slot_ids: torch.Tensor,
+    lengths: torch.Tensor,
+    tok_starts: torch.Tensor,
+    entry_seg: torch.Tensor,
+    entry_blk: torch.Tensor,
+    context: int,
+    block_m: int,
+    block_n: int = 0,
+    num_warps: int = 0,
+    num_stages: int = 0,
+) -> torch.Tensor:
+    return _bthd_out(q)
 
 
 @torch.library.custom_op("vllm_omni::moss_slot_ring_flash_attention", mutates_args=("cache", "end_offset"))
