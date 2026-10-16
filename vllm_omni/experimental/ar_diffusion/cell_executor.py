@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -29,13 +28,8 @@ logger = init_logger(__name__)
 
 
 def activation_use_tensor_dict() -> bool:
-    """Legacy Gloo-metadata activation path (``AR_DIFFUSION_ACT_USE_TENSOR_DICT=1``)."""
-    return os.environ.get("AR_DIFFUSION_ACT_USE_TENSOR_DICT", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    """Legacy Gloo-metadata activation path (disabled; hot path only)."""
+    return False
 
 
 def _pp_global_rank(pp_group: Any, group_rank: int) -> int:

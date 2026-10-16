@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, ClassVar
@@ -227,23 +226,13 @@ def _wait_handles(handles: list[Any] | None) -> None:
 
 
 def kv_comm_stream_enabled() -> bool:
-    """Dedicated CUDA stream + deferred send wait (``AR_DIFFUSION_KV_COMM_STREAM=1``)."""
-    return os.environ.get("AR_DIFFUSION_KV_COMM_STREAM", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    """Dedicated CUDA stream + deferred send wait (disabled; default transport only)."""
+    return False
 
 
 def kv_use_tensor_dict() -> bool:
-    """Legacy Gloo-metadata KV path (``AR_DIFFUSION_KV_USE_TENSOR_DICT=1``)."""
-    return os.environ.get("AR_DIFFUSION_KV_USE_TENSOR_DICT", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    """Legacy Gloo-metadata KV path (disabled; hot path only)."""
+    return False
 
 
 def _pg_for_tensor(pp_group: Any, tensor: torch.Tensor) -> Any:
