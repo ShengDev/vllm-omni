@@ -462,7 +462,7 @@ def test_decode_failure_after_kv_commit_releases_session(monkeypatch):
     assert kv is not None
     free_total = kv.manager.block_pool.get_num_free_blocks()
 
-    def decode_failure(self, req, kv_prefetch_job=None):
+    def decode_failure(self, req, kv_prefetch_job=None, diffusion_kv_metadata=None):
         state = commit_one_block(runner, "broken", "main")
         assert state is pipeline.bound_state
         assert state._committed["main"] > 0

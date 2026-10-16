@@ -300,7 +300,13 @@ class NoisyKVTransport:
             chunk_tokens_by_request=chunk_tokens_by_request,
             use_stream=defer,
         )
-        return [] if defer else list(self._send_handles)
+        if defer:
+            return []
+        # Caller owns waiting these handles (cell_executor / tests). Clear so
+        # wait_sends/end_request do not wait again — gloo double-wait hangs.
+        handles = list(self._send_handles)
+        self._send_handles = []
+        return handles
 
     def _exchange_tensor_dict(
         self,
@@ -327,7 +333,9 @@ class NoisyKVTransport:
                 merged.extend(recv_handles)
                 self._pending_recv[key] = (merged, payload, nbytes)
                 n_recv += 1
-        return list(self._send_handles)
+        handles = list(self._send_handles)
+        self._send_handles = []
+        return handles
 
     def _exchange_fixed_nccl(
         self,
@@ -404,9 +412,8 @@ class NoisyKVTransport:
 
     def wait_sends(self) -> None:
         """Host-wait deferred outbound KV (comm-stream mode)."""
-        if not self._send_handles:
-            return
-        _wait_handles(self._send_handles)
+        if self._send_handles:
+            _wait_handles(self._send_handles)
         self._send_handles = []
         self._send_keepalives = []
 
