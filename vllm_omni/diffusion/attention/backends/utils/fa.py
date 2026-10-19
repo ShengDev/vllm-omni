@@ -230,7 +230,10 @@ def resolve_vllm_flash_attn_version(requested: str | int | None = None) -> int:
 
 
 def _is_vllm_flash_attn_varlen(attn_func: FlashAttnFn) -> bool:
-    """Return whether ``attn_func`` is vLLM's versioned varlen dispatcher."""
+    """Return whether ``attn_func`` is vLLM's versioned varlen dispatcher.
+
+    Identity by design; compiled-specs variants intentionally fall through.
+    """
     try:
         from vllm.vllm_flash_attn import flash_attn_varlen_func as vllm_func
     except ImportError:
