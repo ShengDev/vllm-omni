@@ -339,8 +339,7 @@ class CausVidWanPipeline(nn.Module):
             ordering = Ordering.SAME_STEP
         else:
             raise ValueError(
-                "cell_schedule must be 'self_forcing', 'latest_kv', or 'same_step', "
-                f"got {schedule_name!r}"
+                f"cell_schedule must be 'self_forcing', 'latest_kv', or 'same_step', got {schedule_name!r}"
             )
         stages = self.stage_parallel_size
         if stages not in (1, denoise + 1):
