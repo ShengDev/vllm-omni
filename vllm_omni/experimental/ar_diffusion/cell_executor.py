@@ -44,12 +44,12 @@ def _consumer_stash_meta(
 ) -> tuple[str, int, int]:
     """Stash under the consumer's ``(chunk, step)`` (what ``take_stashed_activation`` looks up).
 
-    Producer schedule meta alone is wrong across denoise stages: consumer step is
-    ``producer_step + 1``. Same-stage layer-group boundaries keep the step.
+    Producer schedule meta alone is wrong across step replicas: consumer step is
+    ``producer_step + 1``. Same-step layer-group boundaries keep the step.
     """
     _req, cell = src_tasks[0]
     chunk, step, _block = cell
-    if topology.is_stage_last(src):
+    if topology.is_layer_group_last(src):
         step = int(step) + 1
     return ("", int(chunk), int(step))
 
@@ -110,7 +110,7 @@ def _post_activations_ws(
 
     for src, dst, src_tasks in edges:
         batch = max(1, len(src_tasks))
-        include_hidden = not topology.is_stage_last(src)
+        include_hidden = not topology.is_layer_group_last(src)
         spec_list = adapter.activation_spec(batch=batch, include_hidden=include_hidden)
         if not spec_list:
             continue
@@ -163,11 +163,13 @@ class CellTopology:
             return 0, rank
         return rank // self.layer_groups, rank % self.layer_groups
 
-    def is_stage_first(self, rank: int) -> bool:
+    def is_layer_group_first(self, rank: int) -> bool:
+        """``g == 0`` for this rank's step replica."""
         _, g = self.split_rank(rank)
         return g == 0
 
-    def is_stage_last(self, rank: int) -> bool:
+    def is_layer_group_last(self, rank: int) -> bool:
+        """``g == G-1`` for this rank's step replica."""
         _, g = self.split_rank(rank)
         return g == self.layer_groups - 1
 

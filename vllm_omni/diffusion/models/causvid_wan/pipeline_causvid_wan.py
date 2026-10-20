@@ -329,7 +329,11 @@ class CausVidWanPipeline(nn.Module):
         denoise = self._default_denoise if explicit_denoise is None else int(explicit_denoise)
         if denoise < 1:
             raise ValueError(f"num_denoise_steps must be positive, got {denoise}")
-        history = int(extra.get("kv_history_chunks", 0) or 0)
+        if "kv_history_chunks" in extra:
+            history = int(extra.get("kv_history_chunks") or 0)
+        else:
+            # S=1 uses model max_history_chunks to decide clean (H>0 → has_clean).
+            history = int(self.max_history_chunks or 0)
         if self.step_replicas > 1 and history < 1:
             history = self.max_history_chunks
         schedule_name = str(extra.get("cell_schedule", "self_forcing")).strip().lower().replace("-", "_")
@@ -347,13 +351,13 @@ class CausVidWanPipeline(nn.Module):
             if step_replicas not in (1, denoise, denoise + 1):
                 raise ValueError(f"step_replicas must be 1, D ({denoise}), or D+1 ({denoise + 1}), got {step_replicas}")
         extra["num_denoise_steps"] = denoise
-        if "has_clean_stage" in extra:
-            has_clean = bool(extra["has_clean_stage"])
+        if "has_clean" in extra:
+            has_clean = bool(extra["has_clean"])
         elif step_replicas > 1:
             has_clean = step_replicas == denoise + 1
         else:
             has_clean = history > 0
-        extra["has_clean_stage"] = has_clean
+        extra["has_clean"] = has_clean
         if sp is not None:
             sp.extra_args = extra
         num_blocks = int(getattr(self.transformer, "num_layers", 0) or 0)
@@ -365,7 +369,7 @@ class CausVidWanPipeline(nn.Module):
             layer_groups=self.layer_groups,
             ordering=ordering,
             kv_history_chunks=history,
-            has_clean_stage=has_clean,
+            has_clean=has_clean,
             blocks=num_blocks if num_blocks > 0 else None,
             blocks_per_rank=local_blocks if local_blocks > 0 else None,
         )

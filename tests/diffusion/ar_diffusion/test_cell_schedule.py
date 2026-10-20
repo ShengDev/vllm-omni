@@ -27,7 +27,7 @@ def _s1(chunks, world, ordering, *, kv=False, steps=3, has_clean=None) -> CellSc
         layer_groups=world,
         ordering=ordering,
         kv_history_chunks=6 if kv else 0,
-        has_clean_stage=(kv if has_clean is None else has_clean),
+        has_clean=(kv if has_clean is None else has_clean),
     )
 
 
@@ -136,7 +136,7 @@ def test_vertical_same_step_matches_topology_not_latest_kv():
     common = dict(chunks=4, num_denoise_steps=2, step_replicas=2, layer_groups=2, kv_history_chunks=6)
     latest = build_cell_plan(CellSchedule(**common, ordering=Ordering.LATEST_KV))
     same = build_cell_plan(CellSchedule(**common, ordering=Ordering.SAME_STEP))
-    assert same.schedule.has_clean_stage is False
+    assert same.schedule.has_clean is False
     assert same.num_slots == latest.num_slots
     for t in range(same.num_slots):
         for rank in range(same.world):
@@ -162,7 +162,7 @@ def test_vertical_same_step_matches_topology_not_latest_kv():
 
 
 def test_rejects_same_step_with_clean():
-    with pytest.raises(ValueError, match="same_step does not use a clean stage"):
+    with pytest.raises(ValueError, match="same_step does not use clean"):
         CellSchedule(
             chunks=2,
             num_denoise_steps=2,
@@ -170,7 +170,7 @@ def test_rejects_same_step_with_clean():
             layer_groups=1,
             ordering=Ordering.SAME_STEP,
             kv_history_chunks=4,
-            has_clean_stage=True,
+            has_clean=True,
         )
     with pytest.raises(ValueError, match="same_step vertical requires step_replicas=D"):
         CellSchedule(
@@ -258,13 +258,13 @@ def test_accepts_same_step_s_eq_t():
     )
     plan = build_cell_plan(schedule)
     assert plan.schedule.step_replicas == plan.schedule.num_denoise_steps == 3
-    assert plan.schedule.has_clean_stage is False
+    assert plan.schedule.has_clean is False
     assert plan.schedule.num_schedule_steps == 3
     assert plan.world == 3
 
 
 def test_rejects_self_forcing_s_eq_t():
-    with pytest.raises(ValueError, match="self_forcing vertical requires has_clean_stage"):
+    with pytest.raises(ValueError, match="self_forcing vertical requires has_clean"):
         CellSchedule(
             chunks=4,
             num_denoise_steps=3,
@@ -276,7 +276,7 @@ def test_rejects_self_forcing_s_eq_t():
 
 
 def test_s1_history_alone_does_not_add_clean():
-    """H is residency only; clean must be has_clean_stage."""
+    """H is residency only; clean must be has_clean."""
     no_clean = CellSchedule(
         chunks=2,
         num_denoise_steps=3,
@@ -284,7 +284,7 @@ def test_s1_history_alone_does_not_add_clean():
         layer_groups=1,
         ordering=Ordering.LATEST_KV,
         kv_history_chunks=6,
-        has_clean_stage=False,
+        has_clean=False,
     )
     with_clean = CellSchedule(
         chunks=2,
@@ -293,7 +293,7 @@ def test_s1_history_alone_does_not_add_clean():
         layer_groups=1,
         ordering=Ordering.LATEST_KV,
         kv_history_chunks=0,
-        has_clean_stage=True,
+        has_clean=True,
     )
     assert no_clean.num_schedule_steps == 3
     assert with_clean.num_schedule_steps == 4
@@ -303,7 +303,7 @@ def test_s1_history_alone_does_not_add_clean():
 
 
 def test_vertical_has_clean_must_match_stages():
-    with pytest.raises(ValueError, match="has_clean_stage=False inconsistent"):
+    with pytest.raises(ValueError, match="has_clean=False inconsistent"):
         CellSchedule(
             chunks=2,
             num_denoise_steps=2,
@@ -311,7 +311,7 @@ def test_vertical_has_clean_must_match_stages():
             layer_groups=1,
             ordering=Ordering.LATEST_KV,
             kv_history_chunks=4,
-            has_clean_stage=False,
+            has_clean=False,
         )
 
 

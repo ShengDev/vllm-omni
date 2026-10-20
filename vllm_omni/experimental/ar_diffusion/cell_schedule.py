@@ -4,13 +4,13 @@
 
 No torch. ``D`` = noisy denoise steps; ``S = step_replicas ∈ {1, D, D+1}``.
 Schedule/KV unit is cell ``(chunk, step, block)``. Clean at step ``D`` iff
-``has_clean_stage`` (vertical with clean: ``S = D+1``).
+``has_clean`` (vertical with clean: ``S = D+1``).
 
 * Weight split: PP layer-groups ``G``; each coarse ``(c,s)`` expands to local blocks.
 * ``S = 1``: layer PP. ``S = D``: one replica per noisy step (no clean; Same-Step).
   ``S = D+1``: one replica per noisy step plus clean.
 * ``SELF_FORCING``: one chunk in flight (Self-Forcing / clean history);
-  vertical requires ``has_clean_stage`` / ``S = D+1``.
+  vertical requires ``has_clean`` / ``S = D+1``.
 * ``LATEST_KV``: diagonal Latest-KV (may P2P KV across step replicas).
 * ``SAME_STEP``: same diagonal topology, matching-step history only — always
   local to the consumer rank, so no KV transfers; no clean (``S = D``).
@@ -32,11 +32,9 @@ class Ordering(str, Enum):
     SAME_STEP = "same_step"
 
 
-def cfg_step_replicas(stage_cfg: dict) -> int:
-    """``step_replicas``, else legacy ``stage_parallel_size``."""
-    if "step_replicas" in stage_cfg:
-        return int(stage_cfg.get("step_replicas") or 1)
-    return int(stage_cfg.get("stage_parallel_size", 1) or 1)
+def cfg_step_replicas(cfg: dict) -> int:
+    """Read ``step_replicas`` from ``ar_diffusion_stage_config``."""
+    return int(cfg.get("step_replicas", 1) or 1)
 
 
 @dataclass(frozen=True)
@@ -69,10 +67,10 @@ class CellSchedule:
     ordering: Ordering
     kv_history_chunks: int
     #: Clean@0 at step ``D``. ``None`` → derive (Same-Step/S=1: False; else ``S==D+1``).
-    has_clean_stage: bool | None = None
+    has_clean: bool | None = None
     #: Total DiT blocks. Default ``layer_groups`` ⇒ one block per group (K=1).
     blocks: int | None = None
-    #: Contiguous blocks per rank in a step replica. Default ``1``.
+    #: Blocks per rank in a replica (default ``1``).
     blocks_per_rank: int | None = None
 
     def __post_init__(self) -> None:
@@ -93,22 +91,22 @@ class CellSchedule:
         if self.step_replicas > 1 and self.kv_history_chunks < 1:
             raise ValueError("vertical slice (S > 1) requires kv_history_chunks > 0")
         vertical_has_clean = self.step_replicas == d_plus_1
-        if self.has_clean_stage is None:
+        if self.has_clean is None:
             derived = False if (self.ordering is Ordering.SAME_STEP or self.step_replicas == 1) else vertical_has_clean
-            object.__setattr__(self, "has_clean_stage", derived)
+            object.__setattr__(self, "has_clean", derived)
         else:
-            object.__setattr__(self, "has_clean_stage", bool(self.has_clean_stage))
-        if self.ordering is Ordering.SAME_STEP and self.has_clean_stage:
-            raise ValueError("same_step does not use a clean stage (has_clean_stage must be False)")
+            object.__setattr__(self, "has_clean", bool(self.has_clean))
+        if self.ordering is Ordering.SAME_STEP and self.has_clean:
+            raise ValueError("same_step does not use clean (has_clean must be False)")
         if self.ordering is Ordering.SAME_STEP and self.step_replicas > 1 and self.step_replicas != d:
             raise ValueError("same_step vertical requires step_replicas=D (no clean)")
-        if self.step_replicas > 1 and bool(self.has_clean_stage) != vertical_has_clean:
+        if self.step_replicas > 1 and bool(self.has_clean) != vertical_has_clean:
             raise ValueError(
-                f"has_clean_stage={self.has_clean_stage} inconsistent with "
+                f"has_clean={self.has_clean} inconsistent with "
                 f"step_replicas={self.step_replicas}, num_denoise_steps={d} (expect {vertical_has_clean})"
             )
-        if self.ordering is Ordering.SELF_FORCING and self.step_replicas > 1 and not self.has_clean_stage:
-            raise ValueError("self_forcing vertical requires has_clean_stage (step_replicas=D+1)")
+        if self.ordering is Ordering.SELF_FORCING and self.step_replicas > 1 and not self.has_clean:
+            raise ValueError("self_forcing vertical requires has_clean (step_replicas=D+1)")
         blocks = self.layer_groups if self.blocks is None else self.blocks
         k = 1 if self.blocks_per_rank is None else self.blocks_per_rank
         if blocks < 1:
@@ -131,8 +129,8 @@ class CellSchedule:
     @property
     def num_schedule_steps(self) -> int:
         """``D`` or ``D+1`` when clean is on."""
-        assert self.has_clean_stage is not None
-        return self.num_denoise_steps + (1 if self.has_clean_stage else 0)
+        assert self.has_clean is not None
+        return self.num_denoise_steps + (1 if self.has_clean else 0)
 
 
 @dataclass(frozen=True)
@@ -319,7 +317,7 @@ def _plan_vertical_serial_coarse(schedule: CellSchedule) -> tuple[tuple[tuple[in
             layer_groups=schedule.layer_groups,
             ordering=Ordering.LATEST_KV,
             kv_history_chunks=schedule.kv_history_chunks,
-            has_clean_stage=schedule.has_clean_stage,
+            has_clean=schedule.has_clean,
             blocks=schedule.num_blocks,
             blocks_per_rank=schedule.blocks_per_rank,
         )

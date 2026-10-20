@@ -37,7 +37,7 @@ Noisy KV is the same-request multi-chunk path on Omni's existing **layer PP**.
 | `G` | `layer_groups` | Layer groups per step replica; `world = S·G` |
 | `B`, `K` | `blocks`, `blocks_per_rank` | DiT blocks; contiguous blocks per rank in a group |
 | `H` | `kv_history_chunks` | History window (independent of clean) |
-| `has_clean_stage` | same / inferred | Clean@0 at step `D`; vertical `S = D + int(has_clean)` |
+| `has_clean` | same / inferred | Clean@0 at step `D`; vertical `S = D + int(has_clean)` |
 | Cell `(c,s,b)` | — | Schedule task + KV version (+ `req` when batched) |
 | Tick | — | One cell on one rank (one block forward) |
 | `R` | `max_batch_size` | Max micro-batch requests per rank per tick |
@@ -70,7 +70,7 @@ Three orderings; Latest-KV and Same-Step share the diagonal (vertical) topology:
 
 `S = 1` is native layer PP. Vertical schedules use `S ∈ {D, D+1}`:
 `S = D` (no clean; Same-Step) or `S = D+1` (one weight replica per noisy step
-plus a clean stage; Self-Forcing / Latest-KV). Activations still follow PP
+plus clean; Self-Forcing / Latest-KV). Activations still follow PP
 (`next_rank` after the block that feeds the next group). KV is keyed **per
 block** `b`: publish / transfer / wait when that cell finishes; a remote reader
 of `b` does not wait for the producer's other local blocks.
@@ -127,7 +127,7 @@ ARDiffusionModelRunner
 
 Implemented in `experimental/ar_diffusion/cell_schedule.py`.
 
-- **In:** `CellSchedule(N, D, S, G, B, K, ordering, H, has_clean_stage)`.
+- **In:** `CellSchedule(N, D, S, G, B, K, ordering, H, has_clean)`.
 - **Out:** `CellPlan` — per-tick cells `(c,s,b)`, plus `sources` / `transfers` /
   `last_use` keyed by cell.
 
@@ -190,12 +190,12 @@ remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`
 | Layer | Key | Meaning |
 | --- | --- | --- |
 | `parallel_config` | `pipeline_parallel_size` | `S·G` |
-| `ar_diffusion_stage_config` | `step_replicas` | `S` (alias `stage_parallel_size`) |
+| `ar_diffusion_stage_config` | `step_replicas` | `S` |
 | | `max_batch_size` | `R` |
 | | `max_history_chunks` | Cap for `H` |
 | Request `extra_args` | `cell_schedule` | `self_forcing` \| `latest_kv` \| `same_step` (schedule primitive; CausVidWan rejects `same_step`) |
 | | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `D`, `H` |
-| | `has_clean_stage` | Optional; else inferred from `S` vs `D` (`S=1`: `H>0`) |
+| | `has_clean` | Optional; else inferred from `S` vs `D` (`S=1`: `H>0`) |
 
 Backend: `ARDiffusionEngine` + mp executor from deploy YAML.
 `source_rank` = last noisy step's trailing rank when `S ∈ {D, D+1}`.

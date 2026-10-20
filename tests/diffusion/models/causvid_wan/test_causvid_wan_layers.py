@@ -168,7 +168,7 @@ def test_cell_schedule_accepts_known_values(name):
     plan, _, _ = pipeline._plan_for(req)
     assert plan.schedule.ordering is Ordering(name)
     assert plan.schedule.ordering.value == name
-    assert plan.schedule.has_clean_stage is True
+    assert plan.schedule.has_clean is True
 
 
 @pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step", "same_step_kv"])
@@ -218,7 +218,7 @@ def test_cell_schedule_unset_steps_keep_topology_default(stages, expected_steps)
     assert steps == plan.schedule.num_denoise_steps == expected_steps
 
 
-def test_cell_schedule_has_clean_stage_s1_from_history():
+def test_cell_schedule_has_clean_s1_from_history():
     """S=1 self_forcing defaults to clean when history is on."""
     pipeline = _bare_pipeline(step_replicas=1, history=6)
     sf = OmniDiffusionRequest(
@@ -229,7 +229,7 @@ def test_cell_schedule_has_clean_stage_s1_from_history():
         ),
     )
     plan_sf, _, _ = pipeline._plan_for(sf)
-    assert plan_sf.schedule.has_clean_stage is True
+    assert plan_sf.schedule.has_clean is True
     assert plan_sf.schedule.num_schedule_steps == 4
 
 
@@ -275,9 +275,9 @@ def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
     prompt = torch.zeros(1, 8, 16, device=device, dtype=dtype)
 
     class _FakeTransformer:
-        def __init__(self, *, is_stage_first: bool, is_stage_last: bool) -> None:
-            self.is_stage_first = is_stage_first
-            self.is_stage_last = is_stage_last
+        def __init__(self, *, is_layer_group_first: bool, is_layer_group_last: bool) -> None:
+            self.is_layer_group_first = is_layer_group_first
+            self.is_layer_group_last = is_layer_group_last
             self.start_layer = 0
             self.end_layer = 1
             self.dim = 8
@@ -299,7 +299,7 @@ def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
 
     sampler = FlowEuler(2, shift=1.0)
     mid = WanCell(
-        _FakeTransformer(is_stage_first=True, is_stage_last=False),  # type: ignore[arg-type]
+        _FakeTransformer(is_layer_group_first=True, is_layer_group_last=False),  # type: ignore[arg-type]
         sampler=sampler,
         prompt_embeds=prompt,
         latent_shape=shape,
@@ -308,7 +308,7 @@ def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
         dtype=dtype,
     )
     last = WanCell(
-        _FakeTransformer(is_stage_first=False, is_stage_last=True),  # type: ignore[arg-type]
+        _FakeTransformer(is_layer_group_first=False, is_layer_group_last=True),  # type: ignore[arg-type]
         sampler=sampler,
         prompt_embeds=prompt,
         latent_shape=shape,
