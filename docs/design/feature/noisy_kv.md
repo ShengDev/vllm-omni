@@ -10,6 +10,7 @@
 ## Table of Contents
 
 - [Overview](#overview)
+  - [Symbols](#symbols)
   - [What is a cell?](#what-is-a-cell)
 - [Scope](#scope)
 - [Architecture](#architecture)
@@ -25,6 +26,21 @@
 ## Overview
 
 Noisy KV is the same-request multi-chunk path on Omni's existing **layer PP**.
+
+### Symbols
+
+| Symbol | Config | Meaning |
+| --- | --- | --- |
+| `N` | `num_chunks` | Chunks |
+| `D` | `num_denoise_steps` | Noisy denoise steps only (not counting clean) |
+| `S` | `step_replicas` | Step replicas; vertical `S ∈ {1, D, D+1}` |
+| `G` | `layer_groups` | Layer groups per step replica; `world = S·G` |
+| `B`, `K` | `blocks`, `blocks_per_rank` | DiT blocks; contiguous blocks per rank in a group |
+| `H` | `kv_history_chunks` | History window (independent of clean) |
+| `has_clean_stage` | same / inferred | Clean@0 at step `D`; vertical `S = D + int(has_clean)` |
+| Cell `(c,s,b)` | — | Schedule task + KV version (+ `req` when batched) |
+| Tick | — | One cell on one rank (one block forward) |
+| `R` | `max_batch_size` | Max micro-batch requests per rank per tick |
 
 ### What is a cell?
 
@@ -77,19 +93,6 @@ Optional session only keeps clean KV across generations
 ([Realtime AR-Diffusion sessions](realtime_ar_diffusion.md)).
 
 ## Architecture
-
-| Symbol | Config | Meaning |
-| --- | --- | --- |
-| `N` | `num_chunks` | Chunks |
-| `D` | `num_denoise_steps` | Noisy denoise steps only (not counting clean) |
-| `S` | `step_replicas` | Step replicas; vertical `S ∈ {1, D, D+1}` |
-| `G` | `layer_groups` | Layer groups per step replica; `world = S·G` |
-| `B`, `K` | `blocks`, `blocks_per_rank` | DiT blocks; contiguous blocks per rank in a group |
-| `H` | `kv_history_chunks` | History window (independent of clean) |
-| `has_clean_stage` | same / inferred | Clean@0 at step `D`; vertical `S = D + int(has_clean)` |
-| Cell `(c,s,b)` | — | Schedule task + KV version (+ `req` when batched) |
-| Tick | — | One cell on one rank (one block forward) |
-| `R` | `max_batch_size` | Max micro-batch requests per rank per tick |
 
 ```text
 s = pp_rank // G ,   g = pp_rank % G ,   rank(s, g) = s·G + g
