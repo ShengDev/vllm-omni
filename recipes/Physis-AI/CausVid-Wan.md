@@ -63,7 +63,7 @@ out = omni.generate(
         extra_args={
             "num_chunks": 7,
             "num_denoise_steps": 3,
-            "cell_schedule": "self_forcing",  # or latest_kv / same_step
+            "cell_schedule": "self_forcing",  # or latest_kv / same_step (canonical names only; serial/latest/interleaved removed)
             "shift": 8.0,
             "reset": True,
         },

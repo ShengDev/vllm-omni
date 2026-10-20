@@ -170,6 +170,18 @@ def test_cell_schedule_accepts_known_values(name):
     assert plan.schedule.ordering.value == name
 
 
+@pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step_kv"])
+def test_cell_schedule_rejects_removed_aliases(name):
+    pipeline = _bare_pipeline()
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id=f"sched-alias-{name}",
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"cell_schedule": name}),
+    )
+    with pytest.raises(ValueError, match="cell_schedule"):
+        pipeline._plan_for(req)
+
+
 @pytest.mark.parametrize("source", ["num_inference_steps", "num_denoise_steps", "sampling_params"])
 @pytest.mark.parametrize("steps", [0, -1])
 def test_cell_schedule_rejects_nonpositive_steps(source, steps):

@@ -182,7 +182,7 @@ remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`
 | `ar_diffusion_stage_config` | `stage_parallel_size` | `S` |
 | | `max_batch_size` | `R` |
 | | `max_history_chunks` | Cap for `H` |
-| Request `extra_args` | `cell_schedule` | `self_forcing` \| `latest_kv` \| `same_step` |
+| Request `extra_args` | `cell_schedule` | `self_forcing` \| `latest_kv` \| `same_step` (no aliases; former `serial`/`latest`/`interleaved` removed) |
 | | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `T`, `H` |
 
 Backend: `ARDiffusionEngine` + mp executor from deploy YAML. For `S > 1`,

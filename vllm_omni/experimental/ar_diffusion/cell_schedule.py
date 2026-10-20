@@ -374,10 +374,6 @@ def _sources_and_transfers(
                 version = (prev, s_star, block)
                 owner = rank_of_block(s_star, block, schedule)
                 found.append(KVSource(version=version, owner=owner))
-                # Same-Step history is always co-located (same step × block → same
-                # rank); skip KV P2P even if topology invariants drift.
-                if schedule.ordering is Ordering.SAME_STEP:
-                    continue
                 if owner != rank:
                     key = (version, rank)
                     if key not in seen:
