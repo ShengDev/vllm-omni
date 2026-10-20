@@ -695,7 +695,6 @@ def test_diffusion_cpu_suite_shard_contract(pipeline_path: Path) -> None:
     assert argv[:3] == ["pytest", "-sv", "tests/diffusion"]
     assert argv[argv.index("-m") + 1] == DIFFUSION_CPU_MARKERS
     assert "--ignore=tests/diffusion/cache/test_teacache_extractors.py" in argv
-    assert "--ignore=tests/diffusion/models/pi05/test_pi05_units.py" in argv
     assert [arg.removeprefix("--deselect=") for arg in argv if arg.startswith("--deselect=")] == (
         DIFFUSION_SLOW_CPU_NODES
     )
@@ -886,7 +885,9 @@ def test_amd_template_supplies_a_server_verified_aiter_artifact_source() -> None
 
     assert template.count("VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT") == 2
     assert "VLLM_AITER_MHA_TRUSTED_COMMIT=$(git cat-file -p HEAD | sed -n 's/^parent //p' | head -n 1)" in bootstrap
-    assert "VLLM_AITER_MHA_TRUSTED_COMMIT=$(git merge-base origin/main HEAD)" in bootstrap
+    assert "VLLM_AITER_MHA_TRUSTED_COMMIT=$DIFF_BASE" in bootstrap
+    assert bootstrap.count("git merge-base origin/main HEAD") == 1
+    assert '-D vllm_merge_base_commit="$DIFF_BASE"' in bootstrap
     assert '-D vllm_aiter_mha_trusted_commit="$VLLM_AITER_MHA_TRUSTED_COMMIT"' in bootstrap
 
 
