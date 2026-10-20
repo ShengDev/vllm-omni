@@ -1,8 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CausVid Wan 2.1 1.3B on Cell / Noisy KV (Self-Forcing / Latest-KV only).
+"""CausVid Wan 2.1 1.3B on the Cell / Noisy KV path.
 
-Defaults: shift=8, D=3, S=D+1. Optional student ``model.pt`` overlay.
+Wires Wan codec + ``StageWanTransformer`` onto ``ARDiffusionEngine``, with
+CausVid defaults (shift=8, D=3, S=D+1) and optional student ``model.pt`` overlay.
+CausVidWan accepts ``self_forcing`` / ``latest_kv`` only (not ``same_step``).
+
+* Codec base: Diffusers ``Wan-AI/Wan2.1-T2V-1.3B-Diffusers``
+* Student DiT: ``tianweiy/CausVid`` → ``autoregressive_checkpoint/model.pt``
+* Shared infra: ``experimental.ar_diffusion`` (schedule / executor / KV / FlowEuler)
 """
 
 from __future__ import annotations
@@ -54,7 +60,7 @@ logger = init_logger(__name__)
 
 HF_MODEL_ID = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 HF_CAUSVID_REPO = "tianweiy/CausVid"
-# CausVid DMD defaults: D=3 noisy + clean → S=D+1.
+# CausVid causal DMD: shift=8, three noisy steps + clean@0 via S=D+1.
 CAUSVID_DEFAULT_SHIFT = 8.0
 CAUSVID_DEFAULT_DENOISE_STEPS = 3
 WAN21_1_3B = {
@@ -66,7 +72,6 @@ WAN21_1_3B = {
     "patch_size": (1, 2, 2),
 }
 _DEFAULT_LATENT_SHAPE = (1, 16, 3, 60, 104)
-
 
 __all__ = [
     "HF_MODEL_ID",

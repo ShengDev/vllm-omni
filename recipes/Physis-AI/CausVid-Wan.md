@@ -73,6 +73,12 @@ out = omni.generate(
 
 ## Notes
 
-- Schedules: `self_forcing` (trained semantics) or `latest_kv` (diagonal; not training-matched).
-- Defaults: shift=8, D=3 (+ clean → S=4). Official DMD table `1000/757/522` vs FlowEuler still converging.
-- Use deploy `distributed_executor_backend: mp` (not `torchrun`).
+- **Self-Forcing** (`Ordering.SELF_FORCING`) matches CausVid clean-history
+  semantics; **Latest-KV** shares the diagonal placement but reads the newest
+  finished history step (may P2P KV). Neither Latest-KV nor the schedule-level
+  **Same-Step** primitive matches how CausVid was trained; CausVidWan rejects
+  `same_step` (use Self-Forcing / Latest-KV only).
+- Exact official DMD timestep table parity (`1000/757/522`) vs the shared
+  FlowEuler grid is still converging; defaults use CausVid **shift=8** and
+  **D=3** (+ clean → `S=4`) on the Euler cell path.
+- Do not wrap in `torchrun`; use deploy `distributed_executor_backend: mp`.

@@ -1,13 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Pure-function cell timetable and KV transfer plan (no torch).
+"""Pure-function cell timetable, Latest-KV visibility, and transfer plan.
 
-Cell ``(chunk, step, block)``. ``D`` = noisy steps; ``S = step_replicas ∈ {1, D, D+1}``;
-``world = S · G``. Clean at step ``D`` iff ``has_clean_stage`` (vertical: ``S = D+1``).
+No torch. ``D`` = noisy denoise steps; ``S = step_replicas ∈ {1, D, D+1}``.
+Schedule/KV unit is cell ``(chunk, step, block)``. Clean at step ``D`` iff
+``has_clean_stage`` (vertical with clean: ``S = D+1``).
 
-* ``SELF_FORCING``: serial chunks; vertical needs clean (``S = D+1``).
-* ``LATEST_KV``: diagonal; may P2P KV.
-* ``SAME_STEP``: diagonal, matching-step local KV; no clean (``S = D``).
+* Weight split: PP layer-groups ``G``; each coarse ``(c,s)`` expands to local blocks.
+* ``S = 1``: layer PP. ``S = D``: one replica per noisy step (no clean; Same-Step).
+  ``S = D+1``: one replica per noisy step plus clean.
+* ``SELF_FORCING``: one chunk in flight (Self-Forcing / clean history);
+  vertical requires ``has_clean_stage`` / ``S = D+1``.
+* ``LATEST_KV``: diagonal Latest-KV (may P2P KV across step replicas).
+* ``SAME_STEP``: same diagonal topology, matching-step history only — always
+  local to the consumer rank, so no KV transfers; no clean (``S = D``).
 """
 
 from __future__ import annotations
@@ -64,9 +70,9 @@ class CellSchedule:
     kv_history_chunks: int
     #: Clean@0 at step ``D``. ``None`` → derive (Same-Step/S=1: False; else ``S==D+1``).
     has_clean_stage: bool | None = None
-    #: Total DiT blocks (default ``layer_groups``).
+    #: Total DiT blocks. Default ``layer_groups`` ⇒ one block per group (K=1).
     blocks: int | None = None
-    #: Blocks per rank in a replica (default ``1``).
+    #: Contiguous blocks per rank in a step replica. Default ``1``.
     blocks_per_rank: int | None = None
 
     def __post_init__(self) -> None:
