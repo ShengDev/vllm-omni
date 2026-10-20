@@ -333,20 +333,14 @@ class CausVidWanPipeline(nn.Module):
         elif schedule_name == "latest_kv":
             ordering = Ordering.LATEST_KV
         else:
-            raise ValueError(
-                f"CausVidWan cell_schedule must be 'self_forcing' or 'latest_kv', got {schedule_name!r}"
-            )
+            raise ValueError(f"CausVidWan cell_schedule must be 'self_forcing' or 'latest_kv', got {schedule_name!r}")
         step_replicas = self.step_replicas
         if step_replicas not in (1, denoise, denoise + 1):
             if explicit_denoise is not None:
-                raise ValueError(
-                    f"step_replicas must be 1, D ({denoise}), or D+1 ({denoise + 1}), got {step_replicas}"
-                )
+                raise ValueError(f"step_replicas must be 1, D ({denoise}), or D+1 ({denoise + 1}), got {step_replicas}")
             denoise = max(1, step_replicas - 1) if step_replicas > 1 else denoise
             if step_replicas not in (1, denoise, denoise + 1):
-                raise ValueError(
-                    f"step_replicas must be 1, D ({denoise}), or D+1 ({denoise + 1}), got {step_replicas}"
-                )
+                raise ValueError(f"step_replicas must be 1, D ({denoise}), or D+1 ({denoise + 1}), got {step_replicas}")
         extra["num_denoise_steps"] = denoise
         if "has_clean_stage" in extra:
             has_clean = bool(extra["has_clean_stage"])
@@ -506,9 +500,7 @@ class CausVidWanPipeline(nn.Module):
             prompt_embeds = self._encode_prompt(prompt, device, dtype)
             sampler = FlowEuler(denoise, shift=shift)
             stream_decode = bool(extra.get("stream_decode", False))
-            source_rank = (
-                denoise * self.layer_groups - 1 if self.step_replicas in (denoise, denoise + 1) else None
-            )
+            source_rank = denoise * self.layer_groups - 1 if self.step_replicas in (denoise, denoise + 1) else None
             stream_job = None
             on_finished = None
             if stream_decode:

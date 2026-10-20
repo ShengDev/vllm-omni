@@ -206,9 +206,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         step_replicas = cfg_step_replicas(stage_cfg)
         pp_world = int(getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
         if step_replicas < 1 or pp_world % step_replicas != 0:
-            raise ValueError(
-                f"pipeline_parallel_size={pp_world} must be divisible by step_replicas={step_replicas}"
-            )
+            raise ValueError(f"pipeline_parallel_size={pp_world} must be divisible by step_replicas={step_replicas}")
         layer_groups = pp_world // step_replicas
         max_batch_size = int(stage_cfg.get("max_batch_size", 1) or 1)
         self._ar_diffusion_cell_capability = capability
@@ -481,9 +479,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         stage_cfg = self._stage_config()
         step_replicas = cfg_step_replicas(stage_cfg)
         pp_world = int(getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
-        topology = CellTopology(
-            step_replicas=step_replicas, layer_groups=max(1, pp_world // max(1, step_replicas))
-        )
+        topology = CellTopology(step_replicas=step_replicas, layer_groups=max(1, pp_world // max(1, step_replicas)))
         rank, pp_group = resolve_pp_rank_and_group()
         return ARDiffusionCellContext(
             spec=CellRunSpec(
