@@ -1,13 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CausVid Wan 2.1 1.3B on the Cell / Noisy KV path.
+"""CausVid Wan 2.1 1.3B on Cell / Noisy KV (Self-Forcing / Latest-KV only).
 
-Wires Wan codec + ``StageWanTransformer`` onto ``ARDiffusionEngine``, with
-CausVid defaults (shift=8, T=3) and optional student ``model.pt`` overlay.
-
-* Codec base: Diffusers ``Wan-AI/Wan2.1-T2V-1.3B-Diffusers``
-* Student DiT: ``tianweiy/CausVid`` → ``autoregressive_checkpoint/model.pt``
-* Shared infra: ``experimental.ar_diffusion`` (schedule / executor / KV / FlowEuler)
+Defaults: shift=8, D=3, S=D+1. Optional student ``model.pt`` overlay.
 """
 
 from __future__ import annotations
@@ -49,6 +44,7 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     CellSchedule,
     Ordering,
     build_cell_plan,
+    cfg_step_replicas,
 )
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
@@ -58,7 +54,7 @@ logger = init_logger(__name__)
 
 HF_MODEL_ID = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 HF_CAUSVID_REPO = "tianweiy/CausVid"
-# CausVid causal DMD: shift=8, three noisy steps + clean@0 via S=T+1.
+# CausVid DMD defaults: D=3 noisy + clean → S=D+1.
 CAUSVID_DEFAULT_SHIFT = 8.0
 CAUSVID_DEFAULT_DENOISE_STEPS = 3
 WAN21_1_3B = {
@@ -70,6 +66,7 @@ WAN21_1_3B = {
     "patch_size": (1, 2, 2),
 }
 _DEFAULT_LATENT_SHAPE = (1, 16, 3, 60, 104)
+
 
 __all__ = [
     "HF_MODEL_ID",
@@ -92,7 +89,7 @@ class CausVidWanPipeline(nn.Module):
     """CausVid Wan on Cell Self-Forcing/Latest-KV (AR-Diffusion + noisy KV)."""
 
     supports_request_batch = True
-    # Skip engine dummy: num_inference_steps=2 breaks vertical S=T+1.
+    # Skip engine dummy: num_inference_steps=2 breaks vertical S=D+1.
     dummy_run_num_frames: ClassVar[int] = 0
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
@@ -113,9 +110,9 @@ class CausVidWanPipeline(nn.Module):
         ckpt = model_cfg.get("causvid_ckpt") or model_cfg.get("generator_ckpt")
         self._causvid_ckpt = str(ckpt) if ckpt else None
         self._causvid_dit_loaded = False
-        self.stage_parallel_size = int(stage_cfg.get("stage_parallel_size", 1) or 1)
+        self.step_replicas = cfg_step_replicas(stage_cfg)
         pp_world = int(getattr(getattr(od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
-        self.layer_groups = max(1, pp_world // max(1, self.stage_parallel_size))
+        self.layer_groups = max(1, pp_world // max(1, self.step_replicas))
         if bool(stage_cfg.get("tiny", False)):
             raise ValueError("CausVidWanPipeline no longer supports tiny=True")
         geo = dict(WAN21_1_3B)
@@ -167,7 +164,7 @@ class CausVidWanPipeline(nn.Module):
         self._streaming_decoder: WanStreamingDecoder | None = None
         logger.info(
             "CausVidWan pipeline: S=%d G=%d layers=%d local=[%d, %d) codec=%s model=%s causvid_ckpt=%s",
-            self.stage_parallel_size,
+            self.step_replicas,
             self.layer_groups,
             self.transformer.num_layers,
             self.transformer.start_layer,
@@ -328,25 +325,36 @@ class CausVidWanPipeline(nn.Module):
         if denoise < 1:
             raise ValueError(f"num_denoise_steps must be positive, got {denoise}")
         history = int(extra.get("kv_history_chunks", 0) or 0)
-        if self.stage_parallel_size > 1 and history < 1:
+        if self.step_replicas > 1 and history < 1:
             history = self.max_history_chunks
         schedule_name = str(extra.get("cell_schedule", "self_forcing")).strip().lower().replace("-", "_")
         if schedule_name in ("", "self_forcing"):
             ordering = Ordering.SELF_FORCING
         elif schedule_name == "latest_kv":
             ordering = Ordering.LATEST_KV
-        elif schedule_name == "same_step":
-            ordering = Ordering.SAME_STEP
         else:
             raise ValueError(
-                f"cell_schedule must be 'self_forcing', 'latest_kv', or 'same_step', got {schedule_name!r}"
+                f"CausVidWan cell_schedule must be 'self_forcing' or 'latest_kv', got {schedule_name!r}"
             )
-        stages = self.stage_parallel_size
-        if stages not in (1, denoise + 1):
+        step_replicas = self.step_replicas
+        if step_replicas not in (1, denoise, denoise + 1):
             if explicit_denoise is not None:
-                raise ValueError(f"CausVidWan stages must be 1 or num_denoise_steps+1 ({denoise + 1}), got {stages}")
-            denoise = stages - 1
+                raise ValueError(
+                    f"step_replicas must be 1, D ({denoise}), or D+1 ({denoise + 1}), got {step_replicas}"
+                )
+            denoise = max(1, step_replicas - 1) if step_replicas > 1 else denoise
+            if step_replicas not in (1, denoise, denoise + 1):
+                raise ValueError(
+                    f"step_replicas must be 1, D ({denoise}), or D+1 ({denoise + 1}), got {step_replicas}"
+                )
         extra["num_denoise_steps"] = denoise
+        if "has_clean_stage" in extra:
+            has_clean = bool(extra["has_clean_stage"])
+        elif step_replicas > 1:
+            has_clean = step_replicas == denoise + 1
+        else:
+            has_clean = history > 0
+        extra["has_clean_stage"] = has_clean
         if sp is not None:
             sp.extra_args = extra
         num_blocks = int(getattr(self.transformer, "num_layers", 0) or 0)
@@ -354,10 +362,11 @@ class CausVidWanPipeline(nn.Module):
         schedule = CellSchedule(
             chunks=chunks,
             num_denoise_steps=denoise,
-            stages=stages,
+            step_replicas=step_replicas,
             layer_groups=self.layer_groups,
             ordering=ordering,
             kv_history_chunks=history,
+            has_clean_stage=has_clean,
             blocks=num_blocks if num_blocks > 0 else None,
             blocks_per_rank=local_blocks if local_blocks > 0 else None,
         )
@@ -497,7 +506,9 @@ class CausVidWanPipeline(nn.Module):
             prompt_embeds = self._encode_prompt(prompt, device, dtype)
             sampler = FlowEuler(denoise, shift=shift)
             stream_decode = bool(extra.get("stream_decode", False))
-            source_rank = denoise * self.layer_groups - 1 if self.stage_parallel_size == denoise + 1 else None
+            source_rank = (
+                denoise * self.layer_groups - 1 if self.step_replicas in (denoise, denoise + 1) else None
+            )
             stream_job = None
             on_finished = None
             if stream_decode:

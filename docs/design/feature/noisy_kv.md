@@ -28,195 +28,140 @@ Noisy KV is the same-request multi-chunk path on Omni's existing **layer PP**.
 
 ### What is a cell?
 
-A **cell** `(c, s, b)` is the schedule/KV atom — one DiT **block** forward on
-one tick — not a whole chunk and not a full denoise step.
+A **cell** `(c, s, b)` is one DiT **block** forward on one tick.
 
 | | | |
 | --- | --- | --- |
 | `c` | chunk | Temporal latent slice |
-| `s` | step | Denoise index (`0…T-1` noisy, `T` clean) |
+| `s` | step | `0…D-1` noisy; `D` clean if present |
 | `b` | block | Transformer block index |
 
-```text
-chunk c → step s → cell (c,s,b)   # one tick / rank = one block
-```
+History KV matches the **same** `b` only. With `K>1`, one `(c,s)` spans multiple ticks.
 
-History KV is matched on the **same** `b` only. With `K>1` local blocks, one
-`(c,s)` spans multiple ticks.
-
-Three orderings; Latest-KV and Same-Step share the diagonal (vertical) topology:
-
-| Strategy | Advance | History KV |
+| Ordering | Advance | History KV |
 | --- | --- | --- |
-| **Self-Forcing** (`Ordering.SELF_FORCING`) | Finish one chunk before the next | Clean `(c', T, b)` only |
-| **Latest-KV** (`Ordering.LATEST_KV`) | Diagonal cell overlap | Newest finished `(c', s*, b)` with completion tick strictly earlier |
-| **Same-Step** (`Ordering.SAME_STEP`) | Same diagonal placement | Matching step `(c', s, b)` only; always local (no KV P2P) |
+| **Self-Forcing** | One chunk at a time | Clean `(c', D, b)` only |
+| **Latest-KV** | Diagonal | Newest finished `(c', s*, b)` |
+| **Same-Step** | Same diagonal | Matching `(c', s, b)`; local only; **no clean** |
 
-`S = 1` is native layer PP. `S = T+1` places one weight replica per denoise
-step plus a clean stage. Activations still follow PP (`next_rank` after the
-block that feeds the next group). KV is keyed **per block** `b`: publish /
-transfer / wait when that cell finishes; a remote reader of `b` does not wait
-for the producer's other local blocks.
+Vertical: `S=D` no clean; `S=D+1` with clean. CausVidWan: Self-Forcing / Latest-KV only.
 
-#102 acceptance: reproducible basic function + recorded config. No FPS /
-speedup SLA. DreamZero / LingBot paged-session defaults must not regress.
+#102: basic function + recorded config. No FPS SLA. DreamZero / LingBot defaults must not regress.
 
 ## Scope
 
 | Axis | Unit |
 | --- | --- |
-| **Model / weight split** | Unchanged PP: ranks own contiguous layer groups (`G = ⌈B/K⌉`); `pipeline_parallel_size = S·G` |
-| **Schedule / KV** | Cell `(chunk, step, block)` — one transformer block per tick |
+| **Weight split** | Layer PP: `G = ⌈B/K⌉`; `pipeline_parallel_size = S·G` |
+| **Schedule / KV** | Cell `(chunk, step, block)` |
 
-`cell_schedule` (request `extra_args`) selects Self-Forcing, Latest-KV, or
-Same-Step for one generation's `CellPlan`. It is not a session property.
-Optional session only keeps clean KV across generations
+`cell_schedule` picks the ordering for one `CellPlan` (not a session property).
+Optional session keeps clean KV across generations
 ([Realtime AR-Diffusion sessions](realtime_ar_diffusion.md)).
 
 ## Architecture
 
-| Symbol | Meaning |
-| --- | --- |
-| `N`, `T` | Chunks; denoise steps (`T` = clean forward) |
-| `B`, `K` | Blocks; contiguous blocks per rank in a stage |
-| `S`, `G` | Stages; groups per stage. Only `S ∈ {1, T+1}` |
-| Cell `(c,s,b)` | Schedule task + KV version (+ `req` when batched) |
-| Tick | One cell on one rank (one block forward) |
-| `R` | Max micro-batch requests per rank per tick |
+| Symbol | Config | Meaning |
+| --- | --- | --- |
+| `N` | `num_chunks` | Chunks |
+| `D` | `num_denoise_steps` | Noisy steps only |
+| `S` | `step_replicas` | Step replicas; vertical `S ∈ {1, D, D+1}` |
+| `G` | `layer_groups` | Groups per replica; `world = S·G` |
+| `B`, `K` | `blocks`, `blocks_per_rank` | DiT blocks / blocks per rank |
+| `H` | `kv_history_chunks` | History window (not clean) |
+| `has_clean_stage` | same | Clean@0 at step `D`; vertical `S = D + int(has_clean)` |
+| `R` | `max_batch_size` | Micro-batch cap |
 
 ```text
 s = pp_rank // G ,   g = pp_rank % G ,   rank(s, g) = s·G + g
 ```
 
-Layer split uses `(g, G)` via `get_pp_indices(B, pp_rank % G, G)`, not
-`world = S·G`. Production Wan2.2 PP stays on its existing path.
+Layer split uses `(g, G)` via `get_pp_indices`, not `world = S·G`.
 
 ```text
-Optional Session
-        │
-        ▼
 ARDiffusionModelRunner
   ├─ Legacy → paged KV (DreamZero / LingBot)
-  └─ Cell   → NoisyKV + CellPlan
-        │
-   cell_schedule │ cell_executor (tick loop, PP P2P)
-        └────► kv_cache/noisy.py
+  └─ Cell   → NoisyKV + CellPlan → cell_executor
 ```
 
-### How it works
-
-1. The pipeline builds a `CellSchedule` from request `extra_args` and calls
-   `build_cell_plan()` (pure function, no torch).
-2. `ARDiffusionModelRunner` binds an `ARDiffusionCellContext` over a shared
-   `NoisyKVCache` for the request.
-3. `run_cell_pipeline()` admits inflight plans, runs one cell per tick on each
-   rank, and overlaps KV / activation P2P with compute.
-4. Rank 0 gathers finished chunk latents (or streams them) for VAE decode.
+1. Build `CellPlan` from `extra_args`.
+2. Bind `ARDiffusionCellContext` / `NoisyKVCache`.
+3. Tick loop: compute + KV/activation P2P.
+4. Rank 0 gathers or streams latents for VAE.
 
 ## Cell schedule
 
-Implemented in `experimental/ar_diffusion/cell_schedule.py`.
+`experimental/ar_diffusion/cell_schedule.py`.
 
-- **In:** `CellSchedule(N, T, S, G, B, K, ordering, H)`.
-- **Out:** `CellPlan` — per-tick cells `(c,s,b)`, plus `sources` / `transfers` /
-  `last_use` keyed by cell.
-
-Visibility for history of the same block `b`:
+- **In:** `CellSchedule(N, D, S, G, B, K, ordering, H, has_clean_stage)`.
+- **Out:** `CellPlan` — cells, `sources` / `transfers` / `last_use`.
 
 ```text
-# Latest-KV / Self-Forcing (Self-Forcing exposes only clean by then)
-s* = max { s | P(c', s, b) < current_tick }
-src = (c', s*, b)
+# Latest-KV / Self-Forcing
+s* = max { s | P(c', s, b) < tick };  src = (c', s*, b)
 
-# Same-Step: same step × block → same rank → local only
-src = (c', s_task, b)   # only if P(c', s_task, b) < current_tick
-# no KV transfers under Same-Step
+# Same-Step (local only)
+src = (c', s_task, b)  if P(c', s_task, b) < tick
 ```
 
-Invariants:
-
-- `S ∈ {1, T+1}`
-- No Latest-KV edge inside the same micro-batch / tick
-- Cross-rank KV ready before use (Latest-KV / Self-Forcing when remote)
-- Same-Step history never needs KV P2P (co-located with the consumer)
-- Finite `H` + `last_use` bounds residency
-- Consumer of `b` never waits on producer's `b' ≠ b` (activation edges are separate)
+Invariants: `S ∈ {1,D,D+1}`; Same-Step ⇒ `S=D`; Self-Forcing vertical ⇒ `S=D+1`;
+no same-tick Latest edge; finite `H` + `last_use`.
 
 ## Cell executor
 
-Implemented in `experimental/ar_diffusion/cell_executor.py`.
+`experimental/ar_diffusion/cell_executor.py`.
 
-Per tick on each rank:
-
-1. Wait transfers required by this cell's `sources` (same `b`).
-2. Forward one block via `CellAdapter`; **publish KV immediately**.
-3. Post planned KV `isend` (do not wait for remote recv).
-4. Wait posted handles; `evict` versions past last-use once sends complete.
-
-Received versions are readable only on a later tick. Same-tick producer /
-consumer of the same version is forbidden.
-
-`run_cell_pipeline()` owns admit / drop / fail-closed cleanup so a mid-request
-exception does not leak `VersionPool` slots. Rank topology is described by
-`CellTopology` / `CellRunSpec` inside `ARDiffusionCellContext`.
+Per tick: wait KV → one block forward → publish KV → post `isend` → wait/evict.
+Received versions usable only on a later tick. `run_cell_pipeline()` owns admit /
+fail-closed cleanup.
 
 ## NoisyKV
 
-Implemented in `experimental/ar_diffusion/kv_cache/noisy.py`.
+`experimental/ar_diffusion/kv_cache/noisy.py`.
 
 | | |
 | --- | --- |
-| Unit | K/V for `(req, c, s, b)` — one block |
-| Storage | Per-layer `VersionPool` from `ARDiffusionNoisyKVSpec` |
-| Transport | Planned PP-group P2P; post on cell complete |
-| Eviction | `last_use` per cell; no in-place overwrite of live sends |
-
-Per-tick KV traffic ≈ history depth × one block × tokens × heads × dim per
-remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`.
+| Unit | K/V for `(req, c, s, b)` |
+| Storage | Per-layer `VersionPool` |
+| Transport | Planned PP P2P on cell complete |
+| Eviction | `last_use`; no overwrite of live sends |
 
 ## Configuration
 
 | Layer | Key | Meaning |
 | --- | --- | --- |
 | `parallel_config` | `pipeline_parallel_size` | `S·G` |
-| `ar_diffusion_stage_config` | `stage_parallel_size` | `S` |
-| | `max_batch_size` | `R` |
-| | `max_history_chunks` | Cap for `H` |
-| Request `extra_args` | `cell_schedule` | `self_forcing` \| `latest_kv` \| `same_step` (no aliases; former `serial`/`latest`/`interleaved` removed) |
-| | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `T`, `H` |
+| `ar_diffusion_stage_config` | `step_replicas` | `S` (alias `stage_parallel_size`) |
+| | `max_batch_size` / `max_history_chunks` | `R` / `H` cap |
+| `extra_args` | `cell_schedule` | CausVid: `self_forcing` \| `latest_kv` |
+| | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `D`, `H` |
+| | `has_clean_stage` | Optional; else from `S` vs `D` (S=1: `H>0`) |
 
-Backend: `ARDiffusionEngine` + mp executor from deploy YAML. For `S > 1`,
-`S = num_denoise_steps + 1`.
+`source_rank` = last noisy step's trailing rank (`S=D` or `S=D+1`).
 
 ## Compatibility
 
-Only-`SupportsARDiffusionPipeline` paths keep today's behavior. Default
-DreamZero / LingBot YAMLs must not silently enter `run_cell_pipeline`.
-
 | Combination | Status |
 | --- | --- |
-| No session + Self-Forcing/Latest-KV/Same-Step | Supported (opt-in) |
-| Session + legacy loop | Supported (unchanged) |
-| Session + Cell path | Designed; not required for #102 |
+| No session + Self-Forcing / Latest-KV (CausVid) | Supported (opt-in) |
+| Same-Step | Schedule only; not on CausVidWan |
+| Session + legacy loop | Unchanged |
+| Session + Cell | Designed; not required for #102 |
 
-Capability: `SupportsARDiffusionCellPipeline` —
-`ar_diffusion_noisy_kv_spec()`, `bind_ar_diffusion_cell_context()`.
+Capability: `SupportsARDiffusionCellPipeline`.
 
 ## Testing
 
-CPU: `tests/diffusion/ar_diffusion/test_cell_{schedule,executor}.py`,
-`test_noisy_kv*.py`, and model/config resolve tests under the same tree.
+CPU: `tests/diffusion/ar_diffusion/test_cell_{schedule,executor}.py`, `test_noisy_kv*.py`.
 
-GPU (record config): `S=1` Self-Forcing; `S=2` (`T=1`); `S=T+1` Self-Forcing
-vs Latest-KV vs Same-Step (`benchmarks/` / recipe smoke).
+GPU: `S=1` Self-Forcing; `S=D+1` Self-Forcing vs Latest-KV.
 
 ## Open issues
 
-- Paged session vs NoisyKV still separate prealloc; no TP × Noisy KV yet.
+- Paged session vs NoisyKV still separate; no TP × Noisy KV.
 - Noisy KV not wired to session.
-- Micro-batch packing (`R`): varlen vs pad.
-- Cell schedule with `K>1` multiplies ticks; activation inbox is keyed by
-  `(chunk, step)` (R=1 friendly).
+- Micro-batch packing (`R`).
+- `K>1` multiplies ticks; activation inbox keyed by `(chunk, step)`.
 
 ## Related
 

@@ -1,7 +1,6 @@
 # CausVid Wan 2.1 1.3B on Noisy KV (Self-Forcing / Latest-KV).
 #
-# Topology: pipeline_parallel_size = S * G with S = num_denoise_steps + 1
-# (CausVid default T=3 noisy + clean → S=4, G=1).
+# Topology: pipeline_parallel_size = S*G; CausVid default D=3 → S=D+1=4, G=1.
 #
 # ``model``: official Wan 2.1 1.3B base in Diffusers layout
 #   Wan-AI/Wan2.1-T2V-1.3B-Diffusers  (local: /data/models/Wan2.1-T2V-1.3B-Diffusers)
@@ -37,6 +36,6 @@ stages:
       num_denoise_steps: 3
       # causvid_ckpt: /path/to/tianweiy/CausVid/autoregressive_checkpoint/model.pt
       ar_diffusion_stage_config:
-        stage_parallel_size: 4
+        step_replicas: 4
         max_batch_size: 1
         max_history_chunks: 6

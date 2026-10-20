@@ -25,10 +25,10 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _bare_pipeline(*, stages: int = 1, history: int = 1) -> CausVidWanPipeline:
+def _bare_pipeline(*, step_replicas: int = 1, history: int = 1) -> CausVidWanPipeline:
     """``__new__`` stub with the fields ``_plan_for`` reads."""
     pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
-    pipeline.stage_parallel_size = stages
+    pipeline.step_replicas = step_replicas
     pipeline.layer_groups = 1
     pipeline.max_history_chunks = history
     pipeline.transformer = SimpleNamespace(num_layers=1, local_num_layers=1)
@@ -153,11 +153,11 @@ def test_cell_schedule_rejects_unknown_values():
         pipeline._plan_for(req)
 
 
-@pytest.mark.parametrize("name", ["self_forcing", "latest_kv", "same_step"])
+@pytest.mark.parametrize("name", ["self_forcing", "latest_kv"])
 def test_cell_schedule_accepts_known_values(name):
     from vllm_omni.experimental.ar_diffusion.cell_schedule import Ordering
 
-    pipeline = _bare_pipeline(stages=4, history=6)
+    pipeline = _bare_pipeline(step_replicas=4, history=6)
     req = OmniDiffusionRequest(
         prompt="x",
         request_id=f"sched-{name}",
@@ -168,9 +168,10 @@ def test_cell_schedule_accepts_known_values(name):
     plan, _, _ = pipeline._plan_for(req)
     assert plan.schedule.ordering is Ordering(name)
     assert plan.schedule.ordering.value == name
+    assert plan.schedule.has_clean_stage is True
 
 
-@pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step_kv"])
+@pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step", "same_step_kv"])
 def test_cell_schedule_rejects_removed_aliases(name):
     pipeline = _bare_pipeline()
     req = OmniDiffusionRequest(
@@ -178,7 +179,7 @@ def test_cell_schedule_rejects_removed_aliases(name):
         request_id=f"sched-alias-{name}",
         sampling_params=OmniDiffusionSamplingParams(extra_args={"cell_schedule": name}),
     )
-    with pytest.raises(ValueError, match="cell_schedule"):
+    with pytest.raises(ValueError, match="cell_schedule|same_step is not supported"):
         pipeline._plan_for(req)
 
 
@@ -202,15 +203,34 @@ def test_cell_schedule_rejects_nonpositive_steps(source, steps):
     ("stages", "expected_steps"),
     [
         (1, CAUSVID_DEFAULT_DENOISE_STEPS),  # S=1 keeps model default
-        (4, 3),  # S=T+1 with T=default
-        (5, 4),  # S≠1 and S≠T+1 → derive T=S-1
+        (4, 3),  # S=D+1 with D=default
+        (5, 4),  # S≠1 and S≠D+1 → derive D=S-1
     ],
 )
 def test_cell_schedule_unset_steps_keep_topology_default(stages, expected_steps):
-    pipeline = _bare_pipeline(stages=stages, history=6)
-    req = OmniDiffusionRequest(prompt="x", request_id="default-steps", sampling_params=OmniDiffusionSamplingParams())
+    pipeline = _bare_pipeline(step_replicas=stages, history=6)
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="default-steps",
+        sampling_params=OmniDiffusionSamplingParams(),
+    )
     plan, _, steps = pipeline._plan_for(req)
     assert steps == plan.schedule.num_denoise_steps == expected_steps
+
+
+def test_cell_schedule_has_clean_stage_s1_from_history():
+    """S=1 self_forcing defaults to clean when history is on."""
+    pipeline = _bare_pipeline(step_replicas=1, history=6)
+    sf = OmniDiffusionRequest(
+        prompt="x",
+        request_id="s1-sf",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={"cell_schedule": "self_forcing", "num_denoise_steps": 3, "num_chunks": 2}
+        ),
+    )
+    plan_sf, _, _ = pipeline._plan_for(sf)
+    assert plan_sf.schedule.has_clean_stage is True
+    assert plan_sf.schedule.num_schedule_steps == 4
 
 
 @pytest.mark.parametrize("shape", [(1, 16, 1, 4, 8), (1, 16, 1, 8, 16)])
@@ -222,7 +242,7 @@ def test_pipeline_rejects_token_count_change_before_admission(shape):
     transformer.patch_size = (1, 2, 2)
     transformer.register_parameter("test_device", torch.nn.Parameter(torch.zeros(1)))
     pipeline.transformer = transformer
-    pipeline.stage_parallel_size = pipeline.layer_groups = pipeline.max_history_chunks = 1
+    pipeline.step_replicas = pipeline.layer_groups = pipeline.max_history_chunks = 1
     pipeline.block_size = pipeline.max_chunk_tokens = 16
     pipeline._chunk_ctx = None
     pipeline._default_shift = CAUSVID_DEFAULT_SHIFT

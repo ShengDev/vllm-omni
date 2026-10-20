@@ -64,7 +64,7 @@ def _activation_edges(
     """Identical edge list on every rank for this tick."""
     edges: list[tuple[int, int, tuple[tuple[str, Cell], ...]]] = []
     last_rank = topology.world - 1
-    if topology.stages == 1:
+    if topology.step_replicas == 1:
         peer_tasks = rank_work(inflight, slot, last_rank)
         if _tasks_need_activation_send(peer_tasks, schedule):
             edges.append((last_rank, 0, peer_tasks))
@@ -151,15 +151,15 @@ def resolve_pp_rank_and_group() -> tuple[int, Any | None]:
 
 @dataclass(frozen=True)
 class CellTopology:
-    stages: int
+    step_replicas: int
     layer_groups: int
 
     @property
     def world(self) -> int:
-        return self.stages * self.layer_groups
+        return self.step_replicas * self.layer_groups
 
     def split_rank(self, rank: int) -> tuple[int, int]:
-        if self.stages == 1:
+        if self.step_replicas == 1:
             return 0, rank
         return rank // self.layer_groups, rank % self.layer_groups
 
@@ -305,8 +305,8 @@ def run_cell_pipeline(
     kv.bind_rank(spec.rank, spec.pp_group)
     pp = spec.pp_group
     logger.info(
-        "[chunk_pipeline] start: stages=%d layer_groups=%d rank=%d inflight=%d pending=%d",
-        spec.topology.stages,
+        "[chunk_pipeline] start: step_replicas=%d layer_groups=%d rank=%d inflight=%d pending=%d",
+        spec.topology.step_replicas,
         spec.topology.layer_groups,
         spec.rank,
         len(ctx.inflight),

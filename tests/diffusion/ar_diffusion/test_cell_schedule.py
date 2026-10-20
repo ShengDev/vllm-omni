@@ -18,14 +18,16 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _s1(chunks, world, ordering, *, kv=False, steps=3) -> CellSchedule:
+def _s1(chunks, world, ordering, *, kv=False, steps=3, has_clean=None) -> CellSchedule:
+    # kv=True keeps a history window; clean is named separately (default: on iff kv).
     return CellSchedule(
         chunks=chunks,
         num_denoise_steps=steps,
-        stages=1,
+        step_replicas=1,
         layer_groups=world,
         ordering=ordering,
         kv_history_chunks=6 if kv else 0,
+        has_clean_stage=(kv if has_clean is None else has_clean),
     )
 
 
@@ -36,7 +38,7 @@ def test_layer_groups_match_vllm_pp_indices():
     schedule = CellSchedule(
         chunks=2,
         num_denoise_steps=1,
-        stages=1,
+        step_replicas=1,
         layer_groups=4,
         ordering=Ordering.LATEST_KV,
         kv_history_chunks=0,
@@ -104,7 +106,7 @@ def test_vertical_diagonal_example():
     schedule = CellSchedule(
         chunks=4,
         num_denoise_steps=2,
-        stages=3,
+        step_replicas=3,
         layer_groups=2,
         ordering=Ordering.LATEST_KV,
         kv_history_chunks=6,
@@ -130,22 +132,21 @@ def test_vertical_diagonal_example():
 
 def test_vertical_same_step_matches_topology_not_latest_kv():
     """Same-Step shares diagonal placement with Latest-KV but only reads matching local step."""
-    common = dict(chunks=4, num_denoise_steps=2, stages=3, layer_groups=2, kv_history_chunks=6)
+    # Same-Step is no-clean: S=D. Latest can share that topology for placement compare.
+    common = dict(chunks=4, num_denoise_steps=2, step_replicas=2, layer_groups=2, kv_history_chunks=6)
     latest = build_cell_plan(CellSchedule(**common, ordering=Ordering.LATEST_KV))
     same = build_cell_plan(CellSchedule(**common, ordering=Ordering.SAME_STEP))
+    assert same.schedule.has_clean_stage is False
     assert same.num_slots == latest.num_slots
     for t in range(same.num_slots):
         for rank in range(same.world):
             assert same.task(t, rank) == latest.task(t, rank)
-    # Latest promotes chunk-0 to step 1; Same-Step stays on step 0.
+    # Latest may promote to a higher finished step; Same-Step stays on matching step.
     latest_versions = {src.version for src in latest.sources((3, 0, 0), 0)}
     same_versions = {src.version for src in same.sources((3, 0, 0), 0)}
     assert (0, 1, 0) in latest_versions
     assert same_versions == {(2, 0, 0), (1, 0, 0), (0, 0, 0)}
     assert all(v[1] == 0 for v in same_versions)
-    # Clean stage still matches step (no Latest promotion across steps).
-    clean_srcs = same.sources((3, 2, 0), 4)
-    assert {s.version for s in clean_srcs} == {(2, 2, 0), (1, 2, 0), (0, 2, 0)}
     # Same step × block is co-located → no KV P2P under Same-Step.
     for t in range(same.num_slots):
         assert same.transfers(t) == ()
@@ -160,14 +161,46 @@ def test_vertical_same_step_matches_topology_not_latest_kv():
                 assert same.wait_ready(t, rank) == frozenset()
 
 
+def test_rejects_same_step_with_clean():
+    with pytest.raises(ValueError, match="same_step does not use a clean stage"):
+        CellSchedule(
+            chunks=2,
+            num_denoise_steps=2,
+            step_replicas=2,
+            layer_groups=1,
+            ordering=Ordering.SAME_STEP,
+            kv_history_chunks=4,
+            has_clean_stage=True,
+        )
+    with pytest.raises(ValueError, match="same_step vertical requires step_replicas=D"):
+        CellSchedule(
+            chunks=2,
+            num_denoise_steps=2,
+            step_replicas=3,
+            layer_groups=1,
+            ordering=Ordering.SAME_STEP,
+            kv_history_chunks=4,
+        )
+
+
 def test_vertical_serial_same_topology_no_chunk_overlap():
-    common = dict(chunks=3, num_denoise_steps=2, stages=3, layer_groups=1, kv_history_chunks=6)
+    common = dict(chunks=3, num_denoise_steps=2, step_replicas=3, layer_groups=1, kv_history_chunks=6)
     serial = build_cell_plan(CellSchedule(**common, ordering=Ordering.SELF_FORCING))
     latest = build_cell_plan(CellSchedule(**common, ordering=Ordering.LATEST_KV))
-    same = build_cell_plan(CellSchedule(**common, ordering=Ordering.SAME_STEP))
+    same = build_cell_plan(
+        CellSchedule(
+            chunks=3,
+            num_denoise_steps=2,
+            step_replicas=2,
+            layer_groups=1,
+            ordering=Ordering.SAME_STEP,
+            kv_history_chunks=6,
+        )
+    )
     world = 3
     assert serial.num_slots == 3 * world
-    assert latest.num_slots == same.num_slots == 3 + world - 1
+    assert latest.num_slots == 3 + world - 1
+    assert same.num_slots == 3 + 2 - 1
     for t in range(serial.num_slots):
         chunks = {task[0] for task in (serial.task(t, r) for r in range(world)) if task is not None}
         assert len(chunks) <= 1
@@ -181,7 +214,7 @@ def test_block_expand_multiplies_ticks():
     schedule = CellSchedule(
         chunks=2,
         num_denoise_steps=1,
-        stages=2,
+        step_replicas=2,
         layer_groups=1,
         ordering=Ordering.LATEST_KV,
         kv_history_chunks=2,
@@ -203,14 +236,82 @@ def test_block_expand_multiplies_ticks():
 
 
 def test_rejects_intermediate_s():
-    with pytest.raises(ValueError, match="stages must be 1"):
+    with pytest.raises(ValueError, match="step_replicas must be 1"):
         CellSchedule(
             chunks=4,
             num_denoise_steps=4,
-            stages=2,
+            step_replicas=2,
             layer_groups=1,
             ordering=Ordering.SELF_FORCING,
             kv_history_chunks=4,
+        )
+
+
+def test_accepts_same_step_s_eq_t():
+    schedule = CellSchedule(
+        chunks=4,
+        num_denoise_steps=3,
+        step_replicas=3,
+        layer_groups=1,
+        ordering=Ordering.SAME_STEP,
+        kv_history_chunks=4,
+    )
+    plan = build_cell_plan(schedule)
+    assert plan.schedule.step_replicas == plan.schedule.num_denoise_steps == 3
+    assert plan.schedule.has_clean_stage is False
+    assert plan.schedule.num_schedule_steps == 3
+    assert plan.world == 3
+
+
+def test_rejects_self_forcing_s_eq_t():
+    with pytest.raises(ValueError, match="self_forcing vertical requires has_clean_stage"):
+        CellSchedule(
+            chunks=4,
+            num_denoise_steps=3,
+            step_replicas=3,
+            layer_groups=1,
+            ordering=Ordering.SELF_FORCING,
+            kv_history_chunks=4,
+        )
+
+
+def test_s1_history_alone_does_not_add_clean():
+    """H is residency only; clean must be has_clean_stage."""
+    no_clean = CellSchedule(
+        chunks=2,
+        num_denoise_steps=3,
+        step_replicas=1,
+        layer_groups=1,
+        ordering=Ordering.LATEST_KV,
+        kv_history_chunks=6,
+        has_clean_stage=False,
+    )
+    with_clean = CellSchedule(
+        chunks=2,
+        num_denoise_steps=3,
+        step_replicas=1,
+        layer_groups=1,
+        ordering=Ordering.LATEST_KV,
+        kv_history_chunks=0,
+        has_clean_stage=True,
+    )
+    assert no_clean.num_schedule_steps == 3
+    assert with_clean.num_schedule_steps == 4
+    plan = build_cell_plan(no_clean)
+    steps = {task[1] for t in range(plan.num_slots) for r in range(plan.world) if (task := plan.task(t, r))}
+    assert steps == {0, 1, 2}
+
+
+def test_vertical_has_clean_must_match_stages():
+    with pytest.raises(ValueError, match="has_clean_stage=False inconsistent"):
+        CellSchedule(
+            chunks=2,
+            num_denoise_steps=2,
+            step_replicas=3,
+            layer_groups=1,
+            ordering=Ordering.LATEST_KV,
+            kv_history_chunks=4,
+            has_clean_stage=False,
         )
 
 
@@ -219,7 +320,7 @@ def test_i2_sources_strictly_earlier():
         CellSchedule(
             chunks=4,
             num_denoise_steps=2,
-            stages=3,
+            step_replicas=3,
             layer_groups=2,
             ordering=Ordering.LATEST_KV,
             kv_history_chunks=6,
@@ -240,7 +341,7 @@ def test_wait_ready_nonempty_after_cell_expand():
         CellSchedule(
             chunks=8,
             num_denoise_steps=4,
-            stages=5,
+            step_replicas=5,
             layer_groups=1,
             ordering=Ordering.LATEST_KV,
             kv_history_chunks=6,
