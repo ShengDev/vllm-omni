@@ -344,9 +344,10 @@ class CausVidWanPipeline(nn.Module):
         else:
             raise ValueError(f"CausVidWan cell_schedule must be 'self_forcing' or 'latest_kv', got {schedule_name!r}")
         step_replicas = self.step_replicas
-        if step_replicas not in (1, denoise, denoise + 1):
+        # CausVid rejects same_step; vertical is S=D+1 only (S=D stays schedule-level).
+        if step_replicas not in (1, denoise + 1):
             if explicit_denoise is not None:
-                raise ValueError(f"step_replicas must be 1, D ({denoise}), or D+1 ({denoise + 1}), got {step_replicas}")
+                raise ValueError(f"step_replicas must be 1 or D+1 ({denoise + 1}), got {step_replicas}")
             # S>=2 here (S=1 is always in the set above); infer D = S-1 → S = D+1.
             denoise = step_replicas - 1
         extra["num_denoise_steps"] = denoise

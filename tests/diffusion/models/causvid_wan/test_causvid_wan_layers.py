@@ -203,6 +203,7 @@ def test_cell_schedule_rejects_nonpositive_steps(source, steps):
     ("stages", "expected_steps"),
     [
         (1, CAUSVID_DEFAULT_DENOISE_STEPS),  # S=1 keeps model default
+        (3, 2),  # S≠1 and S≠D+1 (default D=3) → derive D=S-1 → S=D+1
         (4, 3),  # S=D+1 with D=default
         (5, 4),  # S≠1 and S≠D+1 → derive D=S-1
     ],
@@ -216,6 +217,21 @@ def test_cell_schedule_unset_steps_keep_topology_default(stages, expected_steps)
     )
     plan, _, steps = pipeline._plan_for(req)
     assert steps == plan.schedule.num_denoise_steps == expected_steps
+    assert plan.schedule.step_replicas in (1, steps + 1)
+
+
+def test_causvid_rejects_explicit_s_eq_d():
+    """CausVidWan does not accept vertical S=D (Same-Step-only topology)."""
+    pipeline = _bare_pipeline(step_replicas=3, history=6)
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="s-eq-d",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={"cell_schedule": "latest_kv", "num_denoise_steps": 3, "num_chunks": 2}
+        ),
+    )
+    with pytest.raises(ValueError, match=r"step_replicas must be 1 or D\+1"):
+        pipeline._plan_for(req)
 
 
 def test_cell_schedule_has_clean_s1_from_history():

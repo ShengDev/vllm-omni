@@ -228,8 +228,6 @@ def test_attention_reads_only_valid_version_pages(stages, chunk, chunk_tokens):
             layer_groups=2,
             ordering=Ordering.SELF_FORCING,
             kv_history_chunks=6,
-            # S=1 no longer infers clean from H; Self-Forcing still needs clean history.
-            has_clean=True if stages == 1 else None,
         )
     )
     cache = _cache(max_chunk_tokens=12)

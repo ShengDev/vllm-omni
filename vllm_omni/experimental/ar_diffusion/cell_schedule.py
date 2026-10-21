@@ -92,7 +92,15 @@ class CellSchedule:
             raise ValueError("vertical slice (S > 1) requires kv_history_chunks > 0")
         vertical_has_clean = self.step_replicas == d_plus_1
         if self.has_clean is None:
-            derived = False if (self.ordering is Ordering.SAME_STEP or self.step_replicas == 1) else vertical_has_clean
+            if self.ordering is Ordering.SAME_STEP:
+                derived = False
+            elif self.ordering is Ordering.SELF_FORCING and self.kv_history_chunks > 0:
+                # Clean-history Self-Forcing (S=1 or vertical S=D+1).
+                derived = True
+            elif self.step_replicas == 1:
+                derived = False
+            else:
+                derived = vertical_has_clean
             object.__setattr__(self, "has_clean", derived)
         else:
             object.__setattr__(self, "has_clean", bool(self.has_clean))
@@ -105,6 +113,8 @@ class CellSchedule:
                 f"has_clean={self.has_clean} inconsistent with "
                 f"step_replicas={self.step_replicas}, num_denoise_steps={d} (expect {vertical_has_clean})"
             )
+        if self.ordering is Ordering.SELF_FORCING and self.kv_history_chunks > 0 and not self.has_clean:
+            raise ValueError("self_forcing with history requires has_clean")
         if self.ordering is Ordering.SELF_FORCING and self.step_replicas > 1 and not self.has_clean:
             raise ValueError("self_forcing vertical requires has_clean (step_replicas=D+1)")
         blocks = self.layer_groups if self.blocks is None else self.blocks

@@ -75,10 +75,11 @@ feeds the next group). KV is keyed **per block** `b`: publish / transfer /
 wait when that cell finishes; a remote reader of `b` does not wait for the
 producer's other local blocks.
 
-CausVidWan accepts only Self-Forcing / Latest-KV (not Same-Step). Pair
-schedule with topology: Self-Forcing → `S=1` layer PP
-(`deploy/causvid_wan_self_forcing.yaml`); Latest-KV → vertical `S=D+1`
-(`deploy/causvid_wan_latest_kv.yaml`).
+CausVidWan accepts only Self-Forcing / Latest-KV (not Same-Step) and
+`S ∈ {1, D+1}` (not `S=D`). Pair schedule with topology: Self-Forcing →
+`S=1` layer PP (`deploy/causvid_wan_self_forcing.yaml`); Latest-KV →
+vertical `S=D+1` (`deploy/causvid_wan_latest_kv.yaml`). Self-Forcing with
+`H>0` requires `has_clean` (clean-history semantics).
 
 #102 acceptance: reproducible basic function + recorded config. No FPS /
 speedup SLA. DreamZero / LingBot paged-session defaults must not regress.

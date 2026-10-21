@@ -264,7 +264,7 @@ def test_accepts_same_step_s_eq_t():
 
 
 def test_rejects_self_forcing_s_eq_t():
-    with pytest.raises(ValueError, match="self_forcing vertical requires has_clean"):
+    with pytest.raises(ValueError, match="self_forcing with history requires has_clean"):
         CellSchedule(
             chunks=4,
             num_denoise_steps=3,
@@ -272,11 +272,38 @@ def test_rejects_self_forcing_s_eq_t():
             layer_groups=1,
             ordering=Ordering.SELF_FORCING,
             kv_history_chunks=4,
+            has_clean=False,
+        )
+
+
+def test_s1_self_forcing_history_defaults_clean():
+    schedule = CellSchedule(
+        chunks=2,
+        num_denoise_steps=3,
+        step_replicas=1,
+        layer_groups=1,
+        ordering=Ordering.SELF_FORCING,
+        kv_history_chunks=6,
+    )
+    assert schedule.has_clean is True
+    assert schedule.num_schedule_steps == 4
+
+
+def test_rejects_s1_self_forcing_history_without_clean():
+    with pytest.raises(ValueError, match="self_forcing with history requires has_clean"):
+        CellSchedule(
+            chunks=2,
+            num_denoise_steps=3,
+            step_replicas=1,
+            layer_groups=1,
+            ordering=Ordering.SELF_FORCING,
+            kv_history_chunks=6,
+            has_clean=False,
         )
 
 
 def test_s1_history_alone_does_not_add_clean():
-    """H is residency only; clean must be has_clean."""
+    """H is residency only for Latest-KV; clean must be has_clean."""
     no_clean = CellSchedule(
         chunks=2,
         num_denoise_steps=3,
