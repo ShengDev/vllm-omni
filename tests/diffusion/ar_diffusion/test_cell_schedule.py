@@ -263,8 +263,11 @@ def test_accepts_same_step_s_eq_t():
     assert plan.world == 3
 
 
-def test_rejects_self_forcing_s_eq_t():
-    with pytest.raises(ValueError, match="self_forcing with history requires has_clean"):
+@pytest.mark.parametrize("has_clean", [None, False])
+def test_rejects_self_forcing_s_eq_t(has_clean):
+    # Vertical Self-Forcing needs S=D+1; reject before deriving has_clean so
+    # the error names the topology instead of a misleading derived-flag error.
+    with pytest.raises(ValueError, match=r"self_forcing vertical requires step_replicas=D\+1"):
         CellSchedule(
             chunks=4,
             num_denoise_steps=3,
@@ -272,7 +275,7 @@ def test_rejects_self_forcing_s_eq_t():
             layer_groups=1,
             ordering=Ordering.SELF_FORCING,
             kv_history_chunks=4,
-            has_clean=False,
+            has_clean=has_clean,
         )
 
 

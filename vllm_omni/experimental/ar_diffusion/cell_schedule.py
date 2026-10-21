@@ -66,7 +66,8 @@ class CellSchedule:
     layer_groups: int
     ordering: Ordering
     kv_history_chunks: int
-    #: Clean@0 at step ``D``. ``None`` → derive (Same-Step/S=1: False; else ``S==D+1``).
+    #: Clean@0 at step ``D``. ``None`` → derive (Same-Step: False; Self-Forcing
+    #: with ``kv_history_chunks > 0``: True; else ``S == D+1``).
     has_clean: bool | None = None
     #: Total DiT blocks. Default ``layer_groups`` ⇒ one block per group (K=1).
     blocks: int | None = None
@@ -91,6 +92,13 @@ class CellSchedule:
         if self.step_replicas > 1 and self.kv_history_chunks < 1:
             raise ValueError("vertical slice (S > 1) requires kv_history_chunks > 0")
         vertical_has_clean = self.step_replicas == d_plus_1
+        if self.ordering is Ordering.SELF_FORCING and self.step_replicas > 1 and not vertical_has_clean:
+            # Reject before deriving has_clean so the error names the topology
+            # (vertical Self-Forcing needs S=D+1), not a derived clean flag.
+            raise ValueError(
+                "self_forcing vertical requires step_replicas=D+1 "
+                f"({d_plus_1}) for clean history, got {self.step_replicas}"
+            )
         if self.has_clean is None:
             if self.ordering is Ordering.SAME_STEP:
                 derived = False
@@ -115,8 +123,6 @@ class CellSchedule:
             )
         if self.ordering is Ordering.SELF_FORCING and self.kv_history_chunks > 0 and not self.has_clean:
             raise ValueError("self_forcing with history requires has_clean")
-        if self.ordering is Ordering.SELF_FORCING and self.step_replicas > 1 and not self.has_clean:
-            raise ValueError("self_forcing vertical requires has_clean (step_replicas=D+1)")
         blocks = self.layer_groups if self.blocks is None else self.blocks
         k = 1 if self.blocks_per_rank is None else self.blocks_per_rank
         if blocks < 1:
