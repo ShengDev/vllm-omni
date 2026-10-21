@@ -2,18 +2,30 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Pure-function cell timetable, Latest-KV visibility, and transfer plan.
 
-No torch. ``D`` = noisy denoise steps; ``S = step_replicas ∈ {1, D, D+1}``.
-Schedule/KV unit is cell ``(chunk, step, block)``. Clean at step ``D`` iff
-``has_clean`` (vertical with clean: ``S = D+1``).
+No torch. ``D`` = noisy denoise steps. Schedule/KV unit is cell ``(chunk, step,
+block)``; clean at step ``D`` iff ``has_clean``. Weight split: PP layer-groups
+``G``, each coarse ``(c, s)`` expands to local blocks; ``world = S·G``.
 
-* Weight split: PP layer-groups ``G``; each coarse ``(c,s)`` expands to local blocks.
-* ``S = 1``: layer PP. ``S = D``: one replica per noisy step (no clean; Same-Step).
-  ``S = D+1``: one replica per noisy step plus clean.
-* ``SELF_FORCING``: one chunk in flight (Self-Forcing / clean history);
-  vertical requires ``has_clean`` / ``S = D+1``.
-* ``LATEST_KV``: diagonal Latest-KV (may P2P KV across step replicas).
-* ``SAME_STEP``: same diagonal topology, matching-step history only — always
-  local to the consumer rank, so no KV transfers; no clean (``S = D``).
+Deployment paths (schedule ↔ topology pairs; default ``has_clean`` derivation):
+
+| Ordering       | ``S``     | clean          | ``H``       | topology / deploy |
+| -------------- | --------- | -------------- | ----------- | ----------------- |
+| self_forcing   | ``1``     | ``H>0`` → on   | any         | layer PP × ``G``; ``causvid_wan_self_forcing.yaml`` |
+| self_forcing   | ``D+1``   | required (on)  | ``≥1``      | vertical + clean history |
+| latest_kv      | ``1``     | off            | any         | layer PP × ``G`` (serial, no P2P KV) |
+| latest_kv      | ``D``     | off            | ``≥1``      | diagonal, may P2P KV, no clean |
+| latest_kv      | ``D+1``   | on             | ``≥1``      | diagonal + clean — ``causvid_wan_latest_kv.yaml`` |
+| same_step      | ``1``     | off            | any         | serial, local-only KV |
+| same_step      | ``D``     | off            | ``≥1``      | vertical, local-only KV, no clean |
+
+Rejected fast in ``CellSchedule.__post_init__``:
+
+* ``self_forcing`` vertical with ``S = D`` (vertical Self-Forcing needs
+  ``S = D+1`` for clean history), or with history but explicit
+  ``has_clean=False``.
+* ``same_step`` with clean, or vertical with ``S != D``.
+* ``S`` outside ``{1, D, D+1}``; vertical (``S > 1``) with ``H < 1``; explicit
+  ``has_clean`` conflicting with the topology-derived value.
 """
 
 from __future__ import annotations
