@@ -153,11 +153,11 @@ def test_cell_schedule_rejects_unknown_values():
         pipeline._plan_for(req)
 
 
-@pytest.mark.parametrize("name", ["self_forcing", "latest_kv"])
-def test_cell_schedule_accepts_known_values(name):
+@pytest.mark.parametrize(("name", "step_replicas"), [("self_forcing", 1), ("latest_kv", 4)])
+def test_cell_schedule_accepts_known_values(name, step_replicas):
     from vllm_omni.experimental.ar_diffusion.cell_schedule import Ordering
 
-    pipeline = _bare_pipeline(step_replicas=4, history=6)
+    pipeline = _bare_pipeline(step_replicas=step_replicas, history=6)
     req = OmniDiffusionRequest(
         prompt="x",
         request_id=f"sched-{name}",
@@ -200,20 +200,20 @@ def test_cell_schedule_rejects_nonpositive_steps(source, steps):
 
 
 @pytest.mark.parametrize(
-    ("stages", "expected_steps"),
+    ("stages", "schedule", "expected_steps"),
     [
-        (1, CAUSVID_DEFAULT_DENOISE_STEPS),  # S=1 keeps model default
-        (3, 2),  # S≠1 and S≠D+1 (default D=3) → derive D=S-1 → S=D+1
-        (4, 3),  # S=D+1 with D=default
-        (5, 4),  # S≠1 and S≠D+1 → derive D=S-1
+        (1, "self_forcing", CAUSVID_DEFAULT_DENOISE_STEPS),  # S=1 keeps model default
+        (3, "latest_kv", 2),  # S≠1 and S≠D+1 (default D=3) → derive D=S-1 → S=D+1
+        (4, "latest_kv", 3),  # S=D+1 with D=default
+        (5, "latest_kv", 4),  # S≠1 and S≠D+1 → derive D=S-1
     ],
 )
-def test_cell_schedule_unset_steps_keep_topology_default(stages, expected_steps):
+def test_cell_schedule_unset_steps_keep_topology_default(stages, schedule, expected_steps):
     pipeline = _bare_pipeline(step_replicas=stages, history=6)
     req = OmniDiffusionRequest(
         prompt="x",
         request_id="default-steps",
-        sampling_params=OmniDiffusionSamplingParams(),
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"cell_schedule": schedule, "num_chunks": 2}),
     )
     plan, _, steps = pipeline._plan_for(req)
     assert steps == plan.schedule.num_denoise_steps == expected_steps
@@ -231,6 +231,20 @@ def test_causvid_rejects_explicit_s_eq_d():
         ),
     )
     with pytest.raises(ValueError, match=r"step_replicas must be 1 or D\+1"):
+        pipeline._plan_for(req)
+
+
+def test_causvid_rejects_vertical_self_forcing():
+    """Vertical (S>1) step replicas are Latest-KV only; Self-Forcing is S=1 layer PP."""
+    pipeline = _bare_pipeline(step_replicas=4, history=6)
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="vertical-sf",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={"cell_schedule": "self_forcing", "num_denoise_steps": 3, "num_chunks": 2}
+        ),
+    )
+    with pytest.raises(ValueError, match="self_forcing requires step_replicas=1"):
         pipeline._plan_for(req)
 
 

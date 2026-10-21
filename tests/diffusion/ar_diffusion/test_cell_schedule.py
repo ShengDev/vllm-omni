@@ -183,10 +183,17 @@ def test_rejects_same_step_with_clean():
         )
 
 
-def test_vertical_serial_same_topology_no_chunk_overlap():
-    common = dict(chunks=3, num_denoise_steps=2, step_replicas=3, layer_groups=1, kv_history_chunks=6)
-    serial = build_cell_plan(CellSchedule(**common, ordering=Ordering.SELF_FORCING))
-    latest = build_cell_plan(CellSchedule(**common, ordering=Ordering.LATEST_KV))
+def test_vertical_diagonal_slot_counts():
+    latest = build_cell_plan(
+        CellSchedule(
+            chunks=3,
+            num_denoise_steps=2,
+            step_replicas=3,
+            layer_groups=1,
+            ordering=Ordering.LATEST_KV,
+            kv_history_chunks=6,
+        )
+    )
     same = build_cell_plan(
         CellSchedule(
             chunks=3,
@@ -198,16 +205,8 @@ def test_vertical_serial_same_topology_no_chunk_overlap():
         )
     )
     world = 3
-    assert serial.num_slots == 3 * world
     assert latest.num_slots == 3 + world - 1
     assert same.num_slots == 3 + 2 - 1
-    for t in range(serial.num_slots):
-        chunks = {task[0] for task in (serial.task(t, r) for r in range(world)) if task is not None}
-        assert len(chunks) <= 1
-    assert serial.task(world, 0) == (1, 0, 0)
-    assert serial.completion_tick((0, 2, 0)) == world - 1
-    for src in serial.sources((1, 0, 0), 0):
-        assert src.version[1] == 2
 
 
 def test_block_expand_multiplies_ticks():
@@ -263,19 +262,17 @@ def test_accepts_same_step_s_eq_t():
     assert plan.world == 3
 
 
-@pytest.mark.parametrize("has_clean", [None, False])
-def test_rejects_self_forcing_s_eq_t(has_clean):
-    # Vertical Self-Forcing needs S=D+1; reject before deriving has_clean so
-    # the error names the topology instead of a misleading derived-flag error.
-    with pytest.raises(ValueError, match=r"self_forcing vertical requires step_replicas=D\+1"):
+@pytest.mark.parametrize("step_replicas", [3, 4])  # S=D and S=D+1 both rejected
+def test_rejects_vertical_self_forcing(step_replicas):
+    # Self-Forcing is single-replica (layer PP); vertical replicas are latest_kv/same_step.
+    with pytest.raises(ValueError, match="self_forcing requires step_replicas=1"):
         CellSchedule(
             chunks=4,
             num_denoise_steps=3,
-            step_replicas=3,
+            step_replicas=step_replicas,
             layer_groups=1,
             ordering=Ordering.SELF_FORCING,
             kv_history_chunks=4,
-            has_clean=has_clean,
         )
 
 

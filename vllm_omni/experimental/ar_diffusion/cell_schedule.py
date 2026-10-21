@@ -11,7 +11,6 @@ Deployment paths (schedule ↔ topology pairs; default ``has_clean`` derivation)
 | Ordering       | ``S``     | clean          | ``H``       | topology / deploy |
 | -------------- | --------- | -------------- | ----------- | ----------------- |
 | self_forcing   | ``1``     | ``H>0`` → on   | any         | layer PP × ``G``; ``causvid_wan_self_forcing.yaml`` |
-| self_forcing   | ``D+1``   | required (on)  | ``≥1``      | vertical + clean history |
 | latest_kv      | ``1``     | off            | any         | layer PP × ``G`` (serial, no P2P KV) |
 | latest_kv      | ``D``     | off            | ``≥1``      | diagonal, may P2P KV, no clean |
 | latest_kv      | ``D+1``   | on             | ``≥1``      | diagonal + clean — ``causvid_wan_latest_kv.yaml`` |
@@ -20,9 +19,9 @@ Deployment paths (schedule ↔ topology pairs; default ``has_clean`` derivation)
 
 Rejected fast in ``CellSchedule.__post_init__``:
 
-* ``self_forcing`` vertical with ``S = D`` (vertical Self-Forcing needs
-  ``S = D+1`` for clean history), or with history but explicit
-  ``has_clean=False``.
+* ``self_forcing`` with ``S > 1`` (Self-Forcing is single-replica layer PP;
+  vertical step replicas are the Latest-KV / Same-Step topology), or with
+  history but explicit ``has_clean=False``.
 * ``same_step`` with clean, or vertical with ``S != D``.
 * ``S`` outside ``{1, D, D+1}``; vertical (``S > 1``) with ``H < 1``; explicit
   ``has_clean`` conflicting with the topology-derived value.
@@ -104,18 +103,19 @@ class CellSchedule:
         if self.step_replicas > 1 and self.kv_history_chunks < 1:
             raise ValueError("vertical slice (S > 1) requires kv_history_chunks > 0")
         vertical_has_clean = self.step_replicas == d_plus_1
-        if self.ordering is Ordering.SELF_FORCING and self.step_replicas > 1 and not vertical_has_clean:
-            # Reject before deriving has_clean so the error names the topology
-            # (vertical Self-Forcing needs S=D+1), not a derived clean flag.
+        if self.ordering is Ordering.SELF_FORCING and self.step_replicas > 1:
+            # Self-Forcing is single-replica (layer PP); vertical step replicas
+            # are the Latest-KV / Same-Step (diagonal) topology. Reject before
+            # deriving has_clean so the error names the ordering, not a flag.
             raise ValueError(
-                "self_forcing vertical requires step_replicas=D+1 "
-                f"({d_plus_1}) for clean history, got {self.step_replicas}"
+                f"self_forcing requires step_replicas=1 (layer PP), got {self.step_replicas}; "
+                "vertical replicas use latest_kv or same_step"
             )
         if self.has_clean is None:
             if self.ordering is Ordering.SAME_STEP:
                 derived = False
             elif self.ordering is Ordering.SELF_FORCING and self.kv_history_chunks > 0:
-                # Clean-history Self-Forcing (S=1 or vertical S=D+1).
+                # S=1 Self-Forcing with history defaults clean on.
                 derived = True
             elif self.step_replicas == 1:
                 derived = False
@@ -336,27 +336,6 @@ def _plan_vertical_coarse(schedule: CellSchedule) -> tuple[tuple[tuple[int, int]
     return tuple(slots)
 
 
-def _plan_vertical_serial_coarse(schedule: CellSchedule) -> tuple[tuple[tuple[int, int] | None, ...], ...]:
-    unit = _plan_vertical_coarse(
-        CellSchedule(
-            chunks=1,
-            num_denoise_steps=schedule.num_denoise_steps,
-            step_replicas=schedule.step_replicas,
-            layer_groups=schedule.layer_groups,
-            ordering=Ordering.LATEST_KV,
-            kv_history_chunks=schedule.kv_history_chunks,
-            has_clean=schedule.has_clean,
-            blocks=schedule.num_blocks,
-            blocks_per_rank=schedule.blocks_per_rank,
-        )
-    )
-    slots: list[tuple[tuple[int, int] | None, ...]] = []
-    for chunk in range(schedule.chunks):
-        for row in unit:
-            slots.append(tuple((chunk, task[1]) if task is not None else None for task in row))
-    return tuple(slots)
-
-
 def _expand_to_cells(
     coarse: tuple[tuple[tuple[int, int] | None, ...], ...],
     schedule: CellSchedule,
@@ -536,8 +515,6 @@ def _assert_invariants(plan: CellPlan) -> None:
 def build_cell_plan(schedule: CellSchedule) -> CellPlan:
     if schedule.step_replicas == 1:
         coarse = _plan_s1_coarse(schedule)
-    elif schedule.ordering is Ordering.SELF_FORCING:
-        coarse = _plan_vertical_serial_coarse(schedule)
     elif _is_diagonal(schedule.ordering):
         coarse = _plan_vertical_coarse(schedule)
     else:

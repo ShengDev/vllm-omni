@@ -77,7 +77,7 @@ producer's other local blocks.
 
 CausVidWan accepts only Self-Forcing / Latest-KV (not Same-Step) and
 `S ∈ {1, D+1}` (not `S=D`). Pair schedule with topology: Self-Forcing →
-`S=1` layer PP (`deploy/causvid_wan_self_forcing.yaml`); Latest-KV →
+`S=1` layer PP only (`deploy/causvid_wan_self_forcing.yaml`); Latest-KV →
 vertical `S=D+1` (`deploy/causvid_wan_latest_kv.yaml`). Self-Forcing with
 `H>0` requires `has_clean` (clean-history semantics).
 
@@ -150,7 +150,7 @@ src = (c', s_task, b)   # only if P(c', s_task, b) < current_tick
 Invariants:
 
 - `S ∈ {1, D, D+1}`
-- Same-Step ⇒ `S = D` (no clean); Self-Forcing vertical ⇒ `S = D+1`
+- Same-Step ⇒ `S = D` (no clean); Self-Forcing ⇒ `S = 1` (vertical replicas are Latest-KV)
 - No Latest-KV edge inside the same micro-batch / tick
 - Cross-rank KV ready before use (Latest-KV / Self-Forcing when remote)
 - Same-Step history never needs KV P2P (co-located with the consumer)

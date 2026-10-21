@@ -344,6 +344,13 @@ class CausVidWanPipeline(nn.Module):
         else:
             raise ValueError(f"CausVidWan cell_schedule must be 'self_forcing' or 'latest_kv', got {schedule_name!r}")
         step_replicas = self.step_replicas
+        if ordering is Ordering.SELF_FORCING and step_replicas > 1:
+            # Self-Forcing is single-replica (paper semantics, layer PP);
+            # vertical step replicas are the Latest-KV topology.
+            raise ValueError(
+                f"self_forcing requires step_replicas=1 (layer PP), got {step_replicas}; "
+                "vertical step replicas use cell_schedule: latest_kv"
+            )
         # CausVid rejects same_step; vertical is S=D+1 only (S=D stays schedule-level).
         if step_replicas not in (1, denoise + 1):
             if explicit_denoise is not None:

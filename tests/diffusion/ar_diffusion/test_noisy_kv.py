@@ -216,17 +216,20 @@ def test_wait_ready_is_empty_without_kv_history():
         assert union_wait_ready(inflight, slot, 0) == frozenset()
 
 
-@pytest.mark.parametrize("stages", [1, 3])
+@pytest.mark.parametrize(
+    ("stages", "ordering"),
+    [(1, Ordering.SELF_FORCING), (3, Ordering.LATEST_KV)],
+)
 @pytest.mark.parametrize("chunk", [1, 3])
 @pytest.mark.parametrize("chunk_tokens", [4, 8, 12])
-def test_attention_reads_only_valid_version_pages(stages, chunk, chunk_tokens):
+def test_attention_reads_only_valid_version_pages(stages, ordering, chunk, chunk_tokens):
     plan = build_cell_plan(
         CellSchedule(
             chunks=4,
             num_denoise_steps=2,
             step_replicas=stages,
             layer_groups=2,
-            ordering=Ordering.SELF_FORCING,
+            ordering=ordering,
             kv_history_chunks=6,
         )
     )
