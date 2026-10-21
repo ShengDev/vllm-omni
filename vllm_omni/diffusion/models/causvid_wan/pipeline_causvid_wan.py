@@ -347,9 +347,8 @@ class CausVidWanPipeline(nn.Module):
         if step_replicas not in (1, denoise, denoise + 1):
             if explicit_denoise is not None:
                 raise ValueError(f"step_replicas must be 1, D ({denoise}), or D+1 ({denoise + 1}), got {step_replicas}")
-            denoise = max(1, step_replicas - 1) if step_replicas > 1 else denoise
-            if step_replicas not in (1, denoise, denoise + 1):
-                raise ValueError(f"step_replicas must be 1, D ({denoise}), or D+1 ({denoise + 1}), got {step_replicas}")
+            # S>=2 here (S=1 is always in the set above); infer D = S-1 → S = D+1.
+            denoise = step_replicas - 1
         extra["num_denoise_steps"] = denoise
         if "has_clean" in extra:
             has_clean = bool(extra["has_clean"])
@@ -456,10 +455,11 @@ class CausVidWanPipeline(nn.Module):
         on_finished: Callable[[int, torch.Tensor], None] | None,
         timeline_file: Any,
         *,
-        source_rank: int | None,
+        finish_rank: int,
         pp_rank: int,
     ) -> Callable[[int, torch.Tensor], None] | None:
-        if timeline_file is None or source_rank is None or pp_rank != source_rank:
+        """Append chunk finish times on the last-noisy producer rank."""
+        if timeline_file is None or pp_rank != finish_rank:
             return on_finished
         import time as _time
 
@@ -509,7 +509,15 @@ class CausVidWanPipeline(nn.Module):
             prompt_embeds = self._encode_prompt(prompt, device, dtype)
             sampler = FlowEuler(denoise, shift=shift)
             stream_decode = bool(extra.get("stream_decode", False))
-            source_rank = denoise * self.layer_groups - 1 if self.step_replicas in (denoise, denoise + 1) else None
+            # Rank that finishes the last noisy step (WanCell on_finished).
+            # S=1: one layer-PP replica → trailing group G-1.
+            # Vertical S∈{D,D+1}: last noisy step replica → D·G-1.
+            if self.step_replicas > 1 and self.step_replicas in (denoise, denoise + 1):
+                finish_rank = denoise * self.layer_groups - 1
+            else:
+                finish_rank = self.layer_groups - 1
+            # Remote stream_decode only for vertical; S=1 stays local (_start_local).
+            source_rank = finish_rank if self.step_replicas > 1 else None
             stream_job = None
             on_finished = None
             if stream_decode:
@@ -530,7 +538,7 @@ class CausVidWanPipeline(nn.Module):
                 )
                 on_finished = stream_job.on_finished
             on_finished = self._maybe_timeline(
-                on_finished, extra.get("chunk_timeline_file"), source_rank=source_rank, pp_rank=pp_rank
+                on_finished, extra.get("chunk_timeline_file"), finish_rank=finish_rank, pp_rank=pp_rank
             )
 
             adapter = WanCell(

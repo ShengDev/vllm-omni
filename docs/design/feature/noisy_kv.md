@@ -70,12 +70,15 @@ Three orderings; Latest-KV and Same-Step share the diagonal (vertical) topology:
 
 `S = 1` is native layer PP. Vertical schedules use `S ∈ {D, D+1}`:
 `S = D` (no clean; Same-Step) or `S = D+1` (one weight replica per noisy step
-plus clean; Self-Forcing / Latest-KV). Activations still follow PP
-(`next_rank` after the block that feeds the next group). KV is keyed **per
-block** `b`: publish / transfer / wait when that cell finishes; a remote reader
-of `b` does not wait for the producer's other local blocks.
+plus clean). Activations still follow PP (`next_rank` after the block that
+feeds the next group). KV is keyed **per block** `b`: publish / transfer /
+wait when that cell finishes; a remote reader of `b` does not wait for the
+producer's other local blocks.
 
-CausVidWan accepts only Self-Forcing / Latest-KV (not Same-Step).
+CausVidWan accepts only Self-Forcing / Latest-KV (not Same-Step). Pair
+schedule with topology: Self-Forcing → `S=1` layer PP
+(`deploy/causvid_wan_self_forcing.yaml`); Latest-KV → vertical `S=D+1`
+(`deploy/causvid_wan_latest_kv.yaml`).
 
 #102 acceptance: reproducible basic function + recorded config. No FPS /
 speedup SLA. DreamZero / LingBot paged-session defaults must not regress.
@@ -198,7 +201,9 @@ remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`
 | | `has_clean` | Optional; else inferred from `S` vs `D` (`S=1`: `H>0`) |
 
 Backend: `ARDiffusionEngine` + mp executor from deploy YAML.
-`source_rank` = last noisy step's trailing rank when `S ∈ {D, D+1}`.
+Last-noisy finish rank: `S=1` → `G-1`; vertical `S ∈ {D, D+1}` → `D·G-1`
+(used for `chunk_timeline_file`). Remote `stream_decode` `source_rank` is
+that finish rank only when `S > 1`; S=1 stays local `_start_local`.
 
 ## Compatibility
 
@@ -212,6 +217,11 @@ DreamZero / LingBot YAMLs must not silently enter `run_cell_pipeline`.
 | Session + legacy loop | Supported (unchanged) |
 | Session + Cell path | Designed; not required for #102 |
 
+**CausVidWan S=1 default:** if request `extra_args` omits `kv_history_chunks`,
+`H` defaults to model `max_history_chunks` (not `0`). That turns `has_clean`
+on when `H>0` and adds one clean forward per chunk versus the previous
+unset→`H=0` behavior. Set `kv_history_chunks: 0` explicitly to keep no-clean.
+
 Capability: `SupportsARDiffusionCellPipeline` —
 `ar_diffusion_noisy_kv_spec()`, `bind_ar_diffusion_cell_context()`.
 
@@ -220,8 +230,8 @@ Capability: `SupportsARDiffusionCellPipeline` —
 CPU: `tests/diffusion/ar_diffusion/test_cell_{schedule,executor}.py`,
 `test_noisy_kv*.py`, and model/config resolve tests under the same tree.
 
-GPU (record config): `S=1` Self-Forcing; `S=D` Same-Step; `S=D+1` Self-Forcing
-vs Latest-KV (`benchmarks/` / recipe smoke).
+GPU (record config): `S=1` Self-Forcing; `S=D` Same-Step; `S=D+1` Latest-KV
+(`benchmarks/` / recipe smoke).
 
 ## Open issues
 
