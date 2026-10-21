@@ -55,12 +55,8 @@ def test_layer_groups_match_vllm_pp_indices():
 
 @pytest.mark.parametrize("world", [1, 2, 3, 4])
 @pytest.mark.parametrize("chunks", [1, 2, 3, 6])
-@pytest.mark.parametrize(
-    "ordering",
-    [Ordering.SELF_FORCING, Ordering.SAME_STEP],
-)
-def test_s1_builds_without_idle_slot(world, chunks, ordering):
-    plan = build_cell_plan(_s1(chunks, world, ordering))
+def test_s1_builds_without_idle_slot(world, chunks):
+    plan = build_cell_plan(_s1(chunks, world, Ordering.SELF_FORCING))
     assert plan.num_slots >= chunks
     for t in range(plan.num_slots):
         assert any(plan.task(t, rank) is not None for rank in range(world))
@@ -166,7 +162,7 @@ def test_rejects_same_step_with_clean():
             kv_history_chunks=4,
             has_clean=True,
         )
-    with pytest.raises(ValueError, match="same_step vertical requires step_replicas=D"):
+    with pytest.raises(ValueError, match=r"same_step requires step_replicas=D"):
         CellSchedule(
             chunks=2,
             num_denoise_steps=2,
@@ -175,6 +171,34 @@ def test_rejects_same_step_with_clean():
             ordering=Ordering.SAME_STEP,
             kv_history_chunks=4,
         )
+
+
+@pytest.mark.parametrize("step_replicas", [1, 4])  # S=1 (D=3) and S=D+1 both rejected
+def test_rejects_non_d_same_step(step_replicas):
+    # Same-Step is the no-clean vertical (S=D); S=1 is valid only when D=1.
+    with pytest.raises(ValueError, match=r"same_step requires step_replicas=D"):
+        CellSchedule(
+            chunks=4,
+            num_denoise_steps=3,
+            step_replicas=step_replicas,
+            layer_groups=1,
+            ordering=Ordering.SAME_STEP,
+            kv_history_chunks=4,
+        )
+
+
+def test_accepts_s1_same_step_when_d_is_1():
+    # D=1: S=1 coincides with S=D, the only Same-Step replica count.
+    schedule = CellSchedule(
+        chunks=2,
+        num_denoise_steps=1,
+        step_replicas=1,
+        layer_groups=1,
+        ordering=Ordering.SAME_STEP,
+        kv_history_chunks=4,
+    )
+    assert schedule.has_clean is False
+    assert schedule.num_schedule_steps == 1
 
 
 def test_vertical_diagonal_slot_counts():

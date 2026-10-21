@@ -12,7 +12,7 @@ Deployment paths (schedule ↔ topology pairs; default ``has_clean`` derivation)
 | -------------- | --------- | -------------- | ----------- | ----------------- |
 | self_forcing   | ``1``     | ``H>0`` → on   | any         | layer PP × ``G``; ``causvid_wan_self_forcing.yaml`` |
 | latest_kv      | ``D+1``   | on             | ``≥1``      | P2P-KV diagonal + clean; ``causvid_wan_latest_kv.yaml`` |
-| same_step      | ``1``/``D`` | off            | any/``≥1`` | local-only KV, no clean (serial / vertical) |
+| same_step      | ``D``     | off            | ``≥1``      | vertical, local-only KV, no clean |
 
 Rejected fast in ``CellSchedule.__post_init__``:
 
@@ -21,7 +21,8 @@ Rejected fast in ``CellSchedule.__post_init__``:
   history but explicit ``has_clean=False``.
 * ``latest_kv`` with ``S != D+1`` (Latest-KV is the vertical clean topology;
   ``S=1`` layer PP is ``self_forcing``, no-clean vertical is ``same_step``).
-* ``same_step`` with clean, or vertical with ``S != D``.
+* ``same_step`` with clean, or with ``S != D`` (no-clean vertical only;
+  ``S=1`` is valid only when ``D=1``).
 * ``S`` outside ``{1, D, D+1}``; vertical (``S > 1``) with ``H < 1``; explicit
   ``has_clean`` conflicting with the topology-derived value.
 """
@@ -116,10 +117,14 @@ class CellSchedule:
             raise ValueError(
                 f"latest_kv requires step_replicas=D+1 ({d_plus_1}) for clean history, got {self.step_replicas}"
             )
+        if self.ordering is Ordering.SAME_STEP and self.step_replicas != d:
+            # Same-Step is the no-clean vertical (S=D); S=1 only when D=1.
+            # Reject before deriving has_clean so the error names the ordering.
+            raise ValueError(
+                f"same_step requires step_replicas=D ({d}) for the no-clean vertical, got {self.step_replicas}"
+            )
         if self.has_clean is None:
-            if self.ordering is Ordering.SAME_STEP:
-                derived = False
-            elif self.ordering is Ordering.SELF_FORCING and self.kv_history_chunks > 0:
+            if self.ordering is Ordering.SELF_FORCING and self.kv_history_chunks > 0:
                 # S=1 Self-Forcing with history defaults clean on.
                 derived = True
             elif self.step_replicas == 1:
@@ -131,8 +136,6 @@ class CellSchedule:
             object.__setattr__(self, "has_clean", bool(self.has_clean))
         if self.ordering is Ordering.SAME_STEP and self.has_clean:
             raise ValueError("same_step does not use clean (has_clean must be False)")
-        if self.ordering is Ordering.SAME_STEP and self.step_replicas > 1 and self.step_replicas != d:
-            raise ValueError("same_step vertical requires step_replicas=D (no clean)")
         if self.step_replicas > 1 and bool(self.has_clean) != vertical_has_clean:
             raise ValueError(
                 f"has_clean={self.has_clean} inconsistent with "
