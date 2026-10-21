@@ -207,7 +207,7 @@ def test_wait_ready_is_empty_without_kv_history():
             num_denoise_steps=1,
             step_replicas=1,
             layer_groups=2,
-            ordering=Ordering.LATEST_KV,
+            ordering=Ordering.SAME_STEP,
             kv_history_chunks=0,
         )
     )

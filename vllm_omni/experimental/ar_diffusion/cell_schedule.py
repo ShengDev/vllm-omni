@@ -11,9 +11,7 @@ Deployment paths (schedule ↔ topology pairs; default ``has_clean`` derivation)
 | Ordering       | ``S``     | clean          | ``H``       | topology / deploy |
 | -------------- | --------- | -------------- | ----------- | ----------------- |
 | self_forcing   | ``1``     | ``H>0`` → on   | any         | layer PP × ``G``; ``causvid_wan_self_forcing.yaml`` |
-| latest_kv      | ``1``     | off            | any         | layer PP × ``G`` (serial, no P2P KV) |
-| latest_kv      | ``D``     | off            | ``≥1``      | diagonal, may P2P KV, no clean |
-| latest_kv      | ``D+1``   | on             | ``≥1``      | diagonal + clean — ``causvid_wan_latest_kv.yaml`` |
+| latest_kv      | ``D+1``   | on             | ``≥1``      | P2P-KV diagonal + clean; ``causvid_wan_latest_kv.yaml`` |
 | same_step      | ``1``     | off            | any         | serial, local-only KV |
 | same_step      | ``D``     | off            | ``≥1``      | vertical, local-only KV, no clean |
 
@@ -22,6 +20,8 @@ Rejected fast in ``CellSchedule.__post_init__``:
 * ``self_forcing`` with ``S > 1`` (Self-Forcing is single-replica layer PP;
   vertical step replicas are the Latest-KV / Same-Step topology), or with
   history but explicit ``has_clean=False``.
+* ``latest_kv`` with ``S != D+1`` (Latest-KV is the vertical clean topology;
+  ``S=1`` layer PP is ``self_forcing``, no-clean vertical is ``same_step``).
 * ``same_step`` with clean, or vertical with ``S != D``.
 * ``S`` outside ``{1, D, D+1}``; vertical (``S > 1``) with ``H < 1``; explicit
   ``has_clean`` conflicting with the topology-derived value.
@@ -110,6 +110,12 @@ class CellSchedule:
             raise ValueError(
                 f"self_forcing requires step_replicas=1 (layer PP), got {self.step_replicas}; "
                 "vertical replicas use latest_kv or same_step"
+            )
+        if self.ordering is Ordering.LATEST_KV and self.step_replicas != d_plus_1:
+            # Latest-KV is the vertical clean-history topology (S=D+1);
+            # S=1 layer PP is self_forcing, no-clean vertical is same_step.
+            raise ValueError(
+                f"latest_kv requires step_replicas=D+1 ({d_plus_1}) for clean history, got {self.step_replicas}"
             )
         if self.has_clean is None:
             if self.ordering is Ordering.SAME_STEP:

@@ -248,6 +248,20 @@ def test_causvid_rejects_vertical_self_forcing():
         pipeline._plan_for(req)
 
 
+def test_causvid_rejects_s1_latest_kv():
+    """Latest-KV is the vertical S=D+1 clean topology; S=1 layer PP is self_forcing."""
+    pipeline = _bare_pipeline(step_replicas=1, history=6)
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="s1-lkv",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={"cell_schedule": "latest_kv", "num_denoise_steps": 3, "num_chunks": 2}
+        ),
+    )
+    with pytest.raises(ValueError, match="latest_kv requires step_replicas=D\\+1"):
+        pipeline._plan_for(req)
+
+
 def test_cell_schedule_has_clean_s1_from_history():
     """S=1 self_forcing defaults to clean when history is on."""
     pipeline = _bare_pipeline(step_replicas=1, history=6)

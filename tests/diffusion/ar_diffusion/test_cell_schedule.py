@@ -40,7 +40,7 @@ def test_layer_groups_match_vllm_pp_indices():
         num_denoise_steps=1,
         step_replicas=1,
         layer_groups=4,
-        ordering=Ordering.LATEST_KV,
+        ordering=Ordering.SELF_FORCING,
         kv_history_chunks=0,
         blocks=30,
     )
@@ -57,7 +57,7 @@ def test_layer_groups_match_vllm_pp_indices():
 @pytest.mark.parametrize("chunks", [1, 2, 3, 6])
 @pytest.mark.parametrize(
     "ordering",
-    [Ordering.SELF_FORCING, Ordering.LATEST_KV, Ordering.SAME_STEP],
+    [Ordering.SELF_FORCING, Ordering.SAME_STEP],
 )
 def test_s1_builds_without_idle_slot(world, chunks, ordering):
     plan = build_cell_plan(_s1(chunks, world, ordering))
@@ -81,23 +81,8 @@ def test_s1_serial_kv_sources_are_clean(world, chunks):
                 assert src.owner == rank
 
 
-@pytest.mark.parametrize("world", [1, 2])
-@pytest.mark.parametrize("chunks", [1, 2, 4])
-def test_s1_latest_kv_uses_latest_completed(world, chunks):
-    plan = build_cell_plan(_s1(chunks, world, Ordering.LATEST_KV, kv=True))
-    for t in range(plan.num_slots):
-        for rank in range(world):
-            task = plan.task(t, rank)
-            if task is None:
-                continue
-            for src in plan.sources(task, rank):
-                assert plan.completion_tick(src.version) < t
-                assert src.owner == rank
-                assert src.version[2] == task[2]
-
-
 def test_s1_kv_transfers_empty():
-    plan = build_cell_plan(_s1(4, 2, Ordering.LATEST_KV, kv=True))
+    plan = build_cell_plan(_s1(4, 2, Ordering.SELF_FORCING, kv=True))
     for t in range(plan.num_slots):
         assert plan.transfers(t) == ()
 
@@ -130,21 +115,30 @@ def test_vertical_diagonal_example():
     assert all(s.owner == 4 for s in clean_srcs)
 
 
-def test_vertical_same_step_matches_topology_not_latest_kv():
-    """Same-Step shares diagonal placement with Latest-KV but only reads matching local step."""
-    # Same-Step is no-clean: S=D. Latest can share that topology for placement compare.
-    common = dict(chunks=4, num_denoise_steps=2, step_replicas=2, layer_groups=2, kv_history_chunks=6)
-    latest = build_cell_plan(CellSchedule(**common, ordering=Ordering.LATEST_KV))
-    same = build_cell_plan(CellSchedule(**common, ordering=Ordering.SAME_STEP))
+def test_same_step_vertical_placement_is_diagonal():
+    """Same-Step shares the diagonal placement (step s → rank s) without clean."""
+    same = build_cell_plan(
+        CellSchedule(
+            chunks=4,
+            num_denoise_steps=2,
+            step_replicas=2,
+            layer_groups=2,
+            ordering=Ordering.SAME_STEP,
+            kv_history_chunks=6,
+        )
+    )
     assert same.schedule.has_clean is False
-    assert same.num_slots == latest.num_slots
+    # Same-Step reads only matching local steps, so sources stay local and old.
     for t in range(same.num_slots):
         for rank in range(same.world):
-            assert same.task(t, rank) == latest.task(t, rank)
-    # Latest may promote to a higher finished step; Same-Step stays on matching step.
-    latest_versions = {src.version for src in latest.sources((3, 0, 0), 0)}
+            task = same.task(t, rank)
+            if task is None:
+                continue
+            for src in same.sources(task, rank):
+                assert src.owner == rank
+                assert same.completion_tick(src.version) < t
+    # Same-Step stays on the matching step (no promotion to a finished higher step).
     same_versions = {src.version for src in same.sources((3, 0, 0), 0)}
-    assert (0, 1, 0) in latest_versions
     assert same_versions == {(2, 0, 0), (1, 0, 0), (0, 0, 0)}
     assert all(v[1] == 0 for v in same_versions)
     # Same step × block is co-located → no KV P2P under Same-Step.
@@ -302,31 +296,18 @@ def test_rejects_s1_self_forcing_history_without_clean():
         )
 
 
-def test_s1_history_alone_does_not_add_clean():
-    """H is residency only for Latest-KV; clean must be has_clean."""
-    no_clean = CellSchedule(
-        chunks=2,
-        num_denoise_steps=3,
-        step_replicas=1,
-        layer_groups=1,
-        ordering=Ordering.LATEST_KV,
-        kv_history_chunks=6,
-        has_clean=False,
-    )
-    with_clean = CellSchedule(
-        chunks=2,
-        num_denoise_steps=3,
-        step_replicas=1,
-        layer_groups=1,
-        ordering=Ordering.LATEST_KV,
-        kv_history_chunks=0,
-        has_clean=True,
-    )
-    assert no_clean.num_schedule_steps == 3
-    assert with_clean.num_schedule_steps == 4
-    plan = build_cell_plan(no_clean)
-    steps = {task[1] for t in range(plan.num_slots) for r in range(plan.world) if (task := plan.task(t, r))}
-    assert steps == {0, 1, 2}
+@pytest.mark.parametrize("step_replicas", [1, 3])  # S=1 layer PP and S=D both rejected
+def test_rejects_non_d_plus_1_latest_kv(step_replicas):
+    # Latest-KV is the vertical clean-history topology (S=D+1) only.
+    with pytest.raises(ValueError, match=r"latest_kv requires step_replicas=D\+1"):
+        CellSchedule(
+            chunks=4,
+            num_denoise_steps=3,
+            step_replicas=step_replicas,
+            layer_groups=1,
+            ordering=Ordering.LATEST_KV,
+            kv_history_chunks=6,
+        )
 
 
 def test_vertical_has_clean_must_match_stages():
