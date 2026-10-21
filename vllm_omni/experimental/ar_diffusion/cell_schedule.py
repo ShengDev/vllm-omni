@@ -12,8 +12,7 @@ Deployment paths (schedule ↔ topology pairs; default ``has_clean`` derivation)
 | -------------- | --------- | -------------- | ----------- | ----------------- |
 | self_forcing   | ``1``     | ``H>0`` → on   | any         | layer PP × ``G``; ``causvid_wan_self_forcing.yaml`` |
 | latest_kv      | ``D+1``   | on             | ``≥1``      | P2P-KV diagonal + clean; ``causvid_wan_latest_kv.yaml`` |
-| same_step      | ``1``     | off            | any         | serial, local-only KV |
-| same_step      | ``D``     | off            | ``≥1``      | vertical, local-only KV, no clean |
+| same_step      | ``1``/``D`` | off            | any/``≥1`` | local-only KV, no clean (serial / vertical) |
 
 Rejected fast in ``CellSchedule.__post_init__``:
 

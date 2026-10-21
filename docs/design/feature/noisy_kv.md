@@ -33,7 +33,7 @@ Noisy KV is the same-request multi-chunk path on Omni's existing **layer PP**.
 | --- | --- | --- |
 | `N` | `num_chunks` | Chunks |
 | `D` | `num_denoise_steps` | Noisy denoise steps only (not counting clean) |
-| `S` | `step_replicas` | Step replicas; vertical `S ∈ {1, D, D+1}` |
+| `S` | `step_replicas` | Step replicas on the denoise axis; `S ∈ {1, D, D+1}` |
 | `G` | `layer_groups` | Layer groups per step replica; `world = S·G` |
 | `B`, `K` | `blocks`, `blocks_per_rank` | DiT blocks; contiguous blocks per rank in a group |
 | `H` | `kv_history_chunks` | History window (independent of clean) |
@@ -150,7 +150,7 @@ src = (c', s_task, b)   # only if P(c', s_task, b) < current_tick
 Invariants:
 
 - `S ∈ {1, D, D+1}`
-- Same-Step ⇒ `S = D` (no clean); Self-Forcing ⇒ `S = 1` (layer PP); Latest-KV ⇒ `S = D+1` (clean)
+- Same-Step ⇒ `S ∈ {1, D}` (no clean); Self-Forcing ⇒ `S = 1` (layer PP); Latest-KV ⇒ `S = D+1` (clean)
 - No Latest-KV edge inside the same micro-batch / tick
 - Cross-rank KV ready before use (Latest-KV / Self-Forcing when remote)
 - Same-Step history never needs KV P2P (co-located with the consumer)
