@@ -3,7 +3,6 @@
 
 import json
 import os
-import re
 import subprocess
 import threading
 from collections.abc import Mapping
@@ -326,17 +325,13 @@ def supports_video_generation(model_name: str) -> bool:
 
 
 def parse_stage_devices(stage_config_path: str) -> str:
-    text = Path(stage_config_path).read_text(encoding="utf-8")
-    raw_devices: list[str] = re.findall(r"^\s*devices:\s*\"?([0-9,\s]+)\"?\s*$", text, flags=re.MULTILINE)
-    devices: set[int] = set()
-    for item in raw_devices:
-        for token in item.split(","):
-            token = token.strip()
-            if token:
-                devices.add(int(token))
-    if not devices:
-        raise ValueError(f"No runtime.devices found in stage config: {stage_config_path}")
-    return ",".join(str(x) for x in sorted(devices))
+    """Devices for the runtime platform, ignoring other ``platforms:`` blocks."""
+    from tests.dfx.reliability.helpers import stage_config_device_spec
+    from vllm_omni.platforms import current_omni_platform
+
+    device_name = current_omni_platform.device_name
+    platform = device_name.lower() if isinstance(device_name, str) and device_name.strip() else None
+    return stage_config_device_spec(stage_config_path, platform)
 
 
 def resolve_oom_device_spec(config: Mapping[str, Any], stage_config_path: str | None) -> str:
@@ -683,7 +678,7 @@ def run_benchmark(
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args and accuracy_baseline is not None:
-        from tests.e2e.accuracy.qwen3_omni.run_qwen_omni_acc_benchmark import _acc_result_filename
+        from tests.e2e.accuracy.helpers import _acc_result_filename
 
         def argument(name: str, default: str = "") -> str:
             return args[args.index(name) + 1] if name in args else default
