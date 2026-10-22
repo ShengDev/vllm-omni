@@ -60,7 +60,8 @@ logger = init_logger(__name__)
 
 HF_MODEL_ID = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 HF_CAUSVID_REPO = "tianweiy/CausVid"
-# CausVid causal DMD: shift=8, three noisy steps + clean@0 via S=D+1.
+# CausVid causal DMD: shift=8, D=3; schedule default derives from topology
+# (S=1 → self_forcing layer PP, S>1 → latest_kv vertical with clean).
 CAUSVID_DEFAULT_SHIFT = 8.0
 CAUSVID_DEFAULT_DENOISE_STEPS = 3
 WAN21_1_3B = {
@@ -336,7 +337,10 @@ class CausVidWanPipeline(nn.Module):
             history = int(self.max_history_chunks or 0)
         if self.step_replicas > 1 and history < 1:
             history = self.max_history_chunks
-        schedule_name = str(extra.get("cell_schedule", "self_forcing")).strip().lower().replace("-", "_")
+        # Topology-derived default: each CausVid topology maps to exactly one
+        # ordering (S=1 → self_forcing layer PP; S>1 → latest_kv vertical).
+        default_schedule = "self_forcing" if self.step_replicas == 1 else "latest_kv"
+        schedule_name = str(extra.get("cell_schedule", default_schedule)).strip().lower().replace("-", "_")
         if schedule_name in ("", "self_forcing"):
             ordering = Ordering.SELF_FORCING
         elif schedule_name == "latest_kv":

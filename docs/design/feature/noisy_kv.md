@@ -91,8 +91,11 @@ speedup SLA. DreamZero / LingBot paged-session defaults must not regress.
 | **Model / weight split** | Unchanged PP: ranks own contiguous layer groups (`G = ⌈B/K⌉`); `pipeline_parallel_size = S·G` |
 | **Schedule / KV** | Cell `(chunk, step, block)` — one transformer block per tick |
 
-`cell_schedule` (request `extra_args`) selects Self-Forcing, Latest-KV, or
-Same-Step for one generation's `CellPlan`. It is not a session property.
+`cell_schedule` (request `extra_args`) must match the deployment topology:
+`S=1` → Self-Forcing, vertical `S=D+1` → Latest-KV (CausVidWan derives the
+default from `step_replicas` and rejects a mismatched explicit choice);
+Same-Step (`S=D`) stays a schedule-level primitive, not on CausVidWan. It is
+not a session property.
 Optional session only keeps clean KV across generations
 ([Realtime AR-Diffusion sessions](realtime_ar_diffusion.md)).
 
@@ -222,6 +225,11 @@ DreamZero / LingBot YAMLs must not silently enter `run_cell_pipeline`.
 `H` defaults to model `max_history_chunks` (not `0`). That turns `has_clean`
 on when `H>0` and adds one clean forward per chunk versus the previous
 unset→`H=0` behavior. Set `kv_history_chunks: 0` explicitly to keep no-clean.
+
+**S=1 noisy history without clean is intentionally gone:** `self_forcing`
+with `H>0` requires `has_clean`, `same_step` is not offered on CausVidWan, and
+the S=1 Latest-KV path was removed with the `S=D+1` restriction; the only
+no-clean S=1 mode left is `kv_history_chunks: 0` (no history at all).
 
 Capability: `SupportsARDiffusionCellPipeline` —
 `ar_diffusion_noisy_kv_spec()`, `bind_ar_diffusion_cell_context()`.

@@ -18,6 +18,7 @@ from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransform
 from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.experimental.ar_diffusion.cell_executor import ARDiffusionCellContext, CellRunSpec, CellTopology
+from vllm_omni.experimental.ar_diffusion.cell_schedule import Ordering
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec, NoisyKVCache, NoisyKVState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -218,6 +219,25 @@ def test_cell_schedule_unset_steps_keep_topology_default(stages, schedule, expec
     plan, _, steps = pipeline._plan_for(req)
     assert steps == plan.schedule.num_denoise_steps == expected_steps
     assert plan.schedule.step_replicas in (1, steps + 1)
+
+
+@pytest.mark.parametrize(
+    ("stages", "expected_ordering"),
+    [
+        (1, Ordering.SELF_FORCING),  # S=1 layer PP defaults to Self-Forcing
+        (4, Ordering.LATEST_KV),  # S>1 vertical defaults to Latest-KV
+    ],
+)
+def test_cell_schedule_default_derives_from_topology(stages, expected_ordering):
+    """cell_schedule absent: the deploy topology fixes the ordering."""
+    pipeline = _bare_pipeline(step_replicas=stages, history=6)
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="default-schedule",
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"num_chunks": 2}),
+    )
+    plan, _, _ = pipeline._plan_for(req)
+    assert plan.schedule.ordering is expected_ordering
 
 
 def test_causvid_rejects_explicit_s_eq_d():
