@@ -3,28 +3,28 @@
 """Pure-function cell timetable, Latest-KV visibility, and transfer plan.
 
 No torch. ``D`` = noisy denoise steps. Schedule/KV unit is cell ``(chunk, step,
-block)``; clean at step ``D`` iff ``has_clean``. Weight split: PP layer-groups
-``G``, each coarse ``(c, s)`` expands to local blocks; ``world = S·G``.
+block)``; the clean step at step ``D`` is an ordering property, independent of
+``H`` (Self-Forcing and Latest-KV always run it; Same-Step never). Weight
+split: PP layer-groups ``G``, each coarse ``(c, s)`` expands to local blocks;
+``world = S·G``.
 
-Deployment paths (schedule ↔ topology pairs; default ``has_clean`` derivation):
+Deployment paths (schedule ↔ topology pairs; clean is derived):
 
 | Ordering       | ``S``     | clean          | ``H``       | topology / deploy |
 | -------------- | --------- | -------------- | ----------- | ----------------- |
-| self_forcing   | ``1``     | ``H>0`` → on   | any         | layer PP × ``G``; ``causvid_wan_self_forcing.yaml`` |
-| latest_kv      | ``D+1``   | on             | ``≥1``      | P2P-KV diagonal + clean; ``causvid_wan_latest_kv.yaml`` |
-| same_step      | ``D``     | off            | ``≥1``      | vertical, local-only KV, no clean |
+| self_forcing   | ``1``     | on             | any         | layer PP × ``G``; ``causvid_wan_self_forcing.yaml`` |
+| latest_kv      | ``D+1``   | on             | any         | P2P-KV diagonal + clean; ``causvid_wan_latest_kv.yaml`` |
+| same_step      | ``D``     | off            | any         | vertical, local-only KV, no clean |
 
 Rejected fast in ``CellSchedule.__post_init__``:
 
 * ``self_forcing`` with ``S > 1`` (Self-Forcing is single-replica layer PP;
-  vertical step replicas are the Latest-KV / Same-Step topology), or with
-  history but explicit ``has_clean=False``.
+  vertical step replicas are the Latest-KV / Same-Step topology).
 * ``latest_kv`` with ``S != D+1`` (Latest-KV is the vertical clean topology;
   ``S=1`` layer PP is ``self_forcing``, no-clean vertical is ``same_step``).
-* ``same_step`` with clean, or with ``S != D`` (no-clean vertical only;
-  ``S=1`` is valid only when ``D=1``).
-* ``S`` outside ``{1, D, D+1}``; vertical (``S > 1``) with ``H < 1``; explicit
-  ``has_clean`` conflicting with the topology-derived value.
+* ``same_step`` with ``S != D`` (no-clean vertical; ``S=1`` only when ``D=1``).
+* ``S`` outside ``{1, D, D+1}``. ``H`` is free (any ``≥ 0`` window on any
+  topology — it is independent of both the ordering and the clean step).
 """
 
 from __future__ import annotations
@@ -77,9 +77,6 @@ class CellSchedule:
     layer_groups: int
     ordering: Ordering
     kv_history_chunks: int
-    #: Clean@0 at step ``D``. ``None`` → derive (Same-Step: False; Self-Forcing
-    #: with ``kv_history_chunks > 0``: True; else ``S == D+1``).
-    has_clean: bool | None = None
     #: Total DiT blocks. Default ``layer_groups`` ⇒ one block per group (K=1).
     blocks: int | None = None
     #: Blocks per rank in a replica (default ``1``).
@@ -100,13 +97,10 @@ class CellSchedule:
             raise ValueError(
                 f"step_replicas must be 1, num_denoise_steps ({d}), or D+1 ({d_plus_1}), got {self.step_replicas}"
             )
-        if self.step_replicas > 1 and self.kv_history_chunks < 1:
-            raise ValueError("vertical slice (S > 1) requires kv_history_chunks > 0")
-        vertical_has_clean = self.step_replicas == d_plus_1
         if self.ordering is Ordering.SELF_FORCING and self.step_replicas > 1:
             # Self-Forcing is single-replica (layer PP); vertical step replicas
-            # are the Latest-KV / Same-Step (diagonal) topology. Reject before
-            # deriving has_clean so the error names the ordering, not a flag.
+            # are the Latest-KV / Same-Step (diagonal) topology. Reject up
+            # front so the error names the ordering, not a flag.
             raise ValueError(
                 f"self_forcing requires step_replicas=1 (layer PP), got {self.step_replicas}; "
                 "vertical replicas use latest_kv or same_step"
@@ -119,30 +113,10 @@ class CellSchedule:
             )
         if self.ordering is Ordering.SAME_STEP and self.step_replicas != d:
             # Same-Step is the no-clean vertical (S=D); S=1 only when D=1.
-            # Reject before deriving has_clean so the error names the ordering.
+            # Reject up front so the error names the ordering.
             raise ValueError(
                 f"same_step requires step_replicas=D ({d}) for the no-clean vertical, got {self.step_replicas}"
             )
-        if self.has_clean is None:
-            if self.ordering is Ordering.SELF_FORCING and self.kv_history_chunks > 0:
-                # S=1 Self-Forcing with history defaults clean on.
-                derived = True
-            elif self.step_replicas == 1:
-                derived = False
-            else:
-                derived = vertical_has_clean
-            object.__setattr__(self, "has_clean", derived)
-        else:
-            object.__setattr__(self, "has_clean", bool(self.has_clean))
-        if self.ordering is Ordering.SAME_STEP and self.has_clean:
-            raise ValueError("same_step does not use clean (has_clean must be False)")
-        if self.step_replicas > 1 and bool(self.has_clean) != vertical_has_clean:
-            raise ValueError(
-                f"has_clean={self.has_clean} inconsistent with "
-                f"step_replicas={self.step_replicas}, num_denoise_steps={d} (expect {vertical_has_clean})"
-            )
-        if self.ordering is Ordering.SELF_FORCING and self.kv_history_chunks > 0 and not self.has_clean:
-            raise ValueError("self_forcing with history requires has_clean")
         blocks = self.layer_groups if self.blocks is None else self.blocks
         k = 1 if self.blocks_per_rank is None else self.blocks_per_rank
         if blocks < 1:
@@ -163,9 +137,16 @@ class CellSchedule:
         return self.blocks
 
     @property
+    def has_clean(self) -> bool:
+        """Clean@0 at step ``D`` — an ordering property, independent of ``H``:
+        Self-Forcing and Latest-KV always run it (clean-history schedule /
+        the ``S=D+1`` clean replica); Same-Step never (denoise steps only).
+        ``kv_history_chunks`` only controls the history window."""
+        return self.ordering is not Ordering.SAME_STEP
+
+    @property
     def num_schedule_steps(self) -> int:
         """``D`` or ``D+1`` when clean is on."""
-        assert self.has_clean is not None
         return self.num_denoise_steps + (1 if self.has_clean else 0)
 
 

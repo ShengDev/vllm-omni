@@ -333,10 +333,9 @@ class CausVidWanPipeline(nn.Module):
         if "kv_history_chunks" in extra:
             history = int(extra.get("kv_history_chunks") or 0)
         else:
-            # S=1 uses model max_history_chunks to decide clean (H>0 → has_clean).
+            # Default the history window from model max_history_chunks (H is
+            # free — an explicit 0 is respected on every topology).
             history = int(self.max_history_chunks or 0)
-        if self.step_replicas > 1 and history < 1:
-            history = self.max_history_chunks
         # Topology-derived default: each CausVid topology maps to exactly one
         # ordering (S=1 → self_forcing layer PP; S>1 → latest_kv vertical).
         default_schedule = "self_forcing" if self.step_replicas == 1 else "latest_kv"
@@ -369,13 +368,22 @@ class CausVidWanPipeline(nn.Module):
             # S>=2 here (S=1 is always in the set above); infer D = S-1 → S = D+1.
             denoise = step_replicas - 1
         extra["num_denoise_steps"] = denoise
+        # Clean@0 is an ordering property, independent of the history window:
+        # self_forcing and latest_kv always run it; same_step is not offered.
         if "has_clean" in extra:
-            has_clean = bool(extra["has_clean"])
-        elif step_replicas > 1:
-            has_clean = step_replicas == denoise + 1
-        else:
-            has_clean = history > 0
-        extra["has_clean"] = has_clean
+            raise ValueError(
+                "has_clean is derived from the topology (self_forcing / latest_kv: always, "
+                "same_step: never) and is no longer a request knob; remove it from extra_args"
+            )
+        if step_replicas == 1 and self.layer_groups > 1 and bool(extra.get("stream_decode", False)):
+            # S=1 finish rank is G-1, but only pp_rank 0 owns the VAE; with
+            # G>1 the local path would crash non-VAE ranks and there is no
+            # remote source_rank on layer PP. S=1 with G=1 (single rank) is
+            # the valid local streaming decode and stays allowed.
+            raise ValueError(
+                "stream_decode requires a vertical topology or a single-rank layer PP; "
+                "S=1 with layer_groups>1 has no VAE on its finish rank (omit stream_decode)"
+            )
         if sp is not None:
             sp.extra_args = extra
         num_blocks = int(getattr(self.transformer, "num_layers", 0) or 0)
@@ -387,7 +395,6 @@ class CausVidWanPipeline(nn.Module):
             layer_groups=self.layer_groups,
             ordering=ordering,
             kv_history_chunks=history,
-            has_clean=has_clean,
             blocks=num_blocks if num_blocks > 0 else None,
             blocks_per_rank=local_blocks if local_blocks > 0 else None,
         )

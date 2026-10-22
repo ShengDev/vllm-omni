@@ -18,8 +18,8 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _s1(chunks, world, ordering, *, kv=False, steps=3, has_clean=None) -> CellSchedule:
-    # kv=True keeps a history window; clean is named separately (default: on iff kv).
+def _s1(chunks, world, ordering, *, kv=False, steps=3) -> CellSchedule:
+    # kv=True keeps a history window; self_forcing always runs the clean step.
     return CellSchedule(
         chunks=chunks,
         num_denoise_steps=steps,
@@ -27,7 +27,6 @@ def _s1(chunks, world, ordering, *, kv=False, steps=3, has_clean=None) -> CellSc
         layer_groups=world,
         ordering=ordering,
         kv_history_chunks=6 if kv else 0,
-        has_clean=(kv if has_clean is None else has_clean),
     )
 
 
@@ -151,8 +150,56 @@ def test_same_step_vertical_placement_is_diagonal():
                 assert same.wait_ready(t, rank) == frozenset()
 
 
-def test_rejects_same_step_with_clean():
-    with pytest.raises(ValueError, match="same_step does not use clean"):
+@pytest.mark.parametrize(("ordering", "step_replicas"), [(Ordering.LATEST_KV, 4), (Ordering.SAME_STEP, 3)])
+def test_vertical_h0_is_free(ordering, step_replicas):
+    """H is free: vertical topologies accept an explicit zero history window."""
+    schedule = CellSchedule(
+        chunks=3,
+        num_denoise_steps=3,
+        step_replicas=step_replicas,
+        layer_groups=1,
+        ordering=ordering,
+        kv_history_chunks=0,
+    )
+    plan = build_cell_plan(schedule)
+    for t in range(plan.num_slots):
+        assert plan.transfers(t) == ()
+        for rank in range(plan.world):
+            task = plan.task(t, rank)
+            if task is None:
+                continue
+            assert plan.sources(task, rank) == ()
+
+
+def test_has_clean_is_derived_not_a_knob():
+    """Clean is a pure function of (ordering, H); it cannot be set explicitly."""
+    sf = CellSchedule(
+        chunks=2,
+        num_denoise_steps=3,
+        step_replicas=1,
+        layer_groups=1,
+        ordering=Ordering.SELF_FORCING,
+        kv_history_chunks=6,
+    )
+    assert sf.has_clean is True and sf.num_schedule_steps == 4
+    sf_no_hist = CellSchedule(
+        chunks=2,
+        num_denoise_steps=3,
+        step_replicas=1,
+        layer_groups=1,
+        ordering=Ordering.SELF_FORCING,
+        kv_history_chunks=0,
+    )
+    assert sf_no_hist.has_clean is True and sf_no_hist.num_schedule_steps == 4
+    lk = CellSchedule(
+        chunks=2, num_denoise_steps=3, step_replicas=4, layer_groups=1, ordering=Ordering.LATEST_KV, kv_history_chunks=6
+    )
+    assert lk.has_clean is True and lk.num_schedule_steps == 4
+    same = CellSchedule(
+        chunks=2, num_denoise_steps=2, step_replicas=2, layer_groups=1, ordering=Ordering.SAME_STEP, kv_history_chunks=4
+    )
+    assert same.has_clean is False and same.num_schedule_steps == 2
+    with pytest.raises(TypeError, match="has_clean"):
         CellSchedule(
             chunks=2,
             num_denoise_steps=2,
@@ -161,15 +208,6 @@ def test_rejects_same_step_with_clean():
             ordering=Ordering.SAME_STEP,
             kv_history_chunks=4,
             has_clean=True,
-        )
-    with pytest.raises(ValueError, match=r"same_step requires step_replicas=D"):
-        CellSchedule(
-            chunks=2,
-            num_denoise_steps=2,
-            step_replicas=3,
-            layer_groups=1,
-            ordering=Ordering.SAME_STEP,
-            kv_history_chunks=4,
         )
 
 
@@ -307,19 +345,6 @@ def test_s1_self_forcing_history_defaults_clean():
     assert schedule.num_schedule_steps == 4
 
 
-def test_rejects_s1_self_forcing_history_without_clean():
-    with pytest.raises(ValueError, match="self_forcing with history requires has_clean"):
-        CellSchedule(
-            chunks=2,
-            num_denoise_steps=3,
-            step_replicas=1,
-            layer_groups=1,
-            ordering=Ordering.SELF_FORCING,
-            kv_history_chunks=6,
-            has_clean=False,
-        )
-
-
 @pytest.mark.parametrize("step_replicas", [1, 3])  # S=1 layer PP and S=D both rejected
 def test_rejects_non_d_plus_1_latest_kv(step_replicas):
     # Latest-KV is the vertical clean-history topology (S=D+1) only.
@@ -331,19 +356,6 @@ def test_rejects_non_d_plus_1_latest_kv(step_replicas):
             layer_groups=1,
             ordering=Ordering.LATEST_KV,
             kv_history_chunks=6,
-        )
-
-
-def test_vertical_has_clean_must_match_stages():
-    with pytest.raises(ValueError, match="has_clean=False inconsistent"):
-        CellSchedule(
-            chunks=2,
-            num_denoise_steps=2,
-            step_replicas=3,
-            layer_groups=1,
-            ordering=Ordering.LATEST_KV,
-            kv_history_chunks=4,
-            has_clean=False,
         )
 
 

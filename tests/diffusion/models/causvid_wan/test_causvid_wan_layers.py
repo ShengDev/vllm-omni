@@ -26,11 +26,11 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _bare_pipeline(*, step_replicas: int = 1, history: int = 1) -> CausVidWanPipeline:
+def _bare_pipeline(*, step_replicas: int = 1, history: int = 1, layer_groups: int = 1) -> CausVidWanPipeline:
     """``__new__`` stub with the fields ``_plan_for`` reads."""
     pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
     pipeline.step_replicas = step_replicas
-    pipeline.layer_groups = 1
+    pipeline.layer_groups = layer_groups
     pipeline.max_history_chunks = history
     pipeline.transformer = SimpleNamespace(num_layers=1, local_num_layers=1)
     pipeline._default_shift = CAUSVID_DEFAULT_SHIFT
@@ -240,6 +240,44 @@ def test_cell_schedule_default_derives_from_topology(stages, expected_ordering):
     assert plan.schedule.ordering is expected_ordering
 
 
+@pytest.mark.parametrize(("layer_groups", "expect_reject"), [(1, False), (2, True)])
+def test_causvid_s1_stream_decode_single_rank_only(layer_groups, expect_reject):
+    """S=1 keeps local streaming on a single rank (G=1); G>1 has no VAE on the finish rank."""
+    pipeline = _bare_pipeline(step_replicas=1, history=6, layer_groups=layer_groups)
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="s1-stream",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={
+                "cell_schedule": "self_forcing",
+                "num_denoise_steps": 3,
+                "num_chunks": 2,
+                "stream_decode": True,
+            }
+        ),
+    )
+    if expect_reject:
+        with pytest.raises(ValueError, match="no VAE on its finish rank"):
+            pipeline._plan_for(req)
+    else:
+        plan, _, _ = pipeline._plan_for(req)
+        assert plan.schedule.step_replicas == 1
+
+
+def test_causvid_rejects_explicit_has_clean():
+    """Clean derives from the topology; has_clean is no longer a request knob."""
+    pipeline = _bare_pipeline(step_replicas=1, history=6)
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="explicit-has-clean",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={"cell_schedule": "self_forcing", "num_denoise_steps": 3, "num_chunks": 2, "has_clean": True}
+        ),
+    )
+    with pytest.raises(ValueError, match="has_clean is derived from the topology"):
+        pipeline._plan_for(req)
+
+
 def test_causvid_rejects_explicit_s_eq_d():
     """CausVidWan does not accept vertical S=D (Same-Step-only topology)."""
     pipeline = _bare_pipeline(step_replicas=3, history=6)
@@ -283,7 +321,7 @@ def test_causvid_rejects_s1_latest_kv():
 
 
 def test_cell_schedule_has_clean_s1_from_history():
-    """S=1 self_forcing defaults to clean when history is on."""
+    """S=1 self_forcing always runs the clean step (ordering property)."""
     pipeline = _bare_pipeline(step_replicas=1, history=6)
     sf = OmniDiffusionRequest(
         prompt="x",

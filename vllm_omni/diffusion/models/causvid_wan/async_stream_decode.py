@@ -76,7 +76,7 @@ def start_async_stream_decode(
     """Wire producer (final denoise) → consumer (VAE owner) without blocking DiT.
 
     * Producer ``on_finished``: async D2H + queue; a send thread waits the copy
-      then ``isend`` (or local queue for S=1).
+      then ``isend`` (or local queue for S=1 single-rank layer PP, G=1).
     * Consumer thread: ``irecv``/queue → rescale → ``decode_chunk``.
     * ``join()`` waits side threads and returns concatenated pixels on owner,
       else ``None``.

@@ -36,8 +36,8 @@ Noisy KV is the same-request multi-chunk path on Omni's existing **layer PP**.
 | `S` | `step_replicas` | Step replicas on the denoise axis; `S ∈ {1, D, D+1}` |
 | `G` | `layer_groups` | Layer groups per step replica; `world = S·G` |
 | `B`, `K` | `blocks`, `blocks_per_rank` | DiT blocks; contiguous blocks per rank in a group |
-| `H` | `kv_history_chunks` | History window (independent of clean) |
-| `has_clean` | same / inferred | Clean@0 at step `D`; vertical `S = D + int(has_clean)` |
+| `H` | `kv_history_chunks` | History window — free (`≥0`) on every topology, independent of both the ordering and the clean step |
+| `has_clean` | derived | Clean@0 at step `D` — Self-Forcing / Latest-KV always, Same-Step never (ordering property, independent of `H`) |
 | Cell `(c,s,b)` | — | Schedule task + KV version (+ `req` when batched) |
 | Tick | — | One cell on one rank (one block forward) |
 | `R` | `max_batch_size` | Max micro-batch requests per rank per tick |
@@ -78,8 +78,9 @@ producer's other local blocks.
 CausVidWan accepts only Self-Forcing / Latest-KV (not Same-Step) and
 `S ∈ {1, D+1}` (not `S=D`). Pair schedule with topology: Self-Forcing →
 `S=1` layer PP only (`deploy/causvid_wan_self_forcing.yaml`); Latest-KV →
-vertical `S=D+1` (`deploy/causvid_wan_latest_kv.yaml`). Self-Forcing with
-`H>0` requires `has_clean` (clean-history semantics).
+vertical `S=D+1` (`deploy/causvid_wan_latest_kv.yaml`). Clean is an ordering
+property, independent of the history window (Self-Forcing and Latest-KV always,
+Same-Step never); `has_clean` is not a knob.
 
 #102 acceptance: reproducible basic function + recorded config. No FPS /
 speedup SLA. DreamZero / LingBot paged-session defaults must not regress.
@@ -134,7 +135,7 @@ ARDiffusionModelRunner
 
 Implemented in `experimental/ar_diffusion/cell_schedule.py`.
 
-- **In:** `CellSchedule(N, D, S, G, B, K, ordering, H, has_clean)`.
+- **In:** `CellSchedule(N, D, S, G, B, K, ordering, H)`.
 - **Out:** `CellPlan` — per-tick cells `(c,s,b)`, plus `sources` / `transfers` /
   `last_use` keyed by cell.
 
@@ -201,13 +202,14 @@ remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`
 | | `max_batch_size` | `R` |
 | | `max_history_chunks` | Cap for `H` |
 | Request `extra_args` | `cell_schedule` | `self_forcing` \| `latest_kv` \| `same_step` (schedule primitive; CausVidWan rejects `same_step`) |
-| | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `D`, `H` |
-| | `has_clean` | Optional; else inferred from `S` vs `D` (`S=1`: `H>0`) |
+| | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `D`, `H` (`has_clean` is derived and rejected as a key) |
 
 Backend: `ARDiffusionEngine` + mp executor from deploy YAML.
 Last-noisy finish rank: `S=1` → `G-1`; vertical `S ∈ {D, D+1}` → `D·G-1`
 (used for `chunk_timeline_file`). Remote `stream_decode` `source_rank` is
-that finish rank only when `S > 1`; S=1 stays local `_start_local`.
+that finish rank only when `S > 1`. `S=1` decodes locally: `G=1` (single
+rank, which owns the VAE) keeps local `stream_decode`; `G>1` rejects it
+(fail fast — the finish rank `G-1` has no VAE).
 
 ## Compatibility
 
@@ -222,14 +224,17 @@ DreamZero / LingBot YAMLs must not silently enter `run_cell_pipeline`.
 | Session + Cell path | Designed; not required for #102 |
 
 **CausVidWan S=1 default:** if request `extra_args` omits `kv_history_chunks`,
-`H` defaults to model `max_history_chunks` (not `0`). That turns `has_clean`
-on when `H>0` and adds one clean forward per chunk versus the previous
-unset→`H=0` behavior. Set `kv_history_chunks: 0` explicitly to keep no-clean.
+`H` defaults to model `max_history_chunks` (not `0`) — that adds the history
+window (and its KV reuse) versus the previous unset→`H=0` behavior; set
+`kv_history_chunks: 0` to run without history. The clean step is unaffected:
+`self_forcing` always runs it (ordering property). `has_clean` is rejected as
+a request `extra_args` key.
 
-**S=1 noisy history without clean is intentionally gone:** `self_forcing`
-with `H>0` requires `has_clean`, `same_step` is not offered on CausVidWan, and
-the S=1 Latest-KV path was removed with the `S=D+1` restriction; the only
-no-clean S=1 mode left is `kv_history_chunks: 0` (no history at all).
+**S=1 without the clean step is intentionally gone:** `self_forcing` always
+runs the clean step regardless of `H`, `same_step` is not offered on
+CausVidWan, and the S=1 Latest-KV path was removed with the `S=D+1`
+restriction. `kv_history_chunks: 0` only removes the history window, not the
+clean step.
 
 Capability: `SupportsARDiffusionCellPipeline` —
 `ar_diffusion_noisy_kv_spec()`, `bind_ar_diffusion_cell_context()`.
