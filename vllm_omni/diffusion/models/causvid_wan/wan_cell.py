@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -15,8 +16,24 @@ from vllm_omni.experimental.ar_diffusion.cell_executor import CellAdapter
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 
 
+@dataclass
+class WanCellStream:
+    """Per-request state for Stream-Batch (``R>1``) on a shared transformer."""
+
+    req_id: str
+    sampler: FlowEuler
+    prompt_embeds: torch.Tensor
+    seed: int
+    on_finished: Callable[[int, torch.Tensor], None] | None = None
+
+
 class WanCell(CellAdapter):
-    """Run one ``(chunk, step, block)`` cell; last stage applies FlowEuler and records latents."""
+    """Run one ``(chunk, step, block)`` cell; last stage applies FlowEuler and records latents.
+
+    Single-request construction matches the historical API. Stream-Batch uses
+    :meth:`from_streams` so several requests share one adapter / tick loop with
+    per-req prompt / sampler / seed / finish callbacks.
+    """
 
     def __init__(
         self,
@@ -29,27 +46,98 @@ class WanCell(CellAdapter):
         device: torch.device,
         dtype: torch.dtype,
         on_finished: Callable[[int, torch.Tensor], None] | None = None,
+        req_id: str = "",
     ) -> None:
         self.transformer = transformer
-        self.sampler = sampler
-        self.prompt_embeds = prompt_embeds
         self.latent_shape = latent_shape
-        self.seed = seed
         self.device = device
         self.dtype = dtype
-        self.on_finished = on_finished
         self.num_denoise_steps = len(sampler.timesteps)
         self.finished: dict[str, dict[int, torch.Tensor]] = {}
         self._live: dict[str, dict[int, torch.Tensor]] = {}
         self._stash: dict[tuple[str, int, int], dict[str, torch.Tensor]] = {}
+        # Optional completion tickets (CUDA Event or Work list) for async act recv.
+        self._stash_ready: dict[tuple[str, int, int], list] = {}
         self._last_meta: tuple[str, int, int] | None = None
         self._timesteps = [torch.tensor(float(t), dtype=torch.float32) for t in sampler.timesteps]
         self._timestep_clean = torch.zeros((), dtype=torch.float32)
-        transformer.prepare_cell(prompt_embeds)
+        self._streams: dict[str, WanCellStream] = {}
+        self._bound_prompt_req: str | None = None
+        # Legacy single-field aliases (first / only stream).
+        self.sampler = sampler
+        self.prompt_embeds = prompt_embeds
+        self.seed = seed
+        self.on_finished = on_finished
+        self.add_stream(
+            WanCellStream(
+                req_id=req_id,
+                sampler=sampler,
+                prompt_embeds=prompt_embeds,
+                seed=seed,
+                on_finished=on_finished,
+            )
+        )
 
-    def _init_noise(self, chunk: int) -> torch.Tensor:
+    @classmethod
+    def from_streams(
+        cls,
+        transformer: StageWanTransformer,
+        streams: list[WanCellStream],
+        *,
+        latent_shape: tuple[int, int, int, int, int],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> WanCell:
+        if not streams:
+            raise ValueError("from_streams requires at least one WanCellStream")
+        first = streams[0]
+        cell = cls(
+            transformer,
+            sampler=first.sampler,
+            prompt_embeds=first.prompt_embeds,
+            latent_shape=latent_shape,
+            seed=first.seed,
+            device=device,
+            dtype=dtype,
+            on_finished=first.on_finished,
+            req_id=first.req_id,
+        )
+        for stream in streams[1:]:
+            if len(stream.sampler.timesteps) != cell.num_denoise_steps:
+                raise ValueError("Stream-Batch requires equal num_denoise_steps across requests")
+            cell.add_stream(stream)
+        return cell
+
+    def add_stream(self, stream: WanCellStream) -> None:
+        if stream.req_id in self._streams and self._streams[stream.req_id] is not stream:
+            raise ValueError(f"duplicate Stream-Batch req_id {stream.req_id!r}")
+        self._streams[stream.req_id] = stream
+        if len(self._streams) == 1:
+            self.sampler = stream.sampler
+            self.prompt_embeds = stream.prompt_embeds
+            self.seed = stream.seed
+            self.on_finished = stream.on_finished
+            self.transformer.prepare_cell(stream.prompt_embeds)
+            self._bound_prompt_req = stream.req_id
+
+    def _stream_for(self, req: str) -> WanCellStream:
+        if req in self._streams:
+            return self._streams[req]
+        if len(self._streams) == 1:
+            return next(iter(self._streams.values()))
+        raise KeyError(f"no WanCell stream for req {req!r}; known={list(self._streams)}")
+
+    def _ensure_prompt(self, req: str) -> WanCellStream:
+        stream = self._stream_for(req)
+        if self._bound_prompt_req != stream.req_id:
+            self.transformer.prepare_cell(stream.prompt_embeds)
+            self._bound_prompt_req = stream.req_id
+        return stream
+
+    def _init_noise(self, req: str, chunk: int) -> torch.Tensor:
+        stream = self._stream_for(req)
         gen = torch.Generator(device=self.device)
-        gen.manual_seed(self.seed * 1_000_003 + chunk * 4096)
+        gen.manual_seed(stream.seed * 1_000_003 + chunk * 4096)
         return torch.randn(self.latent_shape, generator=gen, device=self.device, dtype=self.dtype)
 
     @staticmethod
@@ -63,15 +151,36 @@ class WanCell(CellAdapter):
         handles: list | None = None,
         meta: tuple[str, int, int] | None = None,
     ) -> None:
-        del handles
         tensors = {k: v for k, v in payload.items() if isinstance(v, torch.Tensor) and k not in ("chunk", "step")}
         key = meta or self._last_meta
         if key is None:
             raise RuntimeError("stash_activation needs meta")
         self._stash[key] = tensors
+        if handles:
+            self._stash_ready[key] = list(handles)
+
+    def _wait_stash_ready(self, key: tuple[str, int, int]) -> None:
+        ready = self._stash_ready.pop(key, None)
+        if not ready:
+            return
+        for handle in ready:
+            if handle is None:
+                continue
+            if isinstance(handle, torch.cuda.Event):
+                if self.device.type == "cuda":
+                    torch.cuda.current_stream(self.device).wait_event(handle)
+                else:
+                    handle.synchronize()
+            else:
+                handle.wait()
 
     def take_stashed_activation(self, req: str, chunk: int, step: int):
-        return self._stash.pop((req, chunk, step), None) or self._stash.pop(("", chunk, step), None)
+        for key in ((req, chunk, step), ("", chunk, step)):
+            tensors = self._stash.pop(key, None)
+            if tensors is not None:
+                self._wait_stash_ready(key)
+                return tensors
+        return None
 
     def _resolve_latent_hidden(
         self, *, req: str, chunk: int, step: int, index: int, n_tasks: int, hidden: Any, live: dict[int, torch.Tensor]
@@ -90,7 +199,7 @@ class WanCell(CellAdapter):
             latent = self._slice_batch(hidden, index, n_tasks)
         if latent is None:
             stored = live.get(chunk)
-            latent = self._init_noise(chunk) if stored is None else stored
+            latent = self._init_noise(req, chunk) if stored is None else stored
         return latent, tokens
 
     def forward(self, tasks, kv_contexts, *, hidden):
@@ -100,6 +209,7 @@ class WanCell(CellAdapter):
         tf = self.transformer
         for i, (req, cell) in enumerate(tasks):
             chunk, step, block = cell
+            stream = self._ensure_prompt(req)
             self._last_meta = (req, chunk, step)
             ctx_list = kv_contexts[i] if i < len(kv_contexts) else None
             kv_ctx = ctx_list[0] if isinstance(ctx_list, list) else ctx_list
@@ -121,18 +231,24 @@ class WanCell(CellAdapter):
                 continue
             pred = tf.unembed(tokens, chunk=chunk, step=step_key, latent=latent, timestep=t)
             if step < self.num_denoise_steps:
-                latent = self.sampler.advance(pred, latent, step)
+                latent = stream.sampler.advance(pred, latent, step)
                 if step == self.num_denoise_steps - 1:
                     self.finished.setdefault(req, {})[chunk] = latent.detach()
-                    if self.on_finished is not None:
-                        self.on_finished(chunk, latent)
+                    if stream.on_finished is not None:
+                        stream.on_finished(chunk, latent)
             else:
                 self.finished.setdefault(req, {})[chunk] = latent.detach()
             live[chunk] = latent
             outs.append({"latent": latent})
         if len(outs) == 1:
             return outs[0]
+        # Stream-Batch pad: all outs in one tick must share keys (K=1 ranks are uniform).
         keys = outs[0].keys()
+        if any(o.keys() != keys for o in outs):
+            raise RuntimeError(
+                "Stream-Batch microbatch mixed activation schemas; "
+                "use K=1 or same-phase cells on a rank"
+            )
         return {k: torch.cat([o[k] for o in outs], dim=0) for k in keys}
 
     def pack_activation(self, output):

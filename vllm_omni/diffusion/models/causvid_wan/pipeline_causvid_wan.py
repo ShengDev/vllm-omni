@@ -34,7 +34,7 @@ from vllm_omni.diffusion.media import (
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.causvid_wan.async_stream_decode import start_async_stream_decode
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
-from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
+from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell, WanCellStream
 from vllm_omni.diffusion.models.causvid_wan.weights import (
     iter_causvid_diffusers_weights,
     load_causvid_generator_state,
@@ -434,28 +434,52 @@ class CausVidWanPipeline(nn.Module):
         return DiffusionOutput(output=torch.zeros(1, 3, 8, 8, 8, device=device, dtype=dtype))
 
     def _gather_finished(
-        self, finished: dict[str, dict[int, torch.Tensor]], pp_group: Any | None
+        self,
+        finished: dict[str, dict[int, torch.Tensor]],
+        pp_group: Any | None,
+        *,
+        pp_rank: int,
+        req_id: str,
+        num_chunks: int,
+        latent_shape: tuple[int, ...],
+        finish_rank: int,
     ) -> dict[str, dict[int, torch.Tensor]]:
-        """Union finished-chunk latents across PP ranks onto every rank (object list)."""
+        """Move finished-chunk latents from the finish rank to rank 0 (device P2P).
+
+        Only rank 0 consumes latents (VAE / output). The finish rank isends the
+        fixed-shape chunk tensors straight to rank 0 with NCCL P2P — no object
+        pickle, no all-rank sync; bystander ranks skip communication entirely.
+        """
         if not dist.is_initialized() or pp_group is None or getattr(pp_group, "world_size", 1) <= 1:
             return finished
-        world = int(pp_group.world_size)
+        if finish_rank == 0 or num_chunks < 1:
+            # Local finish rank (S=1, G=1): nothing to move.
+            local = finished.get(req_id, {})
+            return {req_id: dict(local)} if local else {}
         group = getattr(pp_group, "device_group", None) or pp_group
-        gathered: list[Any] = [None] * world
-        dist.all_gather_object(gathered, finished, group=group)
-        merged: dict[str, dict[int, torch.Tensor]] = {}
-        local_device = next(self.transformer.parameters()).device
-        for part in gathered:
-            if not part:
-                continue
-            for req_id, chunks in part.items():
-                bucket = merged.setdefault(req_id, {})
-                for chunk, latent in chunks.items():
-                    if isinstance(latent, torch.Tensor):
-                        bucket[chunk] = latent.to(local_device, non_blocking=True)
-                    else:
-                        bucket[chunk] = latent
-        return merged
+        param = next(self.transformer.parameters())
+        out: dict[str, dict[int, torch.Tensor]] = {}
+        if pp_rank == finish_rank:
+            ops = []
+            for chunk in range(num_chunks):
+                latent = finished.get(req_id, {}).get(chunk)
+                if latent is None:
+                    latent = torch.zeros(latent_shape, dtype=param.dtype, device=param.device)
+                elif latent.device != param.device:
+                    latent = latent.to(param.device)
+                ops.append(dist.P2POp(dist.isend, latent.contiguous(), pp_group.ranks[0], group))
+            for work in dist.batch_isend_irecv(ops):
+                work.wait()
+        elif pp_rank == 0:
+            ops = []
+            for _chunk in range(num_chunks):
+                buf = torch.empty(latent_shape, dtype=param.dtype, device=param.device)
+                ops.append((buf, dist.P2POp(dist.irecv, buf, pp_group.ranks[finish_rank], group)))
+            works = dist.batch_isend_irecv([op for _, op in ops])
+            for work in works:
+                work.wait()
+            out = {req_id: {chunk: buf for chunk, (buf, _op) in enumerate(ops)}}
+        return out
 
     def _get_streaming_decoder(self) -> WanStreamingDecoder | None:
         """Reuse experimental ``WanStreamingDecoder`` on the local VAE (rank0)."""
@@ -501,6 +525,116 @@ class CausVidWanPipeline(nn.Module):
 
         return _wrapped
 
+    def _finish_rank_for(self, denoise: int) -> int:
+        # S=1: trailing layer group. Vertical S∈{D,D+1}: last noisy step replica.
+        if self.step_replicas > 1 and self.step_replicas in (denoise, denoise + 1):
+            return denoise * self.layer_groups - 1
+        return self.layer_groups - 1
+
+    def _prepare_item(
+        self,
+        item: OmniDiffusionRequest,
+        *,
+        ctx: ARDiffusionCellContext,
+        device: torch.device,
+        dtype: torch.dtype,
+        pp_rank: int,
+        pp_group: Any | None,
+    ) -> dict[str, Any]:
+        plan, extra, denoise = self._plan_for(item)
+        req_id = str(getattr(item, "request_id", None) or extra.get("request_id") or "")
+        if not req_id:
+            raise ValueError("CausVidWan path requires a non-empty request_id")
+        shape = tuple(int(x) for x in (extra.get("latent_shape") or _DEFAULT_LATENT_SHAPE))
+        if len(shape) != 5:
+            raise ValueError(f"latent_shape must be B,C,T,H,W; got {shape}")
+        shift = float(extra.get("shift", self._default_shift))
+        seed = int(extra.get("seed", getattr(item.sampling_params, "seed", 0) or 0))
+        chunk_tokens = self.transformer.seq_len_for_latent(shape)
+        spec = ctx.kv.cache.spec
+        if chunk_tokens != spec.max_chunk_tokens:
+            raise ValueError(
+                f"latent_shape token count {chunk_tokens} does not match preallocated NoisyKV "
+                f"max_chunk_tokens={spec.max_chunk_tokens}"
+            )
+        finish_rank = self._finish_rank_for(denoise)
+        source_rank = finish_rank if self.step_replicas > 1 else None
+        stream_decode = bool(extra.get("stream_decode", False))
+        stream_job = None
+        on_finished = None
+        if stream_decode:
+            stream_group = None
+            if source_rank is not None and source_rank != 0 and pp_group is not None:
+                stream_group = self._ensure_stream_decode_group(pp_group, source_rank)
+            stream_job = start_async_stream_decode(
+                vae=self.vae,
+                decoder=self._get_streaming_decoder(),
+                session_id=req_id,
+                n_chunks=plan.schedule.chunks,
+                latent_shape=shape,
+                dtype=dtype,
+                pp_rank=pp_rank,
+                source_rank=source_rank,
+                pp_group=pp_group,
+                stream_group=stream_group,
+            )
+            on_finished = stream_job.on_finished
+        on_finished = self._maybe_timeline(
+            on_finished, extra.get("chunk_timeline_file"), finish_rank=finish_rank, pp_rank=pp_rank
+        )
+        prompt_embeds = self._encode_prompt(self._prompt_text(item.prompt), device, dtype)
+        return {
+            "req_id": req_id,
+            "plan": plan,
+            "shape": shape,
+            "chunk_tokens": chunk_tokens,
+            "denoise": denoise,
+            "shift": shift,
+            "seed": seed,
+            "finish_rank": finish_rank,
+            "stream_job": stream_job,
+            "stream": WanCellStream(
+                req_id=req_id,
+                sampler=FlowEuler(denoise, shift=shift),
+                prompt_embeds=prompt_embeds,
+                seed=seed,
+                on_finished=on_finished,
+            ),
+        }
+
+    def _collect_item_output(
+        self,
+        *,
+        prepared: dict[str, Any],
+        adapter: WanCell,
+        pp_group: Any | None,
+        pp_rank: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> DiffusionOutput:
+        stream_job = prepared["stream_job"]
+        req_id = prepared["req_id"]
+        if stream_job is not None:
+            video = stream_job.join()
+            if video is not None:
+                return self._video_output(video)
+            return self._placeholder_output(device, dtype)
+        finished = self._gather_finished(
+            adapter.finished,
+            pp_group,
+            pp_rank=pp_rank,
+            req_id=req_id,
+            num_chunks=prepared["plan"].schedule.chunks,
+            latent_shape=prepared["shape"],
+            finish_rank=prepared["finish_rank"],
+        )
+        chunk_map = finished.get(req_id, {})
+        if pp_rank == 0 and chunk_map:
+            ordered = [chunk_map[c] for c in sorted(chunk_map)]
+            latents = torch.cat(ordered, dim=2)
+            return self._video_output(self._decode_latents(latents))
+        return self._placeholder_output(device, dtype)
+
     def forward(self, req: OmniDiffusionRequest | DiffusionRequestBatch) -> list[DiffusionOutput]:
         ctx = self._chunk_ctx
         if ctx is None:
@@ -510,89 +644,76 @@ class CausVidWanPipeline(nn.Module):
 
         param = next(self.transformer.parameters())
         device, dtype = param.device, param.dtype
-        outputs: list[DiffusionOutput] = []
-        for item in requests:
-            plan, extra, denoise = self._plan_for(item)
-            req_id = str(getattr(item, "request_id", None) or extra.get("request_id") or "")
-            if not req_id:
-                raise ValueError("CausVidWan path requires a non-empty request_id")
-            shape = tuple(int(x) for x in (extra.get("latent_shape") or _DEFAULT_LATENT_SHAPE))
-            if len(shape) != 5:
-                raise ValueError(f"latent_shape must be B,C,T,H,W; got {shape}")
-            shift = float(extra.get("shift", self._default_shift))
-            seed = int(extra.get("seed", getattr(item.sampling_params, "seed", 0) or 0))
-            chunk_tokens = self.transformer.seq_len_for_latent(shape)
-            # The KV pool is fixed at load time; requests cannot resize it by changing pipeline fields.
-            spec = ctx.kv.cache.spec
-            if chunk_tokens != spec.max_chunk_tokens:
-                raise ValueError(
-                    f"latent_shape token count {chunk_tokens} does not match preallocated NoisyKV "
-                    f"max_chunk_tokens={spec.max_chunk_tokens}"
+        r_max = max(1, int(ctx.spec.max_batch_size))
+        # Stream-Batch: one tick loop for up to R homogeneous requests.
+        use_stream_batch = r_max > 1 and len(requests) > 1
+        if not use_stream_batch:
+            outputs: list[DiffusionOutput] = []
+            for item in requests:
+                prepared = self._prepare_item(
+                    item, ctx=ctx, device=device, dtype=dtype, pp_rank=pp_rank, pp_group=pp_group
                 )
-            ctx.enqueue(req_id, plan, chunk_tokens=chunk_tokens)
-
-            prompt = self._prompt_text(item.prompt)
-            prompt_embeds = self._encode_prompt(prompt, device, dtype)
-            sampler = FlowEuler(denoise, shift=shift)
-            stream_decode = bool(extra.get("stream_decode", False))
-            # Rank that finishes the last noisy step (WanCell on_finished).
-            # S=1: one layer-PP replica → trailing group G-1.
-            # Vertical S∈{D,D+1}: last noisy step replica → D·G-1.
-            if self.step_replicas > 1 and self.step_replicas in (denoise, denoise + 1):
-                finish_rank = denoise * self.layer_groups - 1
-            else:
-                finish_rank = self.layer_groups - 1
-            # Remote stream_decode only for vertical; S=1 stays local (_start_local).
-            source_rank = finish_rank if self.step_replicas > 1 else None
-            stream_job = None
-            on_finished = None
-            if stream_decode:
-                stream_group = None
-                if source_rank is not None and source_rank != 0 and pp_group is not None:
-                    stream_group = self._ensure_stream_decode_group(pp_group, source_rank)
-                stream_job = start_async_stream_decode(
-                    vae=self.vae,
-                    decoder=self._get_streaming_decoder(),
-                    session_id=req_id,
-                    n_chunks=plan.schedule.chunks,
-                    latent_shape=shape,
+                ctx.enqueue(prepared["req_id"], prepared["plan"], chunk_tokens=prepared["chunk_tokens"])
+                adapter = WanCell(
+                    self.transformer,
+                    sampler=prepared["stream"].sampler,
+                    prompt_embeds=prepared["stream"].prompt_embeds,
+                    latent_shape=prepared["shape"],  # type: ignore[arg-type]
+                    seed=prepared["seed"],
+                    device=device,
                     dtype=dtype,
-                    pp_rank=pp_rank,
-                    source_rank=source_rank,
-                    pp_group=pp_group,
-                    stream_group=stream_group,
+                    on_finished=prepared["stream"].on_finished,
+                    req_id=prepared["req_id"],
                 )
-                on_finished = stream_job.on_finished
-            on_finished = self._maybe_timeline(
-                on_finished, extra.get("chunk_timeline_file"), finish_rank=finish_rank, pp_rank=pp_rank
-            )
+                run_cell_pipeline(ctx=ctx, adapter=adapter)
+                outputs.append(
+                    self._collect_item_output(
+                        prepared=prepared,
+                        adapter=adapter,
+                        pp_group=pp_group,
+                        pp_rank=pp_rank,
+                        device=device,
+                        dtype=dtype,
+                    )
+                )
+            return outputs
 
-            adapter = WanCell(
-                self.transformer,
-                sampler=sampler,
-                prompt_embeds=prompt_embeds,
-                latent_shape=shape,  # type: ignore[arg-type]
-                seed=seed,
+        if len(requests) > r_max:
+            raise ValueError(
+                f"Stream-Batch received {len(requests)} requests but max_batch_size={r_max}; "
+                "split the batch or raise ar_diffusion_stage_config.max_batch_size"
+            )
+        prepared_list = [
+            self._prepare_item(item, ctx=ctx, device=device, dtype=dtype, pp_rank=pp_rank, pp_group=pp_group)
+            for item in requests
+        ]
+        shapes = {p["shape"] for p in prepared_list}
+        tokens = {p["chunk_tokens"] for p in prepared_list}
+        denoise = {p["denoise"] for p in prepared_list}
+        shifts = {p["shift"] for p in prepared_list}
+        if len(shapes) != 1 or len(tokens) != 1 or len(denoise) != 1 or len(shifts) != 1:
+            raise ValueError(
+                "Stream-Batch requires equal latent_shape / chunk_tokens / num_denoise_steps / shift "
+                f"(got shapes={shapes} tokens={tokens} denoise={denoise} shift={shifts})"
+            )
+        for prepared in prepared_list:
+            ctx.enqueue(prepared["req_id"], prepared["plan"], chunk_tokens=prepared["chunk_tokens"])
+        adapter = WanCell.from_streams(
+            self.transformer,
+            [p["stream"] for p in prepared_list],
+            latent_shape=prepared_list[0]["shape"],  # type: ignore[arg-type]
+            device=device,
+            dtype=dtype,
+        )
+        run_cell_pipeline(ctx=ctx, adapter=adapter)
+        return [
+            self._collect_item_output(
+                prepared=prepared,
+                adapter=adapter,
+                pp_group=pp_group,
+                pp_rank=pp_rank,
                 device=device,
                 dtype=dtype,
-                on_finished=on_finished,
             )
-            # DiT tick loop; stream_job decode/send threads overlap on the side.
-            run_cell_pipeline(ctx=ctx, adapter=adapter)
-            if stream_job is not None:
-                video = stream_job.join()
-                if video is not None:
-                    outputs.append(self._video_output(video))
-                else:
-                    outputs.append(self._placeholder_output(device, dtype))
-                continue
-            finished = self._gather_finished(adapter.finished, pp_group)
-            chunk_map = finished.get(req_id, {})
-            if pp_rank == 0 and chunk_map:
-                ordered = [chunk_map[c] for c in sorted(chunk_map)]
-                latents = torch.cat(ordered, dim=2)
-                video = self._decode_latents(latents)
-                outputs.append(self._video_output(video))
-            else:
-                outputs.append(self._placeholder_output(device, dtype))
-        return outputs
+            for prepared in prepared_list
+        ]

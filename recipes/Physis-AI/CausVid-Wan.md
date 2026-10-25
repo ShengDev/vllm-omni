@@ -16,6 +16,7 @@
 | --- | --- | --- |
 | Self-Forcing | `vllm_omni/deploy/causvid_wan_self_forcing.yaml` | `S=1`, `G=2` (2 GPUs, layer PP) |
 | Latest-KV | `vllm_omni/deploy/causvid_wan_latest_kv.yaml` | `S=D+1=4`, `G=1` (4 GPUs, vertical) |
+| Latest-KV Stream-Batch | `vllm_omni/deploy/causvid_wan_latest_kv_stream_batch.yaml` | same + `R=2` |
 
 CausVid trains causal few-step DMD on Wan 2.1 1.3B. Official README uses native
 `wan_models/Wan2.1-T2V-1.3B/`; Omni loads the Diffusers packaging of that same
