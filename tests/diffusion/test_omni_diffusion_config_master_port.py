@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for OmniDiffusionConfig master_port resolution (issue #3794)."""
 
+import socket
+
 import pytest
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -56,8 +58,7 @@ class TestOmniDiffusionConfigMasterPort:
         monkeypatch.setenv("MASTER_PORT", str(_ENV_PORT))
         config = OmniDiffusionConfig(model="test", master_port=_KWARG_PORT)
         assert config.master_port == _ENV_PORT
-        assert _ENV_PORT in checked
-        assert _KWARG_PORT not in checked
+        assert checked == [_ENV_PORT]
 
     def test_explicit_master_port_is_stable_without_jitter(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("MASTER_PORT", raising=False)
@@ -68,10 +69,21 @@ class TestOmniDiffusionConfigMasterPort:
 
     def test_default_master_port_is_available(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("MASTER_PORT", raising=False)
-        checked = _stub_port_availability(monkeypatch)
-        config = OmniDiffusionConfig(model="test")
-        assert config.master_port == checked[0]
-        assert len(checked) == 1
+        # The default port still comes from live get_open_port(), which does
+        # not reserve it, so retry the resolve-and-bind. Bind loopback only;
+        # CodeQL flags a wildcard bind.
+        last_error: Exception | None = None
+        for _ in range(10):
+            try:
+                config = OmniDiffusionConfig(model="test")
+                assert config.master_port is not None
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.bind(("127.0.0.1", config.master_port))
+                return
+            except OSError as exc:
+                last_error = exc
+        pytest.fail(f"default master_port was not bindable in 10 attempts: {last_error}")
 
     def test_settle_port_steps_when_port_is_busy(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("MASTER_PORT", raising=False)
