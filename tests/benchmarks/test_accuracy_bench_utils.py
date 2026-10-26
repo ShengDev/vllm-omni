@@ -53,7 +53,7 @@ from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
     seed_tts_bench_argv,
     videomme_bench_argv,
 )
-from tests.e2e.accuracy.qwen3_omni.run_qwen_omni_acc_benchmark import (
+from tests.e2e.accuracy.helpers import (
     _acc_result_filename,
     _validate_seed_tts,
     _write_accuracy_result_metadata,
@@ -111,6 +111,7 @@ def test_write_accuracy_result_metadata(tmp_path: Path, monkeypatch: pytest.Monk
     import tests.helpers.hardware as hardware
 
     monkeypatch.setattr(hardware, "get_runtime_resource_label", lambda: "H100")
+    monkeypatch.setenv("BUILDKITE_BRANCH", "main")
     path = tmp_path / "result_acc_MiniCPM-o-4_5_daily_omni_20261014_164800.json"
     path.write_text(
         json.dumps({"model_id": "openbmb/MiniCPM-o-4_5", "daily_omni_accuracy": 0.8}),
@@ -131,6 +132,7 @@ def test_write_accuracy_result_metadata(tmp_path: Path, monkeypatch: pytest.Monk
     assert saved["model_id"] == "openbmb/MiniCPM-o-4_5"
     assert saved["baseline"] == {"min_daily_omni_accuracy": 0.77}
     assert saved["Hardware"] == "H100"
+    assert saved["branch"] == "main"
 
 
 def test_write_accuracy_result_metadata_hardware_failure_keeps_baseline(
@@ -142,6 +144,7 @@ def test_write_accuracy_result_metadata_hardware_failure_keeps_baseline(
         raise RuntimeError("device_count unavailable")
 
     monkeypatch.setattr(hardware, "get_runtime_resource_label", _boom)
+    monkeypatch.delenv("BUILDKITE_BRANCH", raising=False)
     path = tmp_path / "result_acc_Qwen3-Omni-30B-A3B-Instruct_daily_omni_20261015_110000.json"
     path.write_text(
         json.dumps({"model_id": "Qwen/Qwen3-Omni-30B-A3B-Instruct", "daily_omni_accuracy": 0.8}),
@@ -163,6 +166,7 @@ def test_write_accuracy_result_metadata_hardware_failure_keeps_baseline(
     assert saved["model_id"] == "Qwen/Qwen3-Omni-30B-A3B-Instruct"
     assert saved["baseline"] == {"min_daily_omni_accuracy": 0.69}
     assert saved["Hardware"] == ""
+    assert saved["branch"] == ""
     assert "Hardware" in caplog.text
 
 
@@ -247,6 +251,39 @@ def test_seed_tts_floor_rejects_incomplete_sim_and_utmos_coverage():
     assert any("seed_tts_utmos_evaluated=10" in err and "failed=1078" in err for err in errs)
     assert not any("seed_tts_sim_mean=0.900000" in err for err in errs)
     assert not any("seed_tts_utmos_mean=3.350000" in err for err in errs)
+
+
+@pytest.mark.parametrize(
+    ("timed_out_requests", "cancelled_after_timeout_requests"),
+    [(1, 0), (0, 3)],
+)
+def test_validate_seed_tts_rejects_high_scoring_partial_timeout_result(
+    timed_out_requests: int,
+    cancelled_after_timeout_requests: int,
+) -> None:
+    partial = {
+        "seed_tts_content_evaluated": 1,
+        "seed_tts_content_error_mean": 0.01,
+        "seed_tts_turn_count": 1,
+        "seed_tts_request_failed": 0,
+        "seed_tts_no_pcm": 0,
+        "seed_tts_sim_mean": 0.95,
+        "seed_tts_sim_evaluated": 1,
+        "seed_tts_sim_failed": 0,
+        "seed_tts_utmos_mean": 4.5,
+        "seed_tts_utmos_evaluated": 1,
+        "seed_tts_utmos_failed": 0,
+        "timed_out_requests": timed_out_requests,
+        "cancelled_after_timeout_requests": cancelled_after_timeout_requests,
+    }
+
+    errs = _validate_seed_tts(partial, max_mean_wer=0.05, min_mean_sim=0.80, min_mean_utmos=3.10)
+
+    assert any(
+        f"timed_out_requests={timed_out_requests}" in err
+        and f"cancelled_after_timeout_requests={cancelled_after_timeout_requests}" in err
+        for err in errs
+    )
 
 
 def test_seed_tts_floor_coverage_excludes_rows_the_scorer_never_sees():

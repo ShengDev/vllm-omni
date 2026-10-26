@@ -27,11 +27,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.e2e.accuracy.qwen3_omni import run_qwen_omni_acc_benchmark as _acc_bench
-from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
-    build_acc_benchmark_cli_argv,
-    find_vllm_cli,
-)
+from tests.e2e.accuracy import helpers as _acc_bench
+from tests.e2e.accuracy.helpers import build_acc_benchmark_cli_argv, find_vllm_cli
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
@@ -157,7 +154,7 @@ def _inline_daily_omni_media(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @requires_daily_omni_deps
-@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", daily_test_params, indirect=True)
 def test_minicpmo_4_5_daily_omni_accuracy_bench(omni_server) -> None:
     _require_vllm_cli()
@@ -209,6 +206,7 @@ def _run_seed_tts_wer_bench(omni_server) -> None:
             str(_MIN_SEED_TTS_MEAN_SIM),
             "--seed-extra-body-json",
             json.dumps(_SEED_EXTRA_BODY, separators=(",", ":")),
+            "--omni-fail-fast-on-timeout",
             "--trust-remote-code",
         ]
     )
@@ -218,7 +216,7 @@ def _run_seed_tts_wer_bench(omni_server) -> None:
     assert _acc_bench.run_acc_benchmark(_acc_bench.parse_acc_benchmark_args(argv)) == 0
 
 
-@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", seed_test_params, indirect=True)
 def test_minicpmo_4_5_seed_tts_wer_bench(omni_server) -> None:
     _run_seed_tts_wer_bench(omni_server)
