@@ -74,7 +74,7 @@ feeds the next group). KV is keyed **per block** `b`: publish / transfer /
 wait when that cell finishes; a remote reader of `b` does not wait for the
 producer's other local blocks.
 
-CausVidWan accepts Self-Forcing / Latest-KV / Same-Step (`S=D`). Pair schedule with topology: Self-Forcing →
+CausVidWan accepts Self-Forcing / Latest-KV only. Pair schedule with topology: Self-Forcing →
 `S=1` layer PP only (`deploy/causvid_wan_self_forcing.yaml`); Latest-KV →
 vertical `S=D+1` (`deploy/causvid_wan_latest_kv.yaml`). Clean is an ordering
 property, independent of the history window (Self-Forcing and Latest-KV always,
@@ -93,7 +93,8 @@ speedup SLA. DreamZero / LingBot paged-session defaults must not regress.
 `cell_schedule` (request `extra_args`) must match the deployment topology:
 `S=1` → Self-Forcing, vertical `S=D+1` → Latest-KV (CausVidWan derives the
 default from `step_replicas` and rejects a mismatched explicit choice);
-Same-Step (`S=D`) includes a fixed first-chunk clean sink. It is not a session property.
+Same-Step (`S=D`) is a generic schedule primitive with a fixed first-chunk clean
+sink; CausVidWan does not expose it. It is not a session property.
 Optional session only keeps clean KV across generations
 ([Realtime AR-Diffusion sessions](realtime_ar_diffusion.md)).
 
@@ -192,8 +193,7 @@ remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`
 
 ### Same-Step with a first-chunk clean sink
 
-Set `cell_schedule: same_step`; multi-chunk requests use a first-chunk clean sink. See
-[`causvid_wan_same_step.yaml`](gh-file:vllm_omni/deploy/causvid_wan_same_step.yaml).
+`Ordering.SAME_STEP` uses a first-chunk clean sink for multi-chunk requests.
 The topology stays `S=D`. Chunk 0 runs one extra clean forward on the last
 replica, then its clean KV is distributed once to the readers before later
 chunks start. Subsequent chunks use the normal Same-Step schedule. A single-chunk
@@ -212,7 +212,7 @@ requires separate validation.
 | `ar_diffusion_stage_config` | `step_replicas` | `S` |
 | | `max_batch_size` | `R` |
 | | `max_history_chunks` | Cap for `H` |
-| Request `extra_args` | `cell_schedule` | `self_forcing` \| `latest_kv` \| `same_step` |
+| Request `extra_args` | `cell_schedule` | CausVidWan: `self_forcing` \| `latest_kv`; Same-Step is schedule-level only |
 | | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `D`, `H` (clean scheduling follows the ordering and sink configuration) |
 
 Backend: `ARDiffusionEngine` + mp executor from deploy YAML.
@@ -230,7 +230,7 @@ DreamZero / LingBot YAMLs must not silently enter `run_cell_pipeline`.
 | Combination | Status |
 | --- | --- |
 | No session + Self-Forcing / Latest-KV | Supported (opt-in; CausVid) |
-| No session + Same-Step | Supported with a fixed first-chunk clean sink |
+| No session + Same-Step | Generic schedule primitive with a clean sink; not exposed by CausVidWan |
 | Session + legacy loop | Supported (unchanged) |
 | Session + Cell path | Designed; not required for #102 |
 

@@ -171,7 +171,7 @@ def test_cell_schedule_accepts_known_values(name, step_replicas):
     assert plan.schedule.ordering.value == name
 
 
-@pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step_kv"])
+@pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step", "same_step_kv"])
 def test_cell_schedule_rejects_removed_aliases(name):
     pipeline = _bare_pipeline()
     req = OmniDiffusionRequest(
@@ -421,23 +421,3 @@ def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
     )
     assert 0 in last.finished["r0"]
     assert last_out2["latent"].shape == shape
-
-
-def test_causvid_same_step_uses_clean_sink_by_default():
-    pipeline = _bare_pipeline(step_replicas=3)
-    req = OmniDiffusionRequest(
-        prompt="x",
-        request_id="same-step-sink",
-        sampling_params=OmniDiffusionSamplingParams(
-            extra_args={
-                "cell_schedule": "same_step",
-                "num_denoise_steps": 3,
-                "num_chunks": 4,
-                "kv_history_chunks": 1,
-            }
-        ),
-    )
-    plan, _, steps = pipeline._plan_for(req)
-    assert steps == 3 and plan.world == 3
-    assert plan.completion_tick((0, 3, 0)) < plan.completion_tick((1, 0, 0))
-    assert {s.version for s in plan.sources((3, 0, 0), 0)} == {(0, 3, 0), (2, 0, 0)}

@@ -4,7 +4,7 @@
 
 Wires Wan codec + ``StageWanTransformer`` onto ``ARDiffusionEngine``, with
 CausVid defaults (shift=8, D=3, S=D+1) and optional student ``model.pt`` overlay.
-Same-Step uses a fixed clean sink from the first chunk.
+CausVidWan accepts ``self_forcing`` / ``latest_kv`` only (not ``same_step``).
 
 * Codec base: Diffusers ``Wan-AI/Wan2.1-T2V-1.3B-Diffusers``
 * Student DiT: ``tianweiy/CausVid`` → ``autoregressive_checkpoint/model.pt``
@@ -344,12 +344,8 @@ class CausVidWanPipeline(nn.Module):
             ordering = Ordering.SELF_FORCING
         elif schedule_name == "latest_kv":
             ordering = Ordering.LATEST_KV
-        elif schedule_name == "same_step":
-            ordering = Ordering.SAME_STEP
         else:
-            raise ValueError(
-                f"CausVidWan cell_schedule must be 'self_forcing', 'latest_kv' or 'same_step', got {schedule_name!r}"
-            )
+            raise ValueError(f"CausVidWan cell_schedule must be 'self_forcing' or 'latest_kv', got {schedule_name!r}")
         step_replicas = self.step_replicas
         if ordering is Ordering.SELF_FORCING and step_replicas > 1:
             # Self-Forcing is single-replica (paper semantics, layer PP);
@@ -365,10 +361,8 @@ class CausVidWanPipeline(nn.Module):
                 f"latest_kv requires step_replicas=D+1 ({denoise + 1}) for clean history, "
                 "got 1; step_replicas=1 layer PP uses cell_schedule: self_forcing"
             )
-        if ordering is Ordering.SAME_STEP:
-            if explicit_denoise is None:
-                denoise = step_replicas
-        elif step_replicas not in (1, denoise + 1):
+        # CausVid rejects same_step; vertical is S=D+1 only (S=D stays schedule-level).
+        if step_replicas not in (1, denoise + 1):
             if explicit_denoise is not None:
                 raise ValueError(f"step_replicas must be 1 or D+1 ({denoise + 1}), got {step_replicas}")
             # S>=2 here (S=1 is always in the set above); infer D = S-1 → S = D+1.
