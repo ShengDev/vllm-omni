@@ -193,7 +193,7 @@ remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`
 ### Same-Step with a first-chunk clean sink
 
 Set `cell_schedule: same_step`; multi-chunk requests use a first-chunk clean sink. See
-[`causvid_wan_same_step.yaml`](../../../vllm_omni/deploy/causvid_wan_same_step.yaml).
+[`causvid_wan_same_step.yaml`](gh-file:vllm_omni/deploy/causvid_wan_same_step.yaml).
 The topology stays `S=D`. Chunk 0 runs one extra clean forward on the last
 replica, then its clean KV is distributed once to the readers before later
 chunks start. Subsequent chunks use the normal Same-Step schedule. A single-chunk
