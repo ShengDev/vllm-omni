@@ -165,47 +165,6 @@ def test_continuous_batch_two_requests_same_tokens():
     assert not ctx.pending
 
 
-def test_stream_batch_admits_without_gap_when_lanes_free():
-    """R>1 packs pending requests on the same tick when can_admit allows."""
-    plan = build_cell_plan(
-        CellSchedule(
-            chunks=2,
-            num_denoise_steps=1,
-            step_replicas=1,
-            layer_groups=1,
-            ordering=Ordering.SELF_FORCING,
-            kv_history_chunks=1,
-        )
-    )
-    cache = NoisyKVCache(
-        ARDiffusionNoisyKVSpec(
-            num_layers=1,
-            num_kv_heads=2,
-            head_size=4,
-            block_size=4,
-            max_chunk_tokens=4,
-            max_history_chunks=1,
-        ),
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-        layer_groups=1,
-        max_batch_size=2,
-    )
-    ctx = ARDiffusionCellContext(
-        spec=CellRunSpec(
-            topology=CellTopology(step_replicas=1, layer_groups=1),
-            max_batch_size=2,
-            rank=0,
-        ),
-        kv=NoisyKVState(cache),
-    )
-    ctx.enqueue("A", plan, chunk_tokens=4)
-    ctx.enqueue("B", plan, chunk_tokens=4)
-    ctx.admit_pending(0)
-    assert [item.req for item in ctx.inflight] == ["A", "B"]
-    assert ctx.inflight[0].t0 == 0 and ctx.inflight[1].t0 == 0
-
-
 def test_consumer_stash_metas_keeps_per_request_keys():
     topo = CellTopology(step_replicas=2, layer_groups=1)
     src_tasks = (("A", (0, 0, 0)), ("B", (1, 0, 0)))

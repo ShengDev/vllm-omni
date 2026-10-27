@@ -40,7 +40,7 @@ Noisy KV is the same-request multi-chunk path on Omni's existing **layer PP**.
 | `has_clean` | derived | Clean@0 at step `D` — Self-Forcing / Latest-KV always, Same-Step never (ordering property, independent of `H`) |
 | Cell `(c,s,b)` | — | Schedule task + KV version (+ `req` when batched) |
 | Tick | — | One cell on one rank (one block forward) |
-| `R` | `max_batch_size` | Max concurrent streams (Stream-Batch lanes) per rank per tick |
+| `R` | `max_batch_size` | Max concurrent request lanes per rank per tick (`R=1` for CausVid today) |
 
 ### What is a cell?
 
@@ -204,7 +204,7 @@ remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`
 | --- | --- | --- |
 | `parallel_config` | `pipeline_parallel_size` | `S·G` |
 | `ar_diffusion_stage_config` | `step_replicas` | `S` |
-| | `max_batch_size` | `R` (Stream-Batch lanes; >1 needs homogeneous latent/denoise/shift) |
+| | `max_batch_size` | `R` (concurrent request lanes; CausVid ships `R=1`) |
 | | `max_history_chunks` | Cap for `H` |
 | Request `extra_args` | `cell_schedule` | `self_forcing` \| `latest_kv` \| `same_step` (schedule primitive; CausVidWan rejects `same_step`) |
 | | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `D`, `H` (`has_clean` is derived and rejected as a key) |
@@ -252,23 +252,11 @@ CPU: `tests/diffusion/ar_diffusion/test_cell_{schedule,executor}.py`,
 GPU (record config): `S=1` Self-Forcing; `S=D` Same-Step; `S=D+1` Latest-KV
 (`benchmarks/` / recipe smoke).
 
-## Stream-Batch (`R>1`)
-
-Overlapping requests share one `run_cell_pipeline` tick loop. Pending streams
-admit as soon as a free lane exists (no admit-gap stagger). Activation stash
-keys are `(req, chunk, step)`; mid-group handoff is per-req stash (no shared
-`pending_hidden`). CausVid packs a request batch when `max_batch_size>1` and
-shapes/denoise/shift match. Deploy example:
-`vllm_omni/deploy/causvid_wan_latest_kv_stream_batch.yaml` (`R=2`).
-
-Pad-only microbatches (equal `chunk_tokens`); varlen packing is still open.
-Prefer `K=1` so a rank's microbatch shares one activation schema.
-
 ## Open issues
 
 - Paged session vs NoisyKV still separate prealloc; no TP × Noisy KV yet.
 - Noisy KV not wired to session.
-- Micro-batch packing (`R`): varlen (pad-only today).
+- Micro-batch packing (`R>1` Stream-Batch): pad-only / homogeneous shapes; tracked separately.
 - Cell schedule with `K>1` multiplies ticks; mixed boundary schemas in one
   microbatch are rejected.
 

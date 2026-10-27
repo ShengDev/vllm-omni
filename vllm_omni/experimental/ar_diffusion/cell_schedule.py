@@ -580,7 +580,7 @@ def can_admit(
     *,
     max_batch_size: int,
 ) -> bool:
-    """Admit when every PP rank still has a free Stream-Batch lane (``R``)."""
+    """Admit when every PP rank still has a free request lane (``R``)."""
     if max_batch_size < 1:
         return False
     world = plan.schedule.step_replicas * plan.schedule.layer_groups
