@@ -1,0 +1,37 @@
+# CausVid Wan 2.1 1.3B — Latest-KV + Stream-Batch (R=2).
+#
+# Same vertical topology as causvid_wan_latest_kv.yaml (S=D+1=4, G=1), with
+# max_batch_size=2. Pending streams admit as soon as a lane is free (same tick
+# when R allows). Homogeneous batch only (equal latent / denoise / shift).
+# Design: docs/design/feature/noisy_kv.md
+
+pipeline: causvid_wan
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3"
+    max_num_seqs: 2
+    enforce_eager: true
+    model_class_name: CausVidWanPipeline
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    parallel_config:
+      pipeline_parallel_size: 4
+    default_sampling_params:
+      extra_args:
+        num_chunks: 7
+        num_denoise_steps: 3
+        kv_history_chunks: 6
+        cell_schedule: latest_kv
+        shift: 8.0
+        reset: true
+    model_config:
+      shift: 8.0
+      num_denoise_steps: 3
+      # causvid_ckpt: /path/to/tianweiy/CausVid/autoregressive_checkpoint/model.pt
+      ar_diffusion_stage_config:
+        step_replicas: 4
+        max_batch_size: 2
+        max_history_chunks: 6

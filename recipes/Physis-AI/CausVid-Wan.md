@@ -16,6 +16,7 @@
 | --- | --- | --- |
 | Self-Forcing | `vllm_omni/deploy/causvid_wan_self_forcing.yaml` | `S=1`, `G=2` (2 GPUs, layer PP) |
 | Latest-KV | `vllm_omni/deploy/causvid_wan_latest_kv.yaml` | `S=D+1=4`, `G=1` (4 GPUs, vertical) |
+| Latest-KV Stream-Batch | `vllm_omni/deploy/causvid_wan_latest_kv_stream_batch.yaml` | same + `R=2` |
 
 CausVid trains causal few-step DMD on Wan 2.1 1.3B. Official README uses native
 `wan_models/Wan2.1-T2V-1.3B/`; Omni loads the Diffusers packaging of that same
@@ -91,7 +92,7 @@ For Latest-KV, load `causvid_wan_latest_kv.yaml` instead (4 GPUs) and keep
 | **Offline** | One `Omni.generate` / request-mode cell pipeline | Contiguous **uint8 BTHWC** `(B,T,H,W,3)` (same host layout LingBot muxes) |
 | **Streaming decode** | `extra_args.stream_decode=True` | VAE runs **per chunk** off the DiT critical path; `join()` still returns one uint8 BTHWC clip for the request |
 
-True WS stepwise (one AR block → one streamed chunk like LingBot-World `streaming_output`) is not wired for CausVid yet; use offline / `stream_decode` above. Long rollouts must stay on uint8 (not float BCTHW) so worker→engine SHM packing fits `/dev/shm`.
+True WS stepwise (one AR block → one streamed chunk like LingBot-World `streaming_output`) is not wired for CausVid yet; use offline / `stream_decode` above. Long R>1 rollouts must stay on uint8 (not float BCTHW) so worker→engine SHM packing fits `/dev/shm`.
 
 ## Notes
 

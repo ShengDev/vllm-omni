@@ -35,7 +35,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.causvid_wan.async_stream_decode import start_async_stream_decode
 from vllm_omni.diffusion.models.causvid_wan.pixels import float_bcthw_to_uint8_bthwc
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
-from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
+from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell, WanCellStream
 from vllm_omni.diffusion.models.causvid_wan.weights import (
     iter_causvid_diffusers_weights,
     load_causvid_generator_state,
@@ -605,9 +605,13 @@ class CausVidWanPipeline(nn.Module):
             "seed": seed,
             "finish_rank": finish_rank,
             "stream_job": stream_job,
-            "sampler": FlowEuler(denoise, shift=shift),
-            "prompt_embeds": prompt_embeds,
-            "on_finished": on_finished,
+            "stream": WanCellStream(
+                req_id=req_id,
+                sampler=FlowEuler(denoise, shift=shift),
+                prompt_embeds=prompt_embeds,
+                seed=seed,
+                on_finished=on_finished,
+            ),
         }
 
     def _collect_item_output(
@@ -652,32 +656,76 @@ class CausVidWanPipeline(nn.Module):
 
         param = next(self.transformer.parameters())
         device, dtype = param.device, param.dtype
-        outputs: list[DiffusionOutput] = []
-        for item in requests:
-            prepared = self._prepare_item(
-                item, ctx=ctx, device=device, dtype=dtype, pp_rank=pp_rank, pp_group=pp_group
-            )
-            ctx.enqueue(prepared["req_id"], prepared["plan"], chunk_tokens=prepared["chunk_tokens"])
-            adapter = WanCell(
-                self.transformer,
-                sampler=prepared["sampler"],
-                prompt_embeds=prepared["prompt_embeds"],
-                latent_shape=prepared["shape"],  # type: ignore[arg-type]
-                seed=prepared["seed"],
-                device=device,
-                dtype=dtype,
-                on_finished=prepared["on_finished"],
-                req_id=prepared["req_id"],
-            )
-            run_cell_pipeline(ctx=ctx, adapter=adapter)
-            outputs.append(
-                self._collect_item_output(
-                    prepared=prepared,
-                    adapter=adapter,
-                    pp_group=pp_group,
-                    pp_rank=pp_rank,
+        r_max = max(1, int(ctx.spec.max_batch_size))
+        # Stream-Batch: one tick loop for up to R homogeneous requests.
+        use_stream_batch = r_max > 1 and len(requests) > 1
+        if not use_stream_batch:
+            outputs: list[DiffusionOutput] = []
+            for item in requests:
+                prepared = self._prepare_item(
+                    item, ctx=ctx, device=device, dtype=dtype, pp_rank=pp_rank, pp_group=pp_group
+                )
+                ctx.enqueue(prepared["req_id"], prepared["plan"], chunk_tokens=prepared["chunk_tokens"])
+                adapter = WanCell(
+                    self.transformer,
+                    sampler=prepared["stream"].sampler,
+                    prompt_embeds=prepared["stream"].prompt_embeds,
+                    latent_shape=prepared["shape"],  # type: ignore[arg-type]
+                    seed=prepared["seed"],
                     device=device,
                     dtype=dtype,
+                    on_finished=prepared["stream"].on_finished,
+                    req_id=prepared["req_id"],
                 )
+                run_cell_pipeline(ctx=ctx, adapter=adapter)
+                outputs.append(
+                    self._collect_item_output(
+                        prepared=prepared,
+                        adapter=adapter,
+                        pp_group=pp_group,
+                        pp_rank=pp_rank,
+                        device=device,
+                        dtype=dtype,
+                    )
+                )
+            return outputs
+
+        if len(requests) > r_max:
+            raise ValueError(
+                f"Stream-Batch received {len(requests)} requests but max_batch_size={r_max}; "
+                "split the batch or raise ar_diffusion_stage_config.max_batch_size"
             )
-        return outputs
+        prepared_list = [
+            self._prepare_item(item, ctx=ctx, device=device, dtype=dtype, pp_rank=pp_rank, pp_group=pp_group)
+            for item in requests
+        ]
+        shapes = {p["shape"] for p in prepared_list}
+        tokens = {p["chunk_tokens"] for p in prepared_list}
+        denoise = {p["denoise"] for p in prepared_list}
+        shifts = {p["shift"] for p in prepared_list}
+        if len(shapes) != 1 or len(tokens) != 1 or len(denoise) != 1 or len(shifts) != 1:
+            raise ValueError(
+                "Stream-Batch requires equal latent_shape / chunk_tokens / num_denoise_steps / shift "
+                f"(got shapes={shapes} tokens={tokens} denoise={denoise} shift={shifts})"
+            )
+        for prepared in prepared_list:
+            ctx.enqueue(prepared["req_id"], prepared["plan"], chunk_tokens=prepared["chunk_tokens"])
+        adapter = WanCell.from_streams(
+            self.transformer,
+            [p["stream"] for p in prepared_list],
+            latent_shape=prepared_list[0]["shape"],  # type: ignore[arg-type]
+            device=device,
+            dtype=dtype,
+        )
+        run_cell_pipeline(ctx=ctx, adapter=adapter)
+        return [
+            self._collect_item_output(
+                prepared=prepared,
+                adapter=adapter,
+                pp_group=pp_group,
+                pp_rank=pp_rank,
+                device=device,
+                dtype=dtype,
+            )
+            for prepared in prepared_list
+        ]

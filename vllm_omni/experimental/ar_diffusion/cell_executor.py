@@ -48,7 +48,7 @@ def _consumer_stash_meta_one(
 
     Across step replicas the consumer step is ``producer_step + 1`` when leaving
     a layer-group; same-step mid-group boundaries keep the step. ``req`` is
-    required when ``R>1`` so concurrent streams do not collide.
+    required for Stream-Batch (``R>1``) so concurrent streams do not collide.
     """
     chunk, step, _block = cell
     if topology.is_layer_group_last(src):
@@ -100,7 +100,7 @@ def _stash_activation_batch(
             for key, tensor in tensors.items():
                 if tensor.shape[0] != n:
                     raise RuntimeError(
-                        f"activation {key} batch {tensor.shape[0]} != microbatch {n} (R>1 pad required)"
+                        f"activation {key} batch {tensor.shape[0]} != microbatch {n} (Stream-Batch pad required)"
                     )
                 sliced[key] = tensor[i : i + 1]
         adapter.stash_activation(sliced, handles=handles, meta=meta)
@@ -317,7 +317,7 @@ class ARDiffusionCellContext:
         self.kv.set_inflight(tuple(self.inflight))
 
     def admit_pending(self, slot: int) -> None:
-        """Admit as many pending requests as ``max_batch_size`` lanes allow."""
+        """Admit as many pending requests as ``max_batch_size`` lanes allow (no admit gap)."""
         still: list[PendingAdmit] = []
         for item in self.pending:
             if still:
