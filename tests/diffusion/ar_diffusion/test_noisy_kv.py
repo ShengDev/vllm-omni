@@ -134,6 +134,35 @@ def test_nccl_completion_ticket_waits_for_coalesced_work(monkeypatch, direction)
         assert consumer_waits[0].query()
 
 
+def test_cpu_transport_does_not_defer_send_retirement(monkeypatch):
+    """CPU/Gloo has no CUDA ticket; exchange must return Works for host wait."""
+    cache = _cache()
+    transport = NoisyKVTransport(cache.pool)
+    assert cache.pool.device.type == "cpu"
+    assert not transport.uses_comm_stream
+    send = RequestKVTransfer(req="A", version=(0, 0, 0), src=0, dst=1)
+    key = ("A", *send.version)
+    cache.pool.alloc(key)
+    posted = []
+
+    def submit(ops):
+        posted.extend(ops)
+        return [SimpleNamespace(wait=lambda: None)]
+
+    monkeypatch.setattr(torch.distributed, "batch_isend_irecv", submit)
+    monkeypatch.setattr(torch.distributed, "P2POp", lambda op, tensor, peer, group: (op, peer))
+    handles = transport.exchange(
+        (send,),
+        rank=0,
+        pp_group=SimpleNamespace(world_size=2, ranks=(0, 1), cpu_group=object()),
+        chunk_tokens_by_request={"A": 4},
+    )
+    assert posted
+    assert handles, "CPU exchange must return send Works so the caller host-waits before slot reuse"
+    assert transport.send_retired(key)
+    assert not transport._send_retire
+
+
 def test_capacity_uses_k1():
     cache = _cache(layer_groups=2, max_batch_size=2)
     # R * (H + 2 + G) = 2 * (6 + 2 + 2) = 20.

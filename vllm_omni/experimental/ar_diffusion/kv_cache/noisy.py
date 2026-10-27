@@ -273,10 +273,17 @@ class NoisyKVTransport:
 
     @property
     def uses_comm_stream(self) -> bool:
-        return kv_comm_stream_enabled() and not kv_use_tensor_dict()
+        # Deferred send retirement needs a real CUDA completion ticket. CPU/Gloo
+        # pools keep the synchronous Work path so the caller host-waits before
+        # slot reuse (otherwise evict can free a live send buffer).
+        return (
+            kv_comm_stream_enabled()
+            and not kv_use_tensor_dict()
+            and self.pool.device.type == "cuda"
+        )
 
     def _ensure_comm_stream(self) -> torch.cuda.Stream | None:
-        if not self.uses_comm_stream or self.pool.device.type != "cuda":
+        if not self.uses_comm_stream:
             return None
         if self._comm_stream is None:
             self._comm_stream = torch.cuda.Stream(device=self.pool.device)
@@ -303,15 +310,16 @@ class NoisyKVTransport:
             return self._exchange_tensor_dict(
                 transfers, rank=rank, pp_group=pp_group, chunk_tokens_by_request=chunk_tokens_by_request
             )
-        defer = self.uses_comm_stream
+        # Only defer when a CUDA stream ticket can actually be recorded.
+        stream = self._ensure_comm_stream()
         self._exchange_fixed_nccl(
             transfers,
             rank=rank,
             pp_group=pp_group,
             chunk_tokens_by_request=chunk_tokens_by_request,
-            use_stream=defer,
+            use_stream=stream is not None,
         )
-        if defer:
+        if stream is not None:
             return []
         # Caller owns waiting these handles (cell_executor / tests). Clear so
         # wait_sends/end_request do not wait again — gloo double-wait hangs.
