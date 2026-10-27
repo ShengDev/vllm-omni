@@ -33,6 +33,7 @@ from vllm_omni.diffusion.media import (
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.causvid_wan.async_stream_decode import start_async_stream_decode
+from vllm_omni.diffusion.models.causvid_wan.pixels import float_bcthw_to_uint8_bthwc
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
 from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell, WanCellStream
 from vllm_omni.diffusion.models.causvid_wan.weights import (
@@ -415,23 +416,34 @@ class CausVidWanPipeline(nn.Module):
         return video.clamp(-1, 1)
 
     def _video_output(self, video: torch.Tensor) -> DiffusionOutput:
+        # Match LingBot streaming/offline pixel form: host RGB uint8 BTHWC.
+        # Keeps worker→engine SHM packing ~4× smaller than float BCTHW.
+        if video.dtype == torch.uint8:
+            if video.ndim != 5 or video.shape[-1] != 3:
+                raise ValueError(f"uint8 video must be BTHWC RGB, got shape {tuple(video.shape)}")
+            pixels = video.contiguous()
+        else:
+            pixels = float_bcthw_to_uint8_bthwc(video)
         if not self.od_config.video_output_transport.enable_device_postprocess:
-            return DiffusionOutput(output=video)
+            return DiffusionOutput(output=pixels)
         return DiffusionOutput(
             media=DiffusionMediaOutput(
                 video=VideoMediaOutput(
-                    tensor=video,
+                    tensor=pixels,
                     spec=VideoTensorSpec(
-                        layout=VideoTensorLayout.BCTHW,
-                        encoding=VideoTensorEncoding.NORMALIZED_FLOAT,
-                        value_range=VideoValueRange.NEGATIVE_ONE_TO_ONE,
+                        layout=VideoTensorLayout.BTHWC,
+                        encoding=VideoTensorEncoding.UINT8_FRAMES,
+                        value_range=VideoValueRange.ZERO_TO_255,
                     ),
                 )
             )
         )
 
     def _placeholder_output(self, device: torch.device, dtype: torch.dtype) -> DiffusionOutput:
-        return DiffusionOutput(output=torch.zeros(1, 3, 8, 8, 8, device=device, dtype=dtype))
+        del dtype  # uint8 host layout; dtype only mattered for float BCTHW placeholders.
+        return DiffusionOutput(
+            output=torch.zeros(1, 8, 8, 8, 3, device=device, dtype=torch.uint8)
+        )
 
     def _gather_finished(
         self,
