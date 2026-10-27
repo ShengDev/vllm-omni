@@ -196,7 +196,9 @@ remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`
 `Ordering.SAME_STEP` uses a first-chunk clean sink for multi-chunk requests.
 The topology stays `S=D`. Chunk 0 runs one extra clean forward on the last
 replica, then its clean KV is distributed once to the readers before later
-chunks start. Subsequent chunks use the normal Same-Step schedule. A single-chunk
+chunks start. With `G=1`, the executor carries the final latent directly into
+the local clean pass, without requiring adapter-local latent storage.
+Subsequent chunks use the normal Same-Step schedule. A single-chunk
 request skips the unused clean forward and sink distribution.
 
 Each chunk reads the fixed clean sink plus its most recent `H` Same-Step

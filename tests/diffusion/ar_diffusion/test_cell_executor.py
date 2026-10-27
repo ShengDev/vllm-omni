@@ -266,3 +266,50 @@ def test_sink_bootstrap_requests_are_admitted_sequentially():
     assert not ctx.admit("B", plan, chunk_tokens=4, slot=0)
     ctx.drop("A")
     assert ctx.admit("B", plan, chunk_tokens=4, slot=0)
+
+
+def test_same_rank_clean_receives_final_latent_without_adapter_cache():
+    plan = build_cell_plan(
+        CellSchedule(
+            chunks=2,
+            num_denoise_steps=1,
+            step_replicas=1,
+            layer_groups=1,
+            ordering=Ordering.SAME_STEP,
+            kv_history_chunks=0,
+        )
+    )
+    cache = NoisyKVCache(
+        ARDiffusionNoisyKVSpec(
+            num_layers=1,
+            num_kv_heads=1,
+            head_size=1,
+            block_size=1,
+            max_chunk_tokens=1,
+            max_history_chunks=1,
+        ),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        layer_groups=1,
+        max_batch_size=1,
+    )
+    ctx = ARDiffusionCellContext(
+        spec=CellRunSpec(topology=CellTopology(1, 1), rank=0),
+        kv=NoisyKVState(cache),
+    )
+
+    class StatelessAdapter(CellAdapter):
+        def forward(self, tasks, kv_contexts, *, hidden):
+            _req, cell = tasks[0]
+            if cell == (0, 1, 0):
+                assert hidden is not None, "executor dropped the final latent before clean"
+                torch.testing.assert_close(hidden["latent"], torch.tensor([7.0]))
+            else:
+                # Neither the initial chunk nor the tail may inherit stale input.
+                assert hidden is None
+            return {"latent": torch.tensor([7.0])}
+
+    assert ctx.admit("A", plan, chunk_tokens=1, slot=0)
+    run_cell_pipeline(ctx=ctx, adapter=StatelessAdapter())
+    assert not ctx.inflight
+    assert ctx.kv.resident_versions == 0

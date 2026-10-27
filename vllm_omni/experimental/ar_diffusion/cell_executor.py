@@ -378,7 +378,16 @@ def run_cell_pipeline(
                 contexts = kv.prepare(tasks)
                 output = adapter.forward(tasks, contexts, hidden=pending_hidden)
                 kv.publish(tasks)
-                if schedule is not None and not _tasks_need_activation_send(tasks, schedule):
+                # G=1 keeps the chunk-0 final latent on this rank for clean.
+                # The executor owns this handoff; adapters need no latent cache.
+                keep_clean_input = (
+                    schedule is not None
+                    and schedule.ordering is Ordering.SAME_STEP
+                    and schedule.chunks > 1
+                    and schedule.layer_groups == 1
+                    and tasks[0][1] == (0, schedule.num_denoise_steps - 1, schedule.num_blocks - 1)
+                )
+                if schedule is not None and (keep_clean_input or not _tasks_need_activation_send(tasks, schedule)):
                     pending_hidden = output
                 else:
                     pending_hidden = None

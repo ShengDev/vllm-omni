@@ -204,7 +204,6 @@ def _sink_pipeline_worker(rank: int, steps: int, groups: int, chunks: int, init_
     class Adapter(CellAdapter):
         def __init__(self):
             self.stash = {}
-            self.live = {}
             self.completed = {}
 
         def stash_activation(self, payload, *, handles=None, meta=None):
@@ -213,15 +212,11 @@ def _sink_pipeline_worker(rank: int, steps: int, groups: int, chunks: int, init_
         def forward(self, tasks, kv_contexts, *, hidden):
             _req, cell = tasks[0]
             chunk, step, block = cell
-            payload = (
-                hidden
-                if isinstance(hidden, dict) and "hidden_states" in hidden
-                else self.stash.pop((chunk, step), None)
-            )
+            payload = hidden if isinstance(hidden, dict) else self.stash.pop((chunk, step), None)
             if block == 0:
-                value = (
-                    payload["latent"] if payload is not None else self.live.get(chunk, torch.tensor([float(chunk + 1)]))
-                )
+                if step > 0:
+                    assert payload is not None, "step input must come from the executor or transport"
+                value = payload["latent"] if payload is not None else torch.tensor([float(chunk + 1)])
             else:
                 assert payload is not None
                 value = payload["hidden_states"]
@@ -235,13 +230,10 @@ def _sink_pipeline_worker(rank: int, steps: int, groups: int, chunks: int, init_
             context.value_pool[slot] = value.reshape(1, 1, 1)
             result = value + past * 0.01 + 0.1 * (block + 1)
             torch.testing.assert_close(result, torch.tensor([outputs[cell]]), rtol=1e-5, atol=1e-5)
-            current = (
-                payload["latent"] if payload is not None else self.live.get(chunk, torch.tensor([float(chunk + 1)]))
-            )
+            current = payload["latent"] if payload is not None else torch.tensor([float(chunk + 1)])
             if block == blocks - 1:
                 if step < steps:
                     current = result + 0.5
-                self.live[chunk] = current
                 if step == steps - 1:
                     self.completed[chunk] = current
                 return {"latent": current}
