@@ -169,10 +169,9 @@ def test_cell_schedule_accepts_known_values(name, step_replicas):
     plan, _, _ = pipeline._plan_for(req)
     assert plan.schedule.ordering is Ordering(name)
     assert plan.schedule.ordering.value == name
-    assert plan.schedule.has_clean is True
 
 
-@pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step", "same_step_kv"])
+@pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step_kv"])
 def test_cell_schedule_rejects_removed_aliases(name):
     pipeline = _bare_pipeline()
     req = OmniDiffusionRequest(
@@ -264,22 +263,8 @@ def test_causvid_s1_stream_decode_single_rank_only(layer_groups, expect_reject):
         assert plan.schedule.step_replicas == 1
 
 
-def test_causvid_rejects_explicit_has_clean():
-    """Clean derives from the topology; has_clean is no longer a request knob."""
-    pipeline = _bare_pipeline(step_replicas=1, history=6)
-    req = OmniDiffusionRequest(
-        prompt="x",
-        request_id="explicit-has-clean",
-        sampling_params=OmniDiffusionSamplingParams(
-            extra_args={"cell_schedule": "self_forcing", "num_denoise_steps": 3, "num_chunks": 2, "has_clean": True}
-        ),
-    )
-    with pytest.raises(ValueError, match="has_clean is derived from the topology"):
-        pipeline._plan_for(req)
-
-
 def test_causvid_rejects_explicit_s_eq_d():
-    """CausVidWan does not accept vertical S=D (Same-Step-only topology)."""
+    """Latest-KV does not accept the S=D Same-Step topology."""
     pipeline = _bare_pipeline(step_replicas=3, history=6)
     req = OmniDiffusionRequest(
         prompt="x",
@@ -320,7 +305,7 @@ def test_causvid_rejects_s1_latest_kv():
         pipeline._plan_for(req)
 
 
-def test_cell_schedule_has_clean_s1_from_history():
+def test_cell_schedule_s1_steps_independent_of_history():
     """S=1 self_forcing always runs the clean step (ordering property)."""
     pipeline = _bare_pipeline(step_replicas=1, history=6)
     sf = OmniDiffusionRequest(
@@ -331,7 +316,6 @@ def test_cell_schedule_has_clean_s1_from_history():
         ),
     )
     plan_sf, _, _ = pipeline._plan_for(sf)
-    assert plan_sf.schedule.has_clean is True
     assert plan_sf.schedule.num_schedule_steps == 4
 
 
@@ -437,3 +421,23 @@ def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
     )
     assert 0 in last.finished["r0"]
     assert last_out2["latent"].shape == shape
+
+
+def test_causvid_same_step_uses_clean_sink_by_default():
+    pipeline = _bare_pipeline(step_replicas=3)
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="same-step-sink",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={
+                "cell_schedule": "same_step",
+                "num_denoise_steps": 3,
+                "num_chunks": 4,
+                "kv_history_chunks": 1,
+            }
+        ),
+    )
+    plan, _, steps = pipeline._plan_for(req)
+    assert steps == 3 and plan.world == 3
+    assert plan.completion_tick((0, 3, 0)) < plan.completion_tick((1, 0, 0))
+    assert {s.version for s in plan.sources((3, 0, 0), 0)} == {(0, 3, 0), (2, 0, 0)}

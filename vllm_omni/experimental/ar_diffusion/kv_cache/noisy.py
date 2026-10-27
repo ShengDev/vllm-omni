@@ -15,6 +15,7 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     Cell,
     CellPlan,
     Inflight,
+    Ordering,
     RequestKVTransfer,
     union_transfers,
     union_wait_ready,
@@ -645,8 +646,14 @@ class NoisyKVState:
         spec = self.cache.spec
         pool = self.cache.pool
         h = spec.max_history_chunks
-        width = (h + 1) * pool.chunk_blocks
-        max_seq_len = (h + 1) * spec.max_chunk_tokens
+        sink = int(
+            any(
+                plan.schedule.ordering is Ordering.SAME_STEP and plan.schedule.chunks > 1
+                for plan in self._plans.values()
+            )
+        )
+        width = (h + 1 + sink) * pool.chunk_blocks
+        max_seq_len = (h + 1 + sink) * spec.max_chunk_tokens
         max_query_len = self.cache.max_batch_size * spec.max_chunk_tokens
         batch: list[list[NoisyLayerContext]] = []
         device = pool.k_pools[0].device

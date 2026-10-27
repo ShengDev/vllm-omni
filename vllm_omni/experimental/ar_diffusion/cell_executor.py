@@ -17,8 +17,10 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     Cell,
     CellPlan,
     Inflight,
+    Ordering,
     can_admit,
     is_group_boundary,
+    rank_of_block,
     rank_work,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVState
@@ -63,6 +65,26 @@ def _activation_edges(
 ) -> list[tuple[int, int, tuple[tuple[str, Cell], ...]]]:
     """Identical edge list on every rank for this tick."""
     edges: list[tuple[int, int, tuple[tuple[str, Cell], ...]]] = []
+    if schedule.ordering is Ordering.SAME_STEP:
+        for item in inflight:
+            plan = item.plan
+            for src in range(topology.world):
+                task = plan.task(slot - item.t0, src)
+                if task is None or not is_group_boundary(task, plan.schedule):
+                    continue
+                chunk, step, block = task
+                if block + 1 < plan.schedule.num_blocks:
+                    next_step, next_block = step, block + 1
+                elif step + 1 < plan.schedule.num_denoise_steps or (
+                    chunk == 0 and plan.schedule.chunks > 1 and step < plan.schedule.num_denoise_steps
+                ):
+                    next_step, next_block = step + 1, 0
+                else:
+                    continue
+                dst = rank_of_block(next_step, next_block, plan.schedule)
+                if src != dst:
+                    edges.append((src, dst, ((item.req, task),)))
+        return edges
     last_rank = topology.world - 1
     if topology.step_replicas == 1:
         peer_tasks = rank_work(inflight, slot, last_rank)
@@ -201,6 +223,13 @@ class ARDiffusionCellContext:
 
     def admit(self, req: str, plan: CellPlan, *, chunk_tokens: int, slot: int) -> bool:
         pending = tuple(self.inflight)
+        # Sink bootstrap contains a replica-local wrap. Keep its activation
+        # packets request-local until mixed-bootstrap batching is supported.
+        if pending and (
+            plan.schedule.ordering is Ordering.SAME_STEP
+            or any(item.plan.schedule.ordering is Ordering.SAME_STEP for item in pending)
+        ):
+            return False
         if not can_admit(pending, slot, plan, max_batch_size=self.spec.max_batch_size):
             return False
         inflight_tokens = {self.kv._chunk_tokens[item.req] for item in self.inflight}

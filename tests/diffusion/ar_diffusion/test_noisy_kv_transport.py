@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.distributed.group_coordinator import GroupCoordinator
-from vllm_omni.experimental.ar_diffusion.cell_schedule import CellSchedule, Inflight, Ordering, build_cell_plan
+from vllm_omni.experimental.ar_diffusion.cell_schedule import Cell, CellSchedule, Inflight, Ordering, build_cell_plan
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     ARDiffusionNoisyKVSpec,
     NoisyKVCache,
@@ -140,4 +140,137 @@ def test_unused_inbound_kv_finishes_before_page_reuse() -> None:
         _transfer_worker,
         args=(4, f"tcp://127.0.0.1:{get_open_port()}", "cpu", "discard"),
         nprocs=2,
+    )
+
+
+def _sink_pipeline_worker(rank: int, steps: int, groups: int, chunks: int, init_method: str) -> None:
+    from vllm_omni.experimental.ar_diffusion.cell_executor import (
+        ARDiffusionCellContext,
+        CellAdapter,
+        CellRunSpec,
+        CellTopology,
+        run_cell_pipeline,
+    )
+
+    world, blocks, history = steps * groups, 3, 1
+    torch.distributed.init_process_group(
+        "gloo", init_method=init_method, rank=rank, world_size=world, timeout=timedelta(seconds=90)
+    )
+    pp = GroupCoordinator([list(range(world))], local_rank=rank, torch_distributed_backend="gloo")
+    schedule = CellSchedule(
+        chunks=chunks,
+        num_denoise_steps=steps,
+        step_replicas=steps,
+        layer_groups=groups,
+        ordering=Ordering.SAME_STEP,
+        kv_history_chunks=history,
+        blocks=blocks,
+    )
+    plan = build_cell_plan(schedule)
+    spec = ARDiffusionNoisyKVSpec(
+        num_layers=blocks, num_kv_heads=1, head_size=1, block_size=1, max_chunk_tokens=1, max_history_chunks=history
+    )
+    cache = NoisyKVCache(
+        spec,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        layer_groups=groups,
+        max_batch_size=1,
+        step_replicas=steps,
+    )
+    state = NoisyKVState(cache)
+
+    # Independent scalar forward reference: serial rollout, explicit clean
+    # anchor, then same-step recent history. Communication never enters it.
+    pages: dict[Cell, float] = {}
+    inputs: dict[Cell, float] = {}
+    outputs: dict[Cell, float] = {}
+    latent: dict[int, float] = {}
+    order = [(0, step, block) for step in range(steps + int(chunks > 1)) for block in range(blocks)]
+    order += [(chunk, step, block) for chunk in range(1, chunks) for step in range(steps) for block in range(blocks)]
+    for chunk, step, block in order:
+        if block == 0:
+            value = float(chunk + 1) if step == 0 else latent[chunk]
+        else:
+            value = outputs[chunk, step, block - 1]
+        inputs[chunk, step, block] = value
+        sources = [(0, steps, block)] if chunk else []
+        sources += [(c, step, block) for c in range(max(1, chunk - history), chunk)]
+        pages[chunk, step, block] = value
+        outputs[chunk, step, block] = value + sum(pages[x] for x in sources) * 0.01 + 0.1 * (block + 1)
+        if block == blocks - 1 and step < steps:
+            latent[chunk] = outputs[chunk, step, block] + 0.5
+
+    class Adapter(CellAdapter):
+        def __init__(self):
+            self.stash = {}
+            self.live = {}
+            self.completed = {}
+
+        def stash_activation(self, payload, *, handles=None, meta=None):
+            self.stash[meta[1:]] = payload
+
+        def forward(self, tasks, kv_contexts, *, hidden):
+            _req, cell = tasks[0]
+            chunk, step, block = cell
+            payload = (
+                hidden
+                if isinstance(hidden, dict) and "hidden_states" in hidden
+                else self.stash.pop((chunk, step), None)
+            )
+            if block == 0:
+                value = (
+                    payload["latent"] if payload is not None else self.live.get(chunk, torch.tensor([float(chunk + 1)]))
+                )
+            else:
+                assert payload is not None
+                value = payload["hidden_states"]
+            torch.testing.assert_close(value, torch.tensor([inputs[cell]]), rtol=1e-5, atol=1e-5)
+            context = kv_contexts[0][0]
+            n = context.seq_len - 1
+            table = context.block_table[0, :n].long()
+            past = context.key_pool[table].sum() if n else torch.tensor(0.0)
+            slot = context.video_slots.long()
+            context.key_pool[slot] = value.reshape(1, 1, 1)
+            context.value_pool[slot] = value.reshape(1, 1, 1)
+            result = value + past * 0.01 + 0.1 * (block + 1)
+            torch.testing.assert_close(result, torch.tensor([outputs[cell]]), rtol=1e-5, atol=1e-5)
+            current = (
+                payload["latent"] if payload is not None else self.live.get(chunk, torch.tensor([float(chunk + 1)]))
+            )
+            if block == blocks - 1:
+                if step < steps:
+                    current = result + 0.5
+                self.live[chunk] = current
+                if step == steps - 1:
+                    self.completed[chunk] = current
+                return {"latent": current}
+            return {"latent": current, "hidden_states": result}
+
+        def pack_activation(self, output):
+            return output
+
+    adapter = Adapter()
+    ctx = ARDiffusionCellContext(
+        spec=CellRunSpec(topology=CellTopology(steps, groups), rank=rank, pp_group=pp), kv=state
+    )
+    ctx.enqueue("A", plan, chunk_tokens=1)
+    run_cell_pipeline(ctx=ctx, adapter=adapter)
+    assert state.resident_versions == 0
+    if rank == world - 1:
+        assert len(adapter.completed) == chunks
+        for chunk, value in adapter.completed.items():
+            torch.testing.assert_close(value, torch.tensor([latent[chunk]]), rtol=1e-5, atol=1e-5)
+    pp.destroy()
+    torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("steps,groups", [(1, 2), (2, 1)])
+@pytest.mark.parametrize("chunks", [1, 6])
+def test_same_step_sink_distributed_pipeline_matches_serial(steps, groups, chunks):
+    torch.multiprocessing.spawn(
+        _sink_pipeline_worker,
+        args=(steps, groups, chunks, f"tcp://127.0.0.1:{get_open_port()}"),
+        nprocs=steps * groups,
+        join=True,
     )
