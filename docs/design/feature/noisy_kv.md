@@ -213,7 +213,7 @@ requires separate validation.
 | | `max_batch_size` | `R` |
 | | `max_history_chunks` | Cap for `H` |
 | Request `extra_args` | `cell_schedule` | CausVidWan: `self_forcing` \| `latest_kv`; Same-Step is schedule-level only |
-| | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `D`, `H` (clean scheduling follows the ordering and sink configuration) |
+| | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `D`, `H` (clean scheduling follows the ordering and multi-chunk shape) |
 
 Backend: `ARDiffusionEngine` + mp executor from deploy YAML.
 Last-noisy finish rank: `S=1` → `G-1`; vertical `S ∈ {D, D+1}` → `D·G-1`
