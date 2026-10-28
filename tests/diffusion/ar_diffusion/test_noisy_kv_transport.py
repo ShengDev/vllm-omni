@@ -143,7 +143,17 @@ def test_unused_inbound_kv_finishes_before_page_reuse() -> None:
     )
 
 
-def _sink_pipeline_worker(rank: int, steps: int, groups: int, chunks: int, init_method: str) -> None:
+def _sink_pipeline_worker(
+    rank: int,
+    steps: int,
+    groups: int,
+    chunks: int,
+    init_method: str,
+    history: int = 1,
+    fixed_shape: bool = False,
+    device_kind: str = "cpu",
+) -> None:
+    from vllm_omni.experimental.ar_diffusion import cell_executor
     from vllm_omni.experimental.ar_diffusion.cell_executor import (
         ARDiffusionCellContext,
         CellAdapter,
@@ -152,11 +162,24 @@ def _sink_pipeline_worker(rank: int, steps: int, groups: int, chunks: int, init_
         run_cell_pipeline,
     )
 
-    world, blocks, history = steps * groups, 3, 1
+    world, blocks = steps * groups, 3
+    backend = "nccl" if device_kind == "cuda" else "gloo"
+    device = torch.device("cuda", rank) if device_kind == "cuda" else torch.device("cpu")
+    if device_kind == "cuda":
+        current_omni_platform.set_device(device)
+    fixed_calls = 0
+    original_post = cell_executor._post_activations_ws
+
+    def record_fixed_post(*args, **kwargs):
+        nonlocal fixed_calls
+        fixed_calls += 1
+        return original_post(*args, **kwargs)
+
+    cell_executor._post_activations_ws = record_fixed_post
     torch.distributed.init_process_group(
-        "gloo", init_method=init_method, rank=rank, world_size=world, timeout=timedelta(seconds=90)
+        backend, init_method=init_method, rank=rank, world_size=world, timeout=timedelta(seconds=90)
     )
-    pp = GroupCoordinator([list(range(world))], local_rank=rank, torch_distributed_backend="gloo")
+    pp = GroupCoordinator([list(range(world))], local_rank=rank, torch_distributed_backend=backend)
     schedule = CellSchedule(
         chunks=chunks,
         num_denoise_steps=steps,
@@ -168,12 +191,17 @@ def _sink_pipeline_worker(rank: int, steps: int, groups: int, chunks: int, init_
     )
     plan = build_cell_plan(schedule)
     spec = ARDiffusionNoisyKVSpec(
-        num_layers=blocks, num_kv_heads=1, head_size=1, block_size=1, max_chunk_tokens=1, max_history_chunks=history
+        num_layers=blocks,
+        num_kv_heads=1,
+        head_size=1,
+        block_size=1,
+        max_chunk_tokens=1,
+        max_history_chunks=max(1, history),
     )
     cache = NoisyKVCache(
         spec,
         dtype=torch.float32,
-        device=torch.device("cpu"),
+        device=device,
         layer_groups=groups,
         max_batch_size=1,
         step_replicas=steps,
@@ -203,8 +231,18 @@ def _sink_pipeline_worker(rank: int, steps: int, groups: int, chunks: int, init_
 
     class Adapter(CellAdapter):
         def __init__(self):
+            self.device = device
+            self.clean_calls = 0
             self.stash = {}
             self.completed = {}
+
+        def activation_spec(self, *, batch, include_hidden):
+            if not fixed_shape:
+                return None
+            schema = [("latent", (batch,), torch.float32)]
+            if include_hidden:
+                schema.append(("hidden_states", (batch,), torch.float32))
+            return schema
 
         def stash_activation(self, payload, *, handles=None, meta=None):
             self.stash[meta[1:]] = payload
@@ -212,25 +250,26 @@ def _sink_pipeline_worker(rank: int, steps: int, groups: int, chunks: int, init_
         def forward(self, tasks, kv_contexts, *, hidden):
             _req, cell = tasks[0]
             chunk, step, block = cell
+            self.clean_calls += int(step == steps)
             payload = hidden if isinstance(hidden, dict) else self.stash.pop((chunk, step), None)
             if block == 0:
                 if step > 0:
                     assert payload is not None, "step input must come from the executor or transport"
-                value = payload["latent"] if payload is not None else torch.tensor([float(chunk + 1)])
+                value = payload["latent"] if payload is not None else torch.tensor([float(chunk + 1)], device=device)
             else:
                 assert payload is not None
                 value = payload["hidden_states"]
-            torch.testing.assert_close(value, torch.tensor([inputs[cell]]), rtol=1e-5, atol=1e-5)
+            torch.testing.assert_close(value, torch.tensor([inputs[cell]], device=device), rtol=1e-5, atol=1e-5)
             context = kv_contexts[0][0]
             n = context.seq_len - 1
             table = context.block_table[0, :n].long()
-            past = context.key_pool[table].sum() if n else torch.tensor(0.0)
+            past = context.key_pool[table].sum() if n else torch.tensor(0.0, device=device)
             slot = context.video_slots.long()
             context.key_pool[slot] = value.reshape(1, 1, 1)
             context.value_pool[slot] = value.reshape(1, 1, 1)
             result = value + past * 0.01 + 0.1 * (block + 1)
-            torch.testing.assert_close(result, torch.tensor([outputs[cell]]), rtol=1e-5, atol=1e-5)
-            current = payload["latent"] if payload is not None else torch.tensor([float(chunk + 1)])
+            torch.testing.assert_close(result, torch.tensor([outputs[cell]], device=device), rtol=1e-5, atol=1e-5)
+            current = payload["latent"] if payload is not None else torch.tensor([float(chunk + 1)], device=device)
             if block == blocks - 1:
                 if step < steps:
                     current = result + 0.5
@@ -249,10 +288,24 @@ def _sink_pipeline_worker(rank: int, steps: int, groups: int, chunks: int, init_
     ctx.enqueue("A", plan, chunk_tokens=1)
     run_cell_pipeline(ctx=ctx, adapter=adapter)
     assert state.resident_versions == 0
+    assert bool(fixed_calls) == fixed_shape
+    expected_clean = sum(
+        cell is not None and cell[1] == steps for cell in (plan.task(t, rank) for t in range(plan.num_slots))
+    )
+    assert adapter.clean_calls == expected_clean
+    totals = torch.tensor([state.bytes_sent, state.bytes_received], dtype=torch.int64, device=device)
+    torch.distributed.all_reduce(totals)
+    expected_bytes = sum(len(plan.transfers(t)) for t in range(plan.num_slots)) * 8
+    assert totals.tolist() == [expected_bytes, expected_bytes]
+    print(
+        f"sink_pipeline rank={rank} device={device_kind} S={steps} G={groups} H={history} chunks={chunks} "
+        f"fixed_calls={fixed_calls} clean_calls={adapter.clean_calls} kv_bytes={expected_bytes}",
+        flush=True,
+    )
     if rank == world - 1:
         assert len(adapter.completed) == chunks
         for chunk, value in adapter.completed.items():
-            torch.testing.assert_close(value, torch.tensor([latent[chunk]]), rtol=1e-5, atol=1e-5)
+            torch.testing.assert_close(value, torch.tensor([latent[chunk]], device=device), rtol=1e-5, atol=1e-5)
     pp.destroy()
     torch.distributed.destroy_process_group()
 
@@ -263,6 +316,18 @@ def test_same_step_sink_distributed_pipeline_matches_serial(steps, groups, chunk
     torch.multiprocessing.spawn(
         _sink_pipeline_worker,
         args=(steps, groups, chunks, f"tcp://127.0.0.1:{get_open_port()}"),
+        nprocs=steps * groups,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("steps,groups", [(2, 1), (2, 2)])
+@pytest.mark.parametrize("chunks", [1, 6])
+@pytest.mark.parametrize("history", [0, 1])
+def test_same_step_fixed_shape_activation_pipeline_matches_serial(steps, groups, chunks, history):
+    torch.multiprocessing.spawn(
+        _sink_pipeline_worker,
+        args=(steps, groups, chunks, f"tcp://127.0.0.1:{get_open_port()}", history, True),
         nprocs=steps * groups,
         join=True,
     )

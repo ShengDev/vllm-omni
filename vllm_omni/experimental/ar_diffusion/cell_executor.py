@@ -378,13 +378,13 @@ def run_cell_pipeline(
                 contexts = kv.prepare(tasks)
                 output = adapter.forward(tasks, contexts, hidden=pending_hidden)
                 kv.publish(tasks)
-                # G=1 keeps the chunk-0 final latent on this rank for clean.
+                # A local clean successor consumes the chunk-0 final latent here.
                 # The executor owns this handoff; adapters need no latent cache.
                 keep_clean_input = (
                     schedule is not None
                     and schedule.ordering is Ordering.SAME_STEP
                     and schedule.chunks > 1
-                    and schedule.layer_groups == 1
+                    and rank_of_block(schedule.num_denoise_steps, 0, schedule) == spec.rank
                     and tasks[0][1] == (0, schedule.num_denoise_steps - 1, schedule.num_blocks - 1)
                 )
                 if schedule is not None and (keep_clean_input or not _tasks_need_activation_send(tasks, schedule)):
