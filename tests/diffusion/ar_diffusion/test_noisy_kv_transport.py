@@ -317,8 +317,10 @@ def _sink_pipeline_worker(
         cell_executor._post_activations_ws = original_post
 
 
-@pytest.mark.parametrize("steps,groups", [(1, 2), (2, 1)])
-@pytest.mark.parametrize("chunks", [1, 6])
+# Ready-lane budget: Simple · Engine&Entrypoints&Diffusion is 20 minutes and
+# each Gloo spawn re-imports the stack (~30–60s wall). One scalar + one
+# fixed-shape case here; CUDA covers the fuller S/G/H/chunks matrix.
+@pytest.mark.parametrize("steps,groups,chunks", [(2, 1, 6)])
 def test_same_step_sink_distributed_pipeline_matches_serial(steps, groups, chunks):
     torch.multiprocessing.spawn(
         _sink_pipeline_worker,
@@ -328,9 +330,7 @@ def test_same_step_sink_distributed_pipeline_matches_serial(steps, groups, chunk
     )
 
 
-@pytest.mark.parametrize("steps,groups", [(2, 1), (2, 2)])
-@pytest.mark.parametrize("chunks", [1, 6])
-@pytest.mark.parametrize("history", [0, 1])
+@pytest.mark.parametrize("steps,groups,chunks,history", [(2, 2, 6, 1)])
 def test_same_step_fixed_shape_activation_pipeline_matches_serial(steps, groups, chunks, history):
     torch.multiprocessing.spawn(
         _sink_pipeline_worker,
