@@ -268,14 +268,17 @@ def test_sink_bootstrap_requests_are_admitted_sequentially():
     assert ctx.admit("B", plan, chunk_tokens=4, slot=0)
 
 
-@pytest.mark.parametrize("groups", [1, 2])
-def test_same_rank_clean_receives_final_latent_without_adapter_cache(groups):
+def test_same_rank_clean_receives_final_latent_without_adapter_cache():
+    """Executor keeps the final latent when last-noisy → clean stays on one rank.
+
+    Cross-rank wraps (``G>1``) belong in the distributed fixed-shape harness.
+    """
     plan = build_cell_plan(
         CellSchedule(
             chunks=2,
             num_denoise_steps=1,
             step_replicas=1,
-            layer_groups=groups,
+            layer_groups=1,
             ordering=Ordering.SAME_STEP,
             kv_history_chunks=0,
         )
@@ -291,11 +294,11 @@ def test_same_rank_clean_receives_final_latent_without_adapter_cache(groups):
         ),
         dtype=torch.float32,
         device=torch.device("cpu"),
-        layer_groups=groups,
+        layer_groups=1,
         max_batch_size=1,
     )
     ctx = ARDiffusionCellContext(
-        spec=CellRunSpec(topology=CellTopology(1, groups), rank=0),
+        spec=CellRunSpec(topology=CellTopology(1, 1), rank=0),
         kv=NoisyKVState(cache),
     )
 
