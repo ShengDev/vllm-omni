@@ -926,9 +926,9 @@ class Flux2Pipeline(
 
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
-        num_inference_steps = (
-            50 if req.sampling_params.num_inference_steps is None else req.sampling_params.num_inference_steps
-        )
+        if req.sampling_params.num_inference_steps is not None:
+            num_inference_steps = req.sampling_params.num_inference_steps
+
         sigmas = req.sampling_params.sigmas or sigmas
         guidance_scale = (
             req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
